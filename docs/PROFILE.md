@@ -95,6 +95,17 @@ The winning entry is a single `table.create(26)` addressed entirely by integer o
 
 This is a useful warning for other JPKs: **measure the VM's actual table-growth/allocation behavior before treating SoA as automatically more compact.** Typed native arenas would likely change this tradeoff again.
 
+
+### CCD should stay opt-in and shape-specific until it earns a general TOI pipeline
+
+The first continuous path is deliberately narrow: opted-in dynamic spheres are swept against static/kinematic spheres and OBBs. This catches the important projectile-vs-world tunneling case without forcing every body through a TOI scheduler. A regression probe at `1000 units/s` crosses a thin wall completely with discrete collision and is stopped before the wall with `ccd = true`.
+
+The implementation is useful precisely because it exposes the next boundary cleanly: dynamic-vs-dynamic TOI, rotational sweeps, and convex/mesh casts need a real island-level TOI scheduler rather than more special cases in the discrete narrow phase.
+
+### Exact capsule/OBB distance is worth the branch cost
+
+The v0.1 endpoint/midpoint capsule probe could miss a box touching an arbitrary point along a long capsule spine. v0.2 replaces it with an exact closest-pair search between the capsule segment and OBB (segment/AABB interior handling plus segment/edge checks in box-local space). Capsule/box is not currently a dominant benchmark path, so correctness wins over preserving the cheaper three-probe approximation.
+
 ## Current hot spots
 
 For dense oriented-box scenes:
@@ -172,4 +183,38 @@ Island construction is already cheap enough in Luau for current loads, but a gen
 
 Do **not** add `physics_step`, `obb_sat`, or a native rigid-body engine API merely because Physik exists. The point of this package is to identify generic substrate weaknesses while keeping simulation policy in Luau.
 
-CCD, meshes, additional constraints, and island scheduling should continue in Luau first. Only promote the repeated, reusable pressure points into L3i.
+General TOI/CCD, meshes, richer constraints, and island scheduling should continue in Luau first. Only promote the repeated, reusable pressure points into L3i.
+
+## v0.3 world / M4J integration findings
+
+### Static world geometry wants two representations
+
+Regular terrain and arbitrary triangle soup should not share one expensive path. Heightfields keep only packed scalar heights and reconstruct two local triangles per touched cell. Arbitrary meshes use packed f32 vertices, packed u32 indices, and a numeric-cell accelerator with an overflow list for very large triangles.
+
+In the current sandbox a 65x65 terrain carrying 400 active spheres is materially cheaper as a specialized heightfield than as the equivalent 8192-triangle generic mesh. The generic mesh remains viable for arbitrary world chunks.
+
+### Triangle SAT needs surface penetration, not minimum degenerate-axis overlap
+
+A zero-thickness triangle can have valid SAT axes whose projected interval width is nearly zero. Using the absolute minimum SAT interval overlap as box/triangle penetration caused slowly sinking boxes. SAT is now used for rejection/orientation, while triangle-plane support depth drives depenetration.
+
+### Query acceleration must reuse the simulation's spatial knowledge
+
+The first batched ray API still performed an all-body scan for every ray. That is acceptable in a terrain-only toy and catastrophic in an actor-populated game world. v0.3 lazily reuses the numeric body grid for ray and AABB queries, checks oversized bodies directly, and bounds DDA traversal with a configurable cell budget before falling back to a scan.
+
+A synthetic 4096-small-body scene improved from roughly 372 us/ray under a forced body scan to roughly 12.5 us/ray through the grid in this sandbox. The exact number is hardware/workload dependent; the architectural point is not.
+
+### Query indexes must invalidate on authoritative ECS writes
+
+`applyTransforms`, direct position/rotation edits, body add/remove, origin rebasing, and post-solve position correction can all move bodies without a query occurring immediately. The query grid is therefore lazy and explicitly invalidated by transform-changing operations. Rebuild happens only on the first subsequent spatial query.
+
+### Gameplay contact events should be opt-in
+
+Enter/stay/exit pair tracking is useful for sensors, docking volumes, pickups, damage fields, and server authority, but it adds work proportional to active manifolds. The first implementation ran unconditionally and pushed the 1000-sphere baseline noticeably above the previous cost envelope. v0.3 makes pair-transition tracking opt-in with `contactEvents=true`; default simulation throughput returns to approximately the v0.2 baseline.
+
+### Public sphere casts should reuse CCD kernels
+
+CCD already contained exact sphere TOI kernels for primitive and world-geometry targets. Duplicating gameplay sweeps would create two correctness surfaces. `sphereCast` and its batched SoA form now reuse the same sphere/sphere, sphere/box, sphere/capsule, compound, mesh, and heightfield sweep code used by CCD.
+
+### M4J-facing rule: drains, not callbacks
+
+Physics-to-ECS integration remains bulk and pull-based: transforms, contacts, pair events, ray batches, and sphere casts drain into reusable parallel arrays. This keeps package code deterministic in scheduling terms, avoids reentrant callback policy, and makes it possible for the host/network layer to decide how much data to replicate or inspect.

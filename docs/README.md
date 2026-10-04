@@ -1,38 +1,39 @@
 # physik.jpk
 
-`physik` is a pure-Luau 3D rigid-body kernel for Jess. Rapier and Jolt are architectural references; the implementation is intentionally shaped around Jess/Luau's actual cost model instead of transliterating Rust or C++.
-
-The package exports:
+`physik` is a pure-Luau 3D rigid-body kernel for Jess. Rapier and Jolt are architectural references; the implementation is deliberately shaped around Jess/Luau's actual cost model rather than transliterating Rust or C++.
 
 ```luau
 local physik = require("@dream/physik")
 ```
 
-Current package version: **0.2.0**.
+Current package version: **0.3.0**.
 
-## v0.2 architecture
+## v0.3 architecture
 
 The hot path is data-oriented and allocation-averse:
 
-- generation-checked numeric body handles rather than per-body simulation objects;
-- native Luau `vector` arrays for hot translational and rotational state;
+- generation-checked numeric handles instead of per-body simulation objects;
+- native Luau `vector` arrays for hot position/velocity/angular state;
 - parallel scalar arrays for metadata;
 - reusable SoA contact storage;
-- cached per-frame body bases reused by OBB SAT and inverse inertia;
+- cached body bases reused by SAT and inverse-inertia work;
 - isotropic sphere inertia fast path;
-- numeric 3D hash-grid broad phase for cell-sized bodies;
-- adaptive oversized-body handling: a few large bodies use direct large-vs-world checks, while dense oversized sets use a coherent X sweep;
+- numeric 3D hash-grid broadphase for compact bodies;
+- adaptive oversized-body path: direct large-vs-world when only a few large bodies exist, coherent X sweep when many do;
 - 2-4 point clipped box-face manifolds;
-- cross-frame contact matching in local body space;
-- persistent-pair cache entries packed into one pre-sized integer-indexed table (no child contact tables);
-- cached accumulated normal/friction impulses and warm starting;
-- fixed contact tangent bases and precomputed normal/tangent effective masses;
-- precomputed angular response vectors reused directly by the iterative solver;
-- union-find simulation islands spanning dynamic contact/joint graphs;
-- island sleeping/waking;
-- sleeping contacts are retained for wake detection but removed from contact preparation and solving.
+- local-anchor contact matching across frames;
+- fixed-width integer-indexed persistent contact-cache records;
+- accumulated normal + 2D friction warm starting;
+- precomputed normal/tangent effective masses and angular response vectors;
+- union-find simulation islands spanning contacts and joints;
+- island-wide sleep/wake;
+- sleeping contacts retained for wake detection but removed from active solve work;
+- buffer-backed triangle meshes and heightfields;
+- dynamic compound colliders assembled from spheres, boxes, and capsules;
+- lazy spatial-query indexing shared with the broadphase grid;
+- reusable SoA drains for transforms, contacts, contact-pair events, ray batches, and sphere-cast batches.
 
-No per-contact table is allocated while stepping. `world:getBody`, `world:contacts`, ray-query results, and diagnostics intentionally materialize tables only at API boundaries.
+Ordinary stepping does not allocate per-contact tables. Materialized records are limited to convenience APIs such as `getBody`, `contacts`, single `raycast`, and single `sphereCast`.
 
 ## Shapes
 
@@ -40,18 +41,16 @@ No per-contact table is allocated while stepping. `world:getBody`, `world:contac
 physik.sphere(radius)
 physik.box(vector.create(halfX, halfY, halfZ))
 physik.capsule(radius, halfHeight) -- local Y axis
+physik.compound(children)
+physik.triangleMesh(vertices, indices [, opts])
+physik.heightfield(width, depth, heights [, opts])
 ```
 
-Collision coverage:
+`triangleMesh` accepts either vector/u32 tables or packed buffers. Vertex buffers are packed f32 xyz triples. Index buffers are packed u32 triangle lists and are zero-based when supplied as a buffer. Table indices are one-based.
 
-- sphere / sphere
-- sphere / oriented box
-- oriented box / oriented box using 15-axis SAT
-- capsule / sphere
-- capsule / capsule
-- capsule / box
+Triangle meshes and heightfields are static/kinematic world geometry; Physik intentionally rejects dynamic triangle soup. Use compound colliders for dynamic ships/actors made of several primitive pieces.
 
-Box/box face contacts are clipped to a manifold of at most four spatially spread points. Edge/edge SAT contacts remain single-point. Capsule/box uses a full segment-vs-OBB closest-feature query, including box-edge tests; it is no longer limited to endpoint/midpoint probes.
+Primitive collision coverage includes sphere/sphere, sphere/OBB, OBB/OBB 15-axis SAT, capsule/sphere, capsule/capsule, exact capsule/OBB closest-feature tests, primitive/triangle tests, and compound traversal. World-geometry contacts are capped to four deepest distinct points per body pair.
 
 ## Minimal example
 
@@ -72,8 +71,6 @@ local body = world:addBody({
     shape = physik.sphere(0.5),
     position = vector.create(0, 10, 0),
     mass = 1,
-    friction = 0.6,
-    restitution = 0.05,
 })
 
 for _ = 1, 600 do
@@ -83,121 +80,176 @@ end
 print(world:getBody(body).position)
 ```
 
-## Body API
+## Bodies and ECS integration
 
-`world:addBody(desc)` accepts:
+`world:addBody(desc)` supports dynamic (default), static, and kinematic bodies. Important descriptor fields:
 
 ```text
-type             dynamic (default), static, or kinematic
-shape            sphere(0.5) by default
-position         vector
-rotation         physik.quat(...) or physik.axisAngle(...)
-velocity         vector
-angularVelocity  vector
-mass             dynamic bodies; default 1
-friction         default 0.6
-restitution      default 0.05
-linearDamping    default 0.02
-angularDamping   default 0.05
-group            32-bit collision group bit(s), default 1
-mask             32-bit collision mask, default all bits
-userData         arbitrary caller value
-ccd              opt-in swept CCD for dynamic spheres; default false
+type
+shape
+position
+rotation
+velocity
+angularVelocity
+mass
+friction
+restitution
+linearDamping
+angularDamping
+group
+mask
+userData
+sensor
+ccd
 ```
 
-Mutation/query surface:
+Core mutation surface:
 
 ```text
 world:removeBody(handle)
-world:getBody(handle)
 world:setPosition(handle, position [, wake])
 world:setRotation(handle, quat [, wake])
 world:setVelocity(handle, velocity)
 world:setAngularVelocity(handle, velocity)
+world:driveKinematic(handle, targetPosition [, targetRotation], dt)
 world:wake(handle)
 world:applyForce(handle, force)
 world:applyForceAtPoint(handle, force, worldPoint)
+world:applyTorque(handle, torque)
 world:applyImpulse(handle, impulse [, worldPoint])
+world:applyAngularImpulse(handle, impulse)
 ```
 
-Handles encode slot + generation. Removing and reusing a slot never makes an old handle valid again.
+Bulk ECS synchronization avoids one record per body:
+
+```luau
+local state, count = world:writeTransforms(reusable, {
+    awakeOnly = true,
+    dynamicOnly = true,
+})
+
+-- state.handles
+-- state.positions
+-- state.rotations       -- quaternion xyz as vector
+-- state.rotationW
+-- state.velocities
+-- state.angularVelocities
+
+world:applyTransforms(state) -- authoritative/replicated write-back
+```
+
+`applyTransforms` invalidates persistent contact anchors and the lazy spatial-query index, so an authoritative teleport is visible to collision queries immediately.
+
+For large-coordinate worlds, `world:shiftOrigin(delta)` rebases every live body and current contact point. The numeric hash grid is intentionally optimized for a local simulation bubble rather than pretending arbitrary astronomical coordinates are free.
+
+## Fixed stepping
+
+`world:step(dt [, substeps])` performs one explicit simulation step.
+
+`world:advance(realDt [, fixedDt [, maxCatchUpSteps]])` maintains an accumulator and returns:
+
+```text
+stepsExecuted, interpolationAlpha, droppedCatchUpTime
+```
+
+This is the intended host-facing path when render/network time and simulation tick time differ.
 
 ## Constraints
 
-v0.2 includes distance, ball/socket, and hinge constraints. All participate in dynamic-island construction. Connected-body collision is disabled by default; set `collideConnected = true` on the joint descriptor to keep it enabled.
+v0.3 provides:
 
-Distance:
-
-```luau
-local joint = world:addDistanceJoint(a, b, {
-    localAnchorA = vector.create(0, 0, 0),
-    localAnchorB = vector.create(0, 0, 0),
-    length = 2,
-    stiffness = 0.25,
-    damping = 0.05,
-})
-```
-
-Ball/socket:
+- distance joints;
+- ball/socket joints;
+- hinge joints;
+- optional torque-limited hinge motors.
 
 ```luau
-local joint = world:addBallJoint(a, b, {
-    localAnchorA = vector.create(0, 0, 0),
-    localAnchorB = vector.create(0, 1, 0),
-    stiffness = 0.35,
-    damping = 0.1,
-})
+world:addDistanceJoint(a, b, opts)
+world:addBallJoint(a, b, opts)
+world:addHingeJoint(a, b, opts)
+world:removeJoint(id)
 ```
 
-Hinge with an optional torque-limited motor:
+Connected-body collision is disabled by default through reference-counted numeric pair suppression. Set `collideConnected = true` on a joint when contact between the connected bodies is intentional.
 
-```luau
-local joint = world:addHingeJoint(a, b, {
-    localAnchorA = vector.create(0, 0, 0),
-    localAnchorB = vector.create(0, 1, 0),
-    localAxisA = vector.create(0, 1, 0),
-    localAxisB = vector.create(0, 1, 0),
-    angularStiffness = 0.25,
-    motorSpeed = 3,
-    maxMotorTorque = 20,
-})
-```
+## Queries
 
-Remove any joint with:
-
-```luau
-world:removeJoint(joint)
-```
-
-`collideConnected` defaults to false for all three joint types. The world maintains an integer pair-suppression count so multiple joints between the same body pair compose correctly. Joint removal, stale-joint cleanup, and body removal all release their suppression entries.
-
-## Queries and diagnostics
+Single ray:
 
 ```luau
 local hit = world:raycast(origin, direction, maxDistance, mask)
 ```
 
-The result contains `handle`, `distance`, `point`, `normal`, and `userData`.
+Reusable batches:
 
-`world:contacts()` materializes current contacts on demand. `world:stats()` currently reports:
-
-```text
-frame
-bodies
-sleeping
-islands
-candidates
-contacts
-activeContacts
-manifolds
-warmStarted
-ccdHits
-joints
+```luau
+world:raycastBatch(origins, directions, maxDistances, masks, reusable)
+world:raycastBatchSoA(origins, directions, maxDistances, masks, reusable)
 ```
 
-`contacts` includes sleeping support contacts retained for wake detection. `activeContacts` is the subset actually prepared/solved this step.
+Spatial overlap:
+
+```luau
+local handles, count = world:queryAabb(minimum, maximum, mask, reusable)
+```
+
+Sphere sweep / shape cast:
+
+```luau
+local hit = world:sphereCast(startPos, endPos, radius, mask, ignoreHandle)
+world:sphereCastBatchSoA(starts, ends, radii, masks, ignoreHandles, reusable)
+```
+
+Raycasts and AABB queries lazily reuse Physik's body grid. Large bodies are checked directly, compact bodies are traversed spatially, and pathological huge query ranges fall back to a linear scan rather than walking unbounded cell counts.
+
+Sphere casts reuse the same TOI kernels as CCD against spheres, boxes, capsules, compounds, triangle meshes, and heightfields.
+
+## Contacts, sensors, and gameplay events
+
+Current contact state can be drained without per-contact objects:
+
+```luau
+local contacts, count = world:writeContacts(reusable)
+```
+
+For triggers/gameplay pair transitions, enable event tracking explicitly:
+
+```luau
+local world = physik.newWorld({ contactEvents = true })
+...
+local events, count = world:writeContactEvents(reusable)
+```
+
+`events.kind[n]` is one of:
+
+```luau
+physik.contactEvent.enter
+physik.contactEvent.stay
+physik.contactEvent.exit
+```
+
+`writeContactEvents(out, false)` omits `stay` records. Event tracking is **off by default** so worlds that do not need gameplay pair transitions do not pay that bookkeeping cost.
+
+Sensor bodies participate in contact/event detection but never enter islands or impulse solving.
+
+## Continuous collision detection
+
+Set `ccd = true` on a **dynamic sphere** to sweep it from its previous position to its integrated position before the discrete contact pass.
+
+Current CCD targets:
+
+- static/kinematic spheres;
+- oriented boxes;
+- capsules;
+- compound primitive children;
+- triangle meshes, including face/edge/vertex TOI;
+- heightfields.
+
+CCD remains intentionally sphere-first. There is no dynamic-vs-dynamic TOI island solver, moving-box/capsule cast, or rotational TOI yet. Unsupported fast movers should use substeps or explicit sphere casts where appropriate.
 
 ## World tuning
+
+Important options include:
 
 ```text
 gravity                    default (0, -9.81, 0)
@@ -219,72 +271,71 @@ warmStarting               default true
 warmStartFactor            default 0.85
 manifoldMatchDistance      default 0.08
 contactMargin              default 0.015
+ccdSlop                    default 0.001
 broadphase                 "grid" (default) or "sap"
 broadphaseCellSize         default 1.0
 directLargeThreshold       default 16
-ccdSlop                    default 0.001
+meshQueryCellLimit         default 4096
+queryRayCellLimit          default 2048
+queryAabbCellLimit         default 8192
+fixedDt                    default 1/60
+maxCatchUpSteps            default 8
+contactEvents              default false
 ```
-
-The v0.2 defaults changed deliberately. Multi-point manifolds plus cross-frame warm starting made the v0.1 combination of eight iterations and aggressive Baumgarte velocity bias unnecessarily energetic. v0.2 lowers the default to four iterations and a 0.03 Baumgarte factor while retaining explicit positional correction.
-
-## Continuous collision detection
-
-v0.2 includes an intentionally narrow first CCD path. Set `ccd = true` on a **dynamic sphere** body to sweep its center from the previous position to the integrated position before the discrete collision pass.
-
-Current sweep targets:
-
-- static or kinematic spheres;
-- static or kinematic oriented boxes.
-
-The sphere/box sweep uses the box expanded by the moving sphere radius, making it conservative near box corners but effective at preventing tunneling through thin world geometry. On a hit Physik rewinds to just before TOI using `ccdSlop`, removes the inward normal velocity with restitution, and then lets the ordinary discrete solver continue.
-
-Current CCD does **not** handle dynamic-vs-dynamic sweeps, capsules, boxes as moving sweep shapes, or rotational TOI. It is opt-in so ordinary bodies do not pay the O(N) target scan. `world:stats().ccdHits` reports the number of CCD clamps in the most recent substep.
 
 ## Measured sandbox performance
 
-These are development measurements from the supplied Jess binary in the ChatGPT Linux sandbox. They are regression-direction measurements, not hardware-independent promises.
-
-Unprofiled, 60 Hz, one substep, v0.2 defaults / four velocity iterations:
+These are regression-direction samples from the supplied Jess binary in the ChatGPT Linux sandbox, not hardware-independent promises. Recent unprofiled v0.3 samples:
 
 ```text
-1000 dynamic spheres + large static floor, 120 steps:
-4.62 / 4.67 / 4.65 ms per step across three runs
-~215k body-steps / second typical
+1000 dynamic spheres + static floor, 120 steps:
+~5.37 ms/step
 
-250 dynamic oriented boxes + static floor, 120 steps:
-5.00 / 4.98 / 4.79 ms per step across three runs
-~50-52k body-steps / second
+250 tumbling OBBs + floor, 120 steps:
+~5.53 ms/step
 
-1000 independent spheres fully asleep on a floor, 300 measured steps:
-2.15 / 1.95 / 1.84 ms per step across three runs
+256 three-piece dynamic compound "ships" + floor, 120 steps:
+~4.42 ms/step
+
+65x65 heightfield + 400 active spheres:
+~3.12 ms/step
+
+same terrain as an 8192-triangle generic mesh + 400 active spheres:
+~4.60 ms/step
 ```
 
-The sleeping-world optimization is significant because the engine still generates the 1000 support contacts each frame for wake semantics, but none are prepared or iterated once their islands are asleep. Before that cut, the same settled scene measured about **3.62 ms/step** in this sandbox.
-
-A 250-box, 300-step convergence comparison with the v0.2 stabilization settings produced:
+The body-query grid matters more as scene population grows. In a 4,096-small-body scene with one large floor, a 20,480-ray batch sample measured approximately:
 
 ```text
-4 iterations + warm starting:
-~6.55 ms/step, residual-motion proxy 17.9
-
-8 iterations + warm starting disabled:
-~6.95 ms/step, residual-motion proxy 70.9
+forced linear body scan:  ~372 us/ray
+spatial grid traversal:   ~12.5 us/ray
 ```
 
-That benchmark is intentionally chaotic and the residual-motion value is only a regression metric, but it demonstrates the intended direction: persistent impulses can buy convergence rather than merely adding bookkeeping.
+That is roughly a **30x** reduction in this synthetic many-body query case.
 
-## Deliberate v0.2 limits
+Additional query samples on the same 4,096-body scene:
 
-This is now a real compact rigid-body kernel, not a claim of Rapier/Jolt feature parity.
+```text
+batched sphere casts:     ~9.6 us/cast
+small AABB overlap query: ~10.5 us/query
+```
+
+Pair-transition tracking is opt-in because it adds work proportional to the number of active body pairs. With `contactEvents=false`, the dense sphere/box baselines are effectively back at the v0.2 cost envelope despite the much larger v0.3 feature surface.
+
+## Deliberate v0.3 limits
+
+This is a compact game-oriented rigid-body kernel, not a claim of Rapier/Jolt feature parity.
 
 Not implemented yet:
 
-- general CCD / TOI (dynamic-vs-dynamic, moving boxes/capsules, rotational sweeps);
-- convex hulls, triangle meshes, heightfields, compound shapes;
-- slider / cone / six-DOF constraints;
+- convex hull / general convex support-map shapes;
+- dynamic triangle meshes;
+- slider, cone, six-DOF, gear, or ragdoll-specialized constraints;
 - edge/edge multi-point manifolds;
-- broad-phase acceleration for raycasts;
-- deterministic fixed-point simulation;
+- general dynamic-vs-dynamic TOI islands;
+- moving-box/capsule/compound CCD and rotational TOI;
+- character-controller policy;
+- deterministic fixed-point simulation or cross-architecture bitwise determinism;
 - solver parallelism across independent islands.
 
-The next major correctness step should extend CCD beyond sphere-vs-static/kinematic targets. The next major shape feature should probably be **triangle meshes / heightfields**, because those matter far more to game-world usefulness than exotic convex primitives.
+For M4J-style integration, the intended immediate shape is: fixed authoritative ticks, compound dynamic actors/ships, static mesh/heightfield world chunks, origin rebasing, bulk ECS transform exchange, batched spatial queries/sphere sweeps, and optional contact-pair event drains.

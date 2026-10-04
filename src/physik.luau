@@ -17,9 +17,16 @@ local BODY_KINEMATIC = 2
 local SHAPE_SPHERE = 1
 local SHAPE_BOX = 2
 local SHAPE_CAPSULE = 3
+local SHAPE_MESH = 4
+local SHAPE_HEIGHTFIELD = 5
+local SHAPE_COMPOUND = 6
 local JOINT_DISTANCE = 1
 local JOINT_BALL = 2
 local JOINT_HINGE = 3
+
+local EVENT_ENTER = 1
+local EVENT_STAY = 2
+local EVENT_EXIT = 3
 
 -- Persistent contact cache entry layout. One array table per body pair, no child tables.
 local CACHE_COUNT = 1
@@ -84,6 +91,11 @@ local function qInvRotate(qv, qw, v)
     return v + t * qw + vector.cross(nq, t)
 end
 
+
+local function qMul(av,aw,bv,bw)
+    return av*bw+bv*aw+vector.cross(av,bv),aw*bw-vector.dot(av,bv)
+end
+
 local function qAxes(qv, qw)
     local x, y, z = qv.X, qv.Y, qv.Z
     local xx, yy, zz = x*x, y*y, z*z
@@ -140,6 +152,159 @@ function M.capsule(radius, halfHeight)
     return table.freeze({ kind = SHAPE_CAPSULE, radius = radius, halfHeight = halfHeight })
 end
 
+
+local function readVec3(buf, index)
+    local o=index*12
+    return vector.create(buffer.readf32(buf,o),buffer.readf32(buf,o+4),buffer.readf32(buf,o+8))
+end
+
+local function writeVec3(buf,index,v)
+    local o=index*12
+    buffer.writef32(buf,o,v.X); buffer.writef32(buf,o+4,v.Y); buffer.writef32(buf,o+8,v.Z)
+end
+
+local function buildMeshGrid(vbuf,ibuf,triCount,cellSize,maxCellsPerTriangle)
+    local heads,nextNode,nodeTri,overflow={},{},{},{}
+    local nodeCount=0
+    for t=0,triCount-1 do
+        local io=t*12
+        local ia,ib,ic=buffer.readu32(ibuf,io),buffer.readu32(ibuf,io+4),buffer.readu32(ibuf,io+8)
+        local a,b,c=readVec3(vbuf,ia),readVec3(vbuf,ib),readVec3(vbuf,ic)
+        local mn=vector.create(math.min(a.X,b.X,c.X),math.min(a.Y,b.Y,c.Y),math.min(a.Z,b.Z,c.Z))
+        local mx=vector.create(math.max(a.X,b.X,c.X),math.max(a.Y,b.Y,c.Y),math.max(a.Z,b.Z,c.Z))
+        local x0,y0,z0=math.floor(mn.X/cellSize),math.floor(mn.Y/cellSize),math.floor(mn.Z/cellSize)
+        local x1,y1,z1=math.floor(mx.X/cellSize),math.floor(mx.Y/cellSize),math.floor(mx.Z/cellSize)
+        local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
+        local valid=cells<=maxCellsPerTriangle
+        if valid then
+            for x=x0,x1 do for y=y0,y1 do for z=z0,z1 do
+                local key=packCell(x,y,z)
+                if key==nil then valid=false; break end
+                nodeCount+=1
+                nodeTri[nodeCount]=t
+                nextNode[nodeCount]=heads[key] or 0
+                heads[key]=nodeCount
+            end if not valid then break end end if not valid then break end end
+        end
+        if not valid then overflow[#overflow+1]=t end
+    end
+    return heads,nextNode,nodeTri,overflow
+end
+
+function M.triangleMesh(vertices,indices,opts)
+    opts=opts or {}
+    local vbuf,vcount
+    if typeof(vertices)=="buffer" then
+        assert(buffer.len(vertices)%12==0,"physik.triangleMesh: vertex buffer must contain packed f32 xyz triples")
+        vbuf=vertices; vcount=buffer.len(vertices)/12
+    else
+        assert(type(vertices)=="table" and #vertices>=3,"physik.triangleMesh: vertices must be a vector array or packed f32 buffer")
+        vcount=#vertices; vbuf=buffer.create(vcount*12)
+        for i=1,vcount do assert(typeof(vertices[i])=="vector","physik.triangleMesh: every vertex must be a vector"); writeVec3(vbuf,i-1,vertices[i]) end
+    end
+    local ibuf,icount
+    if indices==nil then
+        assert(vcount%3==0,"physik.triangleMesh: without indices, vertex count must be divisible by 3")
+        icount=vcount; ibuf=buffer.create(icount*4)
+        for i=0,icount-1 do buffer.writeu32(ibuf,i*4,i) end
+    elseif typeof(indices)=="buffer" then
+        assert(buffer.len(indices)%12==0,"physik.triangleMesh: index buffer length must be divisible by 3 u32 indices")
+        ibuf=indices; icount=buffer.len(indices)/4
+    else
+        assert(type(indices)=="table" and #indices%3==0,"physik.triangleMesh: indices must be a triangle-list table or u32 buffer")
+        icount=#indices; ibuf=buffer.create(icount*4)
+        for i=1,icount do
+            local idx=indices[i]
+            assert(type(idx)=="number" and idx%1==0 and idx>=1 and idx<=vcount,"physik.triangleMesh: table indices are 1-based and must reference a vertex")
+            buffer.writeu32(ibuf,(i-1)*4,idx-1)
+        end
+    end
+    local triCount=icount/3
+    assert(triCount>=1,"physik.triangleMesh: mesh must contain at least one triangle")
+    local mn=vector.create(math.huge,math.huge,math.huge)
+    local mx=vector.create(-math.huge,-math.huge,-math.huge)
+    for i=0,vcount-1 do
+        local v=readVec3(vbuf,i)
+        mn=vector.create(math.min(mn.X,v.X),math.min(mn.Y,v.Y),math.min(mn.Z,v.Z))
+        mx=vector.create(math.max(mx.X,v.X),math.max(mx.Y,v.Y),math.max(mx.Z,v.Z))
+    end
+    local extent=mx-mn
+    local longest=math.max(extent.X,extent.Y,extent.Z)
+    local cellSize=opts.cellSize or math.max(longest/math.max(math.sqrt(triCount)*0.5,1),0.25)
+    assert(type(cellSize)=="number" and cellSize>0,"physik.triangleMesh: cellSize must be > 0")
+    local maxCells=opts.maxCellsPerTriangle or 64
+    local heads,nextNode,nodeTri,overflow=buildMeshGrid(vbuf,ibuf,triCount,cellSize,maxCells)
+    return table.freeze({kind=SHAPE_MESH,vertices=vbuf,indices=ibuf,vertexCount=vcount,triangleCount=triCount,localMin=mn,localMax=mx,cellSize=cellSize,heads=heads,nextNode=nextNode,nodeTri=nodeTri,overflow=overflow})
+end
+
+function M.heightfield(width,depth,heights,opts)
+    opts=opts or {}
+    assert(type(width)=="number" and width%1==0 and width>=2,"physik.heightfield: width must be an integer >= 2")
+    assert(type(depth)=="number" and depth%1==0 and depth>=2,"physik.heightfield: depth must be an integer >= 2")
+    local count=width*depth
+    local hbuf
+    if typeof(heights)=="buffer" then
+        assert(buffer.len(heights)==count*4,"physik.heightfield: height buffer must contain width*depth f32 values")
+        hbuf=heights
+    else
+        assert(type(heights)=="table" and #heights==count,"physik.heightfield: heights must contain width*depth values")
+        hbuf=buffer.create(count*4)
+        for i=1,count do assert(type(heights[i])=="number","physik.heightfield: heights must be numbers");buffer.writef32(hbuf,(i-1)*4,heights[i]) end
+    end
+    local sx=opts.cellSizeX or opts.cellSize or 1
+    local sz=opts.cellSizeZ or opts.cellSize or 1
+    assert(sx>0 and sz>0,"physik.heightfield: cell sizes must be > 0")
+    local origin=opts.origin or ZERO
+    assert(typeof(origin)=="vector","physik.heightfield: origin must be a vector")
+    local minY,maxY=math.huge,-math.huge
+    for i=0,count-1 do local h=buffer.readf32(hbuf,i*4);if h<minY then minY=h end;if h>maxY then maxY=h end end
+    local mn=vector.create(origin.X,origin.Y+minY,origin.Z)
+    local mx=vector.create(origin.X+(width-1)*sx,origin.Y+maxY,origin.Z+(depth-1)*sz)
+    return table.freeze({kind=SHAPE_HEIGHTFIELD,width=width,depth=depth,heights=hbuf,cellSizeX=sx,cellSizeZ=sz,origin=origin,localMin=mn,localMax=mx})
+end
+
+
+local function primitiveLocalBounds(shape,p,qv,qw)
+    if shape.kind==SHAPE_SPHERE then
+        local e=vector.create(shape.radius,shape.radius,shape.radius)
+        return p-e,p+e
+    elseif shape.kind==SHAPE_BOX then
+        local a0,a1,a2=qAxes(qv,qw)
+        local h=shape.halfExtents
+        local e=vector.create(math.abs(a0.X)*h.X+math.abs(a1.X)*h.Y+math.abs(a2.X)*h.Z,math.abs(a0.Y)*h.X+math.abs(a1.Y)*h.Y+math.abs(a2.Y)*h.Z,math.abs(a0.Z)*h.X+math.abs(a1.Z)*h.Y+math.abs(a2.Z)*h.Z)
+        return p-e,p+e
+    else
+        local _,axis,_=qAxes(qv,qw)
+        local e=vector.create(math.abs(axis.X)*shape.halfHeight+shape.radius,math.abs(axis.Y)*shape.halfHeight+shape.radius,math.abs(axis.Z)*shape.halfHeight+shape.radius)
+        return p-e,p+e
+    end
+end
+
+function M.compound(children)
+    assert(type(children)=="table" and #children>=1,"physik.compound: children must be a non-empty array")
+    local shapes,positions,qvs,qws={},{},{},{}
+    local mn=vector.create(math.huge,math.huge,math.huge)
+    local mx=vector.create(-math.huge,-math.huge,-math.huge)
+    for i=1,#children do
+        local child=children[i]
+        assert(type(child)=="table" and type(child.shape)=="table","physik.compound: every child needs a shape")
+        local shape=child.shape
+        assert(shape.kind==SHAPE_SPHERE or shape.kind==SHAPE_BOX or shape.kind==SHAPE_CAPSULE,"physik.compound: children must be sphere, box, or capsule shapes")
+        local p=child.position or ZERO
+        assert(typeof(p)=="vector","physik.compound: child position must be a vector")
+        local qv,qw=ZERO,1
+        if child.rotation then
+            assert(type(child.rotation)=="table" and typeof(child.rotation.v)=="vector" and type(child.rotation.w)=="number","physik.compound: child rotation must come from physik.quat/axisAngle")
+            qv,qw=qNormalize(child.rotation.v,child.rotation.w)
+        end
+        shapes[i],positions[i],qvs[i],qws[i]=shape,p,qv,qw
+        local cmn,cmx=primitiveLocalBounds(shape,p,qv,qw)
+        mn=vector.create(math.min(mn.X,cmn.X),math.min(mn.Y,cmn.Y),math.min(mn.Z,cmn.Z))
+        mx=vector.create(math.max(mx.X,cmx.X),math.max(mx.Y,cmx.Y),math.max(mx.Z,cmx.Z))
+    end
+    return table.freeze({kind=SHAPE_COMPOUND,count=#children,shapes=shapes,positions=positions,qv=qvs,qw=qws,localMin=mn,localMax=mx})
+end
+
 function M.quat(x, y, z, w)
     local qv, qw = qNormalize(vector.create(x, y, z), w)
     return table.freeze({ v = qv, w = qw })
@@ -163,7 +328,7 @@ local function inertiaFor(shape, mass)
         local iy = (mass / 3) * (h.X*h.X + h.Z*h.Z)
         local iz = (mass / 3) * (h.X*h.X + h.Y*h.Y)
         return vector.create(if ix > EPS then 1/ix else 0, if iy > EPS then 1/iy else 0, if iz > EPS then 1/iz else 0)
-    else
+    elseif shape.kind == SHAPE_CAPSULE then
         -- Capsule: compact approximation by a box enclosing the swept sphere.
         local r, hh = shape.radius, shape.halfHeight
         local hx, hy, hz = r, hh + r, r
@@ -171,7 +336,17 @@ local function inertiaFor(shape, mass)
         local iy = (mass / 3) * (hx*hx + hz*hz)
         local iz = (mass / 3) * (hx*hx + hy*hy)
         return vector.create(if ix > EPS then 1/ix else 0, if iy > EPS then 1/iy else 0, if iz > EPS then 1/iz else 0)
+    elseif shape.kind == SHAPE_COMPOUND then
+        -- Conservative compound inertia: enclosing cuboid about the declared body origin,
+        -- including a parallel-axis term when the child bounds are offset.
+        local h=(shape.localMax-shape.localMin)*0.5
+        local c=(shape.localMax+shape.localMin)*0.5
+        local ix=(mass/3)*(h.Y*h.Y+h.Z*h.Z)+mass*(c.Y*c.Y+c.Z*c.Z)
+        local iy=(mass/3)*(h.X*h.X+h.Z*h.Z)+mass*(c.X*c.X+c.Z*c.Z)
+        local iz=(mass/3)*(h.X*h.X+h.Y*h.Y)+mass*(c.X*c.X+c.Y*c.Y)
+        return vector.create(if ix>EPS then 1/ix else 0,if iy>EPS then 1/iy else 0,if iz>EPS then 1/iz else 0)
     end
+    return ZERO
 end
 
 local World = {}
@@ -517,20 +692,40 @@ end
 local function segmentAabbInterval(a,b,h)
     local d=b-a
     local tmin,tmax=0,1
-    local function slab(p,dp,lo,hi)
-        if math.abs(dp)<=EPS then return p>=lo and p<=hi,tmin,tmax end
-        local inv=1/dp
-        local t1=(lo-p)*inv
-        local t2=(hi-p)*inv
+    local p,dp,lo,hi,inv,t1,t2
+
+    p,dp,lo,hi=a.X,d.X,-h.X,h.X
+    if math.abs(dp)<=EPS then
+        if p<lo or p>hi then return false end
+    else
+        inv=1/dp;t1=(lo-p)*inv;t2=(hi-p)*inv
         if t1>t2 then t1,t2=t2,t1 end
-        local nmin=math.max(tmin,t1)
-        local nmax=math.min(tmax,t2)
-        return nmin<=nmax,nmin,nmax
+        if t1>tmin then tmin=t1 end
+        if t2<tmax then tmax=t2 end
+        if tmin>tmax then return false end
     end
-    local ok
-    ok,tmin,tmax=slab(a.X,d.X,-h.X,h.X); if not ok then return false end
-    ok,tmin,tmax=slab(a.Y,d.Y,-h.Y,h.Y); if not ok then return false end
-    ok,tmin,tmax=slab(a.Z,d.Z,-h.Z,h.Z); if not ok then return false end
+
+    p,dp,lo,hi=a.Y,d.Y,-h.Y,h.Y
+    if math.abs(dp)<=EPS then
+        if p<lo or p>hi then return false end
+    else
+        inv=1/dp;t1=(lo-p)*inv;t2=(hi-p)*inv
+        if t1>t2 then t1,t2=t2,t1 end
+        if t1>tmin then tmin=t1 end
+        if t2<tmax then tmax=t2 end
+        if tmin>tmax then return false end
+    end
+
+    p,dp,lo,hi=a.Z,d.Z,-h.Z,h.Z
+    if math.abs(dp)<=EPS then
+        if p<lo or p>hi then return false end
+    else
+        inv=1/dp;t1=(lo-p)*inv;t2=(hi-p)*inv
+        if t1>t2 then t1,t2=t2,t1 end
+        if t1>tmin then tmin=t1 end
+        if t2<tmax then tmax=t2 end
+        if tmin>tmax then return false end
+    end
     return true,tmin,tmax
 end
 
@@ -613,6 +808,306 @@ local function capsuleBox(cp,cqv,cqw,cr,chh,bp,bqv,bqw,bh,margin)
     return true,normal,point,penetration
 end
 
+
+local function closestPointTriangle(p,a,b,c)
+    local ab,ac=p and (b-a),c-a
+    local ap=p-a
+    local d1,d2=vector.dot(ab,ap),vector.dot(ac,ap)
+    if d1<=0 and d2<=0 then return a end
+    local bp=p-b
+    local d3,d4=vector.dot(ab,bp),vector.dot(ac,bp)
+    if d3>=0 and d4<=d3 then return b end
+    local vc=d1*d4-d3*d2
+    if vc<=0 and d1>=0 and d3<=0 then
+        local v=d1/(d1-d3)
+        return a+ab*v
+    end
+    local cp=p-c
+    local d5,d6=vector.dot(ab,cp),vector.dot(ac,cp)
+    if d6>=0 and d5<=d6 then return c end
+    local vb=d5*d2-d1*d6
+    if vb<=0 and d2>=0 and d6<=0 then
+        local w=d2/(d2-d6)
+        return a+ac*w
+    end
+    local va=d3*d6-d5*d4
+    if va<=0 and (d4-d3)>=0 and (d5-d6)>=0 then
+        local w=(d4-d3)/((d4-d3)+(d5-d6))
+        return b+(c-b)*w
+    end
+    local denom=1/(va+vb+vc)
+    local v=vb*denom
+    local w=vc*denom
+    return a+ab*v+ac*w
+end
+
+local function pointInTriangle(p,a,b,c,n)
+    local c0=vector.cross(b-a,p-a)
+    local c1=vector.cross(c-b,p-b)
+    local c2=vector.cross(a-c,p-c)
+    local d0,d1,d2=vector.dot(c0,n),vector.dot(c1,n),vector.dot(c2,n)
+    return (d0>=-1e-7 and d1>=-1e-7 and d2>=-1e-7) or (d0<=1e-7 and d1<=1e-7 and d2<=1e-7)
+end
+
+local function closestSegmentTriangle(s0,s1,a,b,c)
+    local n=vector.cross(b-a,c-a)
+    local n2=vector.dot(n,n)
+    if n2>EPS then
+        local d=s1-s0
+        local denom=vector.dot(n,d)
+        if math.abs(denom)>EPS then
+            local t=vector.dot(n,a-s0)/denom
+            if t>=0 and t<=1 then
+                local p=s0+d*t
+                if pointInTriangle(p,a,b,c,n) then return p,p end
+            end
+        end
+    end
+    local bestS=s0
+    local bestT=closestPointTriangle(s0,a,b,c)
+    local bestD=vector.dot(bestT-bestS,bestT-bestS)
+    local q=closestPointTriangle(s1,a,b,c)
+    local d2=vector.dot(q-s1,q-s1)
+    if d2<bestD then bestD,bestS,bestT=d2,s1,q end
+    local p0,p1=closestSegmentSegment(s0,s1,a,b)
+    d2=vector.dot(p1-p0,p1-p0); if d2<bestD then bestD,bestS,bestT=d2,p0,p1 end
+    p0,p1=closestSegmentSegment(s0,s1,b,c)
+    d2=vector.dot(p1-p0,p1-p0); if d2<bestD then bestD,bestS,bestT=d2,p0,p1 end
+    p0,p1=closestSegmentSegment(s0,s1,c,a)
+    d2=vector.dot(p1-p0,p1-p0); if d2<bestD then bestS,bestT=p0,p1 end
+    return bestS,bestT
+end
+
+local function sphereTriangle(sp,r,a,b,c,margin)
+    local q=closestPointTriangle(sp,a,b,c)
+    local d=q-sp
+    local d2=vector.dot(d,d)
+    local detect=r+(margin or 0)
+    if d2>detect*detect then return false end
+    local dist=math.sqrt(math.max(d2,EPS))
+    local n
+    if d2>EPS then n=d/dist else
+        local tn=safeUnit(vector.cross(b-a,c-a),YAXIS)
+        local center=(a+b+c)/3
+        n=if vector.dot(center-sp,tn)>=0 then tn else -tn
+    end
+    return true,n,q,r-dist
+end
+
+local function capsuleTriangle(cp,cqv,cqw,r,hh,a,b,c,margin)
+    local s0,s1=capsuleEndpoints(cp,cqv,cqw,hh)
+    local ps,pt=closestSegmentTriangle(s0,s1,a,b,c)
+    local d=pt-ps
+    local d2=vector.dot(d,d)
+    local detect=r+(margin or 0)
+    if d2>detect*detect then return false end
+    local dist=math.sqrt(math.max(d2,EPS))
+    local n
+    if d2>EPS then n=d/dist else
+        local tn=safeUnit(vector.cross(b-a,c-a),YAXIS)
+        local center=(a+b+c)/3
+        n=if vector.dot(center-cp,tn)>=0 then tn else -tn
+    end
+    return true,n,pt,r-dist
+end
+
+local function triBoxAxis(axis,a,b,c,h,bestPen,bestAxis,margin)
+    local l2=vector.dot(axis,axis)
+    if l2<=1e-10 then return true,bestPen,bestAxis end
+    local n=if math.abs(l2-1)<1e-5 then axis else axis/math.sqrt(l2)
+    local pa,pb,pc=vector.dot(a,n),vector.dot(b,n),vector.dot(c,n)
+    local tmin,tmax=math.min(pa,pb,pc),math.max(pa,pb,pc)
+    local r=h.X*math.abs(n.X)+h.Y*math.abs(n.Y)+h.Z*math.abs(n.Z)
+    local overlap=math.min(r,tmax)-math.max(-r,tmin)
+    if overlap<=-(margin or 0) then return false,bestPen,bestAxis end
+    if overlap<bestPen then
+        bestPen=overlap
+        local center=(tmin+tmax)*0.5
+        bestAxis=if center>=0 then n else -n
+    end
+    return true,bestPen,bestAxis
+end
+
+local function boxTriangle(bp,bqv,bqw,h,wa,wb,wc,margin)
+    local a=qInvRotate(bqv,bqw,wa-bp)
+    local b=qInvRotate(bqv,bqw,wb-bp)
+    local c=qInvRotate(bqv,bqw,wc-bp)
+    local e0,e1,e2=b-a,c-b,a-c
+    local bestPen,bestAxis=math.huge,nil
+    local ok
+    ok,bestPen,bestAxis=triBoxAxis(XAXIS,a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(YAXIS,a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(ZAXIS,a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e0,e1),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e0,XAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e0,YAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e0,ZAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e1,XAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e1,YAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e1,ZAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e2,XAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e2,YAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e2,ZAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
+    local localPoint=closestPointTriangle(ZERO,a,b,c)
+    -- A triangle has zero thickness, so the minimum SAT interval overlap can be nearly zero
+    -- even while a box has crossed the triangle plane. SAT decides overlap; the triangle
+    -- plane supplies the physically useful surface normal and support penetration depth.
+    local triN=safeUnit(vector.cross(b-a,c-a),bestAxis or YAXIS)
+    local planeD=(vector.dot(a,triN)+vector.dot(b,triN)+vector.dot(c,triN))/3
+    if planeD<0 then triN=-triN;planeD=-planeD end
+    local radius=h.X*math.abs(triN.X)+h.Y*math.abs(triN.Y)+h.Z*math.abs(triN.Z)
+    local planePen=radius-planeD
+    return true,qRotate(bqv,bqw,triN),bp+qRotate(bqv,bqw,localPoint),planePen
+end
+
+local function meshTriangle(shape,t)
+    local io=t*12
+    local ia,ib,ic=buffer.readu32(shape.indices,io),buffer.readu32(shape.indices,io+4),buffer.readu32(shape.indices,io+8)
+    return readVec3(shape.vertices,ia),readVec3(shape.vertices,ib),readVec3(shape.vertices,ic)
+end
+
+local function heightVertex(shape,x,z)
+    local h=buffer.readf32(shape.heights,(z*shape.width+x)*4)
+    local o=shape.origin
+    return vector.create(o.X+x*shape.cellSizeX,o.Y+h,o.Z+z*shape.cellSizeZ)
+end
+
+local function transformedBoundsLocal(qv,qw,p,mn,mx)
+    local lmn=vector.create(math.huge,math.huge,math.huge)
+    local lmx=vector.create(-math.huge,-math.huge,-math.huge)
+    for xi=0,1 do for yi=0,1 do for zi=0,1 do
+        local v=vector.create(if xi==0 then mn.X else mx.X,if yi==0 then mn.Y else mx.Y,if zi==0 then mn.Z else mx.Z)
+        local l=qInvRotate(qv,qw,v-p)
+        lmn=vector.create(math.min(lmn.X,l.X),math.min(lmn.Y,l.Y),math.min(lmn.Z,l.Z))
+        lmx=vector.create(math.max(lmx.X,l.X),math.max(lmx.Y,l.Y),math.max(lmx.Z,l.Z))
+    end end end
+    return lmn,lmx
+end
+
+
+local function collidePrimitives(sa,ap,aqv,aqw,sb,bp,bqv,bqw,margin)
+    local ok,n,p,pen
+    if sa.kind==SHAPE_SPHERE and sb.kind==SHAPE_SPHERE then
+        return sphereSphere(ap,sa.radius,bp,sb.radius,margin)
+    elseif sa.kind==SHAPE_SPHERE and sb.kind==SHAPE_BOX then
+        return sphereBox(ap,sa.radius,bp,bqv,bqw,sb.halfExtents,margin)
+    elseif sa.kind==SHAPE_BOX and sb.kind==SHAPE_SPHERE then
+        ok,n,p,pen=sphereBox(bp,sb.radius,ap,aqv,aqw,sa.halfExtents,margin);if ok then n=-n end;return ok,n,p,pen
+    elseif sa.kind==SHAPE_BOX and sb.kind==SHAPE_BOX then
+        local a0,a1,a2=qAxes(aqv,aqw);local b0,b1,b2=qAxes(bqv,bqw)
+        ok,n,p,pen=boxBox(ap,a0,a1,a2,sa.halfExtents,bp,b0,b1,b2,sb.halfExtents,margin);return ok,n,p,pen
+    elseif sa.kind==SHAPE_CAPSULE and sb.kind==SHAPE_SPHERE then
+        return capsuleSphere(ap,aqv,aqw,sa.radius,sa.halfHeight,bp,sb.radius,margin)
+    elseif sa.kind==SHAPE_SPHERE and sb.kind==SHAPE_CAPSULE then
+        ok,n,p,pen=capsuleSphere(bp,bqv,bqw,sb.radius,sb.halfHeight,ap,sa.radius,margin);if ok then n=-n end;return ok,n,p,pen
+    elseif sa.kind==SHAPE_CAPSULE and sb.kind==SHAPE_CAPSULE then
+        return capsuleCapsule(ap,aqv,aqw,sa.radius,sa.halfHeight,bp,bqv,bqw,sb.radius,sb.halfHeight,margin)
+    elseif sa.kind==SHAPE_CAPSULE and sb.kind==SHAPE_BOX then
+        return capsuleBox(ap,aqv,aqw,sa.radius,sa.halfHeight,bp,bqv,bqw,sb.halfExtents,margin)
+    elseif sa.kind==SHAPE_BOX and sb.kind==SHAPE_CAPSULE then
+        ok,n,p,pen=capsuleBox(bp,bqv,bqw,sb.radius,sb.halfHeight,ap,aqv,aqw,sa.halfExtents,margin);if ok then n=-n end;return ok,n,p,pen
+    end
+    return false
+end
+
+local function primitiveTriangleContact(shape,p,qv,qw,a,b,c,margin)
+    if shape.kind==SHAPE_SPHERE then return sphereTriangle(p,shape.radius,a,b,c,margin) end
+    if shape.kind==SHAPE_CAPSULE then return capsuleTriangle(p,qv,qw,shape.radius,shape.halfHeight,a,b,c,margin) end
+    if shape.kind==SHAPE_BOX then return boxTriangle(p,qv,qw,shape.halfExtents,a,b,c,margin) end
+    return false
+end
+
+local function rayTriangleT(origin,dir,maxDist,a,b,c)
+    local e1,e2=b-a,c-a
+    local p=vector.cross(dir,e2)
+    local det=vector.dot(e1,p)
+    if math.abs(det)<1e-9 then return nil end
+    local inv=1/det
+    local tvec=origin-a
+    local u=vector.dot(tvec,p)*inv
+    if u<0 or u>1 then return nil end
+    local q=vector.cross(tvec,e1)
+    local v=vector.dot(dir,q)*inv
+    if v<0 or u+v>1 then return nil end
+    local t=vector.dot(e2,q)*inv
+    if t<0 or t>maxDist then return nil end
+    return t
+end
+
+local function triangleRayNormal(a,b,c,dir)
+    local n=safeUnit(vector.cross(b-a,c-a),YAXIS)
+    if vector.dot(n,dir)>0 then n=-n end
+    return n
+end
+
+local function rayTriangle(origin,dir,maxDist,a,b,c)
+    local t=rayTriangleT(origin,dir,maxDist,a,b,c)
+    if not t then return nil end
+    return t,triangleRayNormal(a,b,c,dir),origin+dir*t
+end
+
+
+local function sphereTriangleGap(startPos,motion,t,r2,a,b,c)
+    local p=startPos+motion*t
+    local q=closestPointTriangle(p,a,b,c)
+    local d=p-q
+    return vector.dot(d,d)-r2,p,q
+end
+
+local function sweepSphereTriangle(startPos,endPos,radius,a,b,c)
+    local q0=closestPointTriangle(startPos,a,b,c)
+    local d0=startPos-q0
+    local r2=radius*radius
+    if vector.dot(d0,d0)<=r2 then return nil end
+    local motion=endPos-startPos
+    local lo,hi=0,1
+    for _=1,10 do
+        local aT=(2*lo+hi)/3
+        local bT=(lo+2*hi)/3
+        local ga=sphereTriangleGap(startPos,motion,aT,r2,a,b,c)
+        local gb=sphereTriangleGap(startPos,motion,bT,r2,a,b,c)
+        if ga<gb then hi=bT else lo=aT end
+    end
+    local tMin=(lo+hi)*0.5
+    if sphereTriangleGap(startPos,motion,tMin,r2,a,b,c)>0 then return nil end
+    lo,hi=0,tMin
+    for _=1,14 do
+        local mid=(lo+hi)*0.5
+        if sphereTriangleGap(startPos,motion,mid,r2,a,b,c)<=0 then hi=mid else lo=mid end
+    end
+    local t=hi
+    local _,p,q=sphereTriangleGap(startPos,motion,t,r2,a,b,c)
+    return t,safeUnit(p-q,safeUnit(vector.cross(b-a,c-a),YAXIS))
+end
+
+local function sphereSegmentGap(startPos,motion,t,r2,a,b)
+    local p=startPos+motion*t
+    local q=closestPointSegment(p,a,b)
+    local d=p-q
+    return vector.dot(d,d)-r2,p,q
+end
+
+local function sweepSphereSegment(startPos,endPos,radius,a,b)
+    local q0=closestPointSegment(startPos,a,b)
+    local d0=startPos-q0
+    local r2=radius*radius
+    if vector.dot(d0,d0)<=r2 then return nil end
+    local motion=endPos-startPos
+    local lo,hi=0,1
+    for _=1,9 do
+        local aT=(2*lo+hi)/3
+        local bT=(lo+2*hi)/3
+        if sphereSegmentGap(startPos,motion,aT,r2,a,b)<sphereSegmentGap(startPos,motion,bT,r2,a,b) then hi=bT else lo=aT end
+    end
+    local tMin=(lo+hi)*0.5
+    if sphereSegmentGap(startPos,motion,tMin,r2,a,b)>0 then return nil end
+    lo,hi=0,tMin
+    for _=1,13 do local mid=(lo+hi)*0.5;if sphereSegmentGap(startPos,motion,mid,r2,a,b)<=0 then hi=mid else lo=mid end end
+    local t=hi
+    local _,p,q=sphereSegmentGap(startPos,motion,t,r2,a,b)
+    return t,safeUnit(p-q,YAXIS)
+end
+
 local function sweepSphereSphere(a,b,radius,center,targetRadius)
     local d=b-a
     local m=a-center
@@ -679,8 +1174,9 @@ end
 function World:addBody(desc)
     desc = desc or {}
     local shape = desc.shape or M.sphere(0.5)
-    assert(type(shape) == "table" and (shape.kind == SHAPE_SPHERE or shape.kind == SHAPE_BOX or shape.kind == SHAPE_CAPSULE), "physik.addBody: invalid shape")
+    assert(type(shape) == "table" and (shape.kind == SHAPE_SPHERE or shape.kind == SHAPE_BOX or shape.kind == SHAPE_CAPSULE or shape.kind == SHAPE_MESH or shape.kind == SHAPE_HEIGHTFIELD or shape.kind == SHAPE_COMPOUND), "physik.addBody: invalid shape")
     local kind = bodyTypeCode(desc.type)
+    assert(not ((shape.kind==SHAPE_MESH or shape.kind==SHAPE_HEIGHTFIELD) and kind==BODY_DYNAMIC), "physik.addBody: triangle meshes and heightfields must be static or kinematic")
     local mass = if kind == BODY_DYNAMIC then (desc.mass or 1) else 0
     assert(mass >= 0, "physik.addBody: mass must be >= 0")
     local i = self:_allocSlot()
@@ -710,24 +1206,37 @@ function World:addBody(desc)
     self.mask[i] = if desc.mask == nil then 0xffffffff else desc.mask
     self.userData[i] = desc.userData
     self.ccd[i] = desc.ccd == true
+    self.sensor[i] = desc.sensor == true
     self.prevPos[i] = self.pos[i]
     self.sleeping[i] = false
     self.sleepTime[i] = 0
     self.aabbMin[i] = ZERO
     self.aabbMax[i] = ZERO
+    self:_updateAabb(i)
+    self.gridValid=false
     return makeHandle(i,self.generation[i])
 end
 
 function World:removeBody(handle)
     local i = self:_check(handle)
-    for id,j in self.joints do
-        if j.a==i or j.b==i then self:_dropJoint(id,j) end
+    for id=1,self.nextJoint-1 do
+        local j=self.joints[id]
+        if j and (j.a==i or j.b==i) then self:_dropJoint(id,j) end
     end
     self.alive[i] = false
     self.aliveCount -= 1
     self.free[#self.free+1] = i
     self.userData[i] = nil
     self.sleeping[i] = false
+    -- A destroyed slot must not turn into a "stay" event if the numeric slot is reused.
+    for k=1,#self.contactPairPrev do
+        local key=self.contactPairPrev[k]
+        if self.contactPairA[key]==i or self.contactPairB[key]==i then
+            self.contactPairActive[key]=nil
+            self.contactPairA[key]=nil;self.contactPairB[key]=nil;self.contactPairSensor[key]=nil
+        end
+    end
+    self.gridValid=false
 end
 
 function World:getBody(handle)
@@ -740,6 +1249,7 @@ function World:getBody(handle)
         velocity = self.linVel[i],
         angularVelocity = self.angVel[i],
         sleeping = self.sleeping[i],
+        sensor = self.sensor[i],
         userData = self.userData[i],
     }
 end
@@ -747,6 +1257,7 @@ end
 function World:setPosition(handle, p, wake)
     local i = self:_check(handle)
     self.pos[i] = p
+    self.gridValid=false
     if wake ~= false then self:wake(handle) end
 end
 
@@ -754,7 +1265,43 @@ function World:setRotation(handle,q,wake)
     local i=self:_check(handle)
     self.qv[i],self.qw[i]=qNormalize(q.v,q.w)
     self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.qv[i],self.qw[i])
+    self.gridValid=false
     if wake~=false then self:wake(handle) end
+end
+
+
+function World:driveKinematic(handle,targetPosition,targetRotation,dt)
+    local i=self:_check(handle)
+    assert(self.bodyType[i]==BODY_KINEMATIC,"physik.driveKinematic: body must be kinematic")
+    assert(typeof(targetPosition)=="vector" and type(dt)=="number" and dt>0,"physik.driveKinematic: target position must be a vector and dt > 0")
+    self.linVel[i]=(targetPosition-self.pos[i])/dt
+    if targetRotation then
+        assert(type(targetRotation)=="table" and typeof(targetRotation.v)=="vector" and type(targetRotation.w)=="number","physik.driveKinematic: rotation must come from physik.quat/axisAngle")
+        local tv,tw=qNormalize(targetRotation.v,targetRotation.w)
+        local dv,dw=qMul(tv,tw,-self.qv[i],self.qw[i])
+        if dw<0 then dv,dw=-dv,-dw end
+        dw=clamp(dw,-1,1)
+        local angle=2*math.acos(dw)
+        local s2=math.max(1-dw*dw,0)
+        if angle>1e-7 and s2>1e-12 then self.angVel[i]=dv*(angle/(math.sqrt(s2)*dt)) else self.angVel[i]=ZERO end
+    else
+        self.angVel[i]=ZERO
+    end
+end
+
+function World:shiftOrigin(delta)
+    assert(typeof(delta)=="vector","physik.shiftOrigin: delta must be a vector")
+    for i=1,self.high do
+        if self.alive[i] then
+            self.pos[i]-=delta
+            self.prevPos[i]-=delta
+            self.aabbMin[i]-=delta
+            self.aabbMax[i]-=delta
+        end
+    end
+    for c=1,self.contactCount do self.cp[c]-=delta end
+    self.gridValid=false
+    return self
 end
 
 function World:setVelocity(handle, v)
@@ -794,6 +1341,22 @@ function World:applyForceAtPoint(handle, f, point)
     self.sleepTime[i] = 0
 end
 
+function World:applyTorque(handle, torque)
+    local i=self:_check(handle)
+    if self.bodyType[i]~=BODY_DYNAMIC then return end
+    self.torque[i]+=torque
+    self.sleeping[i]=false
+    self.sleepTime[i]=0
+end
+
+function World:applyAngularImpulse(handle, impulse)
+    local i=self:_check(handle)
+    if self.bodyType[i]~=BODY_DYNAMIC then return end
+    self.angVel[i]+=applyInvInertia(self,i,impulse)
+    self.sleeping[i]=false
+    self.sleepTime[i]=0
+end
+
 function World:applyImpulse(handle, impulse, point)
     local i = self:_check(handle)
     if self.bodyType[i] ~= BODY_DYNAMIC then return end
@@ -828,6 +1391,7 @@ function World:addDistanceJoint(aHandle,bHandle,opts)
         local key=bodyPairKey(a,b)
         self.jointNoCollide[key]=(self.jointNoCollide[key] or 0)+1
     end
+    self.jointCount+=1
     return id
 end
 
@@ -841,6 +1405,7 @@ function World:addBallJoint(aHandle,bHandle,opts)
         local key=bodyPairKey(a,b)
         self.jointNoCollide[key]=(self.jointNoCollide[key] or 0)+1
     end
+    self.jointCount+=1
     return id
 end
 
@@ -854,6 +1419,7 @@ function World:addHingeJoint(aHandle,bHandle,opts)
         local key=bodyPairKey(a,b)
         self.jointNoCollide[key]=(self.jointNoCollide[key] or 0)+1
     end
+    self.jointCount+=1
     return id
 end
 
@@ -866,6 +1432,7 @@ function World:_dropJoint(id,j)
         if count<=1 then self.jointNoCollide[key]=nil else self.jointNoCollide[key]=count-1 end
     end
     self.joints[id]=nil
+    self.jointCount-=1
 end
 
 function World:removeJoint(id)
@@ -888,13 +1455,25 @@ function World:_updateAabb(i)
             math.abs(a0.Z)*h.X + math.abs(a1.Z)*h.Y + math.abs(a2.Z)*h.Z
         )
         self.aabbMin[i],self.aabbMax[i] = p-e,p+e
-    else
+    elseif shape.kind == SHAPE_CAPSULE then
         local a0,axis,a2=qAxes(self.qv[i],self.qw[i])
         self.axis0[i],self.axis1[i],self.axis2[i]=a0,axis,a2
         local h = shape.halfHeight
         local r = shape.radius
         local e = vector.create(math.abs(axis.X)*h+r,math.abs(axis.Y)*h+r,math.abs(axis.Z)*h+r)
         self.aabbMin[i],self.aabbMax[i] = p-e,p+e
+    else
+        local a0,a1,a2=qAxes(self.qv[i],self.qw[i])
+        self.axis0[i],self.axis1[i],self.axis2[i]=a0,a1,a2
+        local lc=(shape.localMin+shape.localMax)*0.5
+        local lh=(shape.localMax-shape.localMin)*0.5
+        local wc=p+qRotate(self.qv[i],self.qw[i],lc)
+        local e=vector.create(
+            math.abs(a0.X)*lh.X+math.abs(a1.X)*lh.Y+math.abs(a2.X)*lh.Z,
+            math.abs(a0.Y)*lh.X+math.abs(a1.Y)*lh.Y+math.abs(a2.Y)*lh.Z,
+            math.abs(a0.Z)*lh.X+math.abs(a1.Z)*lh.Y+math.abs(a2.Z)*lh.Z
+        )
+        self.aabbMin[i],self.aabbMax[i]=wc-e,wc+e
     end
     local margin=self.contactMargin
     if margin>0 then
@@ -941,8 +1520,151 @@ function World:_addContact(a,b,n,p,pen)
     self.ctangentImpulse2[c]=0
 end
 
+
+function World:_pushGeomContact(n,p,pen)
+    local count=self.geomContactCount
+    for k=1,count do
+        if vector.dot(self.geomPoint[k]-p,self.geomPoint[k]-p)<1e-6 then
+            if pen>self.geomPen[k] then self.geomNormal[k],self.geomPoint[k],self.geomPen[k]=n,p,pen end
+            return
+        end
+    end
+    if count<4 then
+        count+=1
+        self.geomContactCount=count
+        self.geomNormal[count],self.geomPoint[count],self.geomPen[count]=n,p,pen
+        return
+    end
+    local shallow=1
+    for k=2,4 do if self.geomPen[k]<self.geomPen[shallow] then shallow=k end end
+    if pen>self.geomPen[shallow] then self.geomNormal[shallow],self.geomPoint[shallow],self.geomPen[shallow]=n,p,pen end
+end
+
+function World:_testGeomTriangle(prim,geom,la,lb,lc,flip)
+    local gp,gqv,gqw=self.pos[geom],self.qv[geom],self.qw[geom]
+    local a=gp+qRotate(gqv,gqw,la)
+    local b=gp+qRotate(gqv,gqw,lb)
+    local c=gp+qRotate(gqv,gqw,lc)
+    local ps=self.shape[prim]
+    if ps.kind==SHAPE_COMPOUND then
+        local bp,bqv,bqw=self.pos[prim],self.qv[prim],self.qw[prim]
+        for k=1,ps.count do
+            local cv,cw=qMul(bqv,bqw,ps.qv[k],ps.qw[k])
+            local cp=bp+qRotate(bqv,bqw,ps.positions[k])
+            local ok,n,p,pen=primitiveTriangleContact(ps.shapes[k],cp,cv,cw,a,b,c,self.contactMargin)
+            if ok then if flip then n=-n end;self:_pushGeomContact(n,p,pen) end
+        end
+        return
+    end
+    local ok,n,p,pen=primitiveTriangleContact(ps,self.pos[prim],self.qv[prim],self.qw[prim],a,b,c,self.contactMargin)
+    if ok then if flip then n=-n end;self:_pushGeomContact(n,p,pen) end
+end
+function World:_meshTriangleOnce(prim,geom,shape,t,flip,epoch)
+    if self.meshMarks[t]==epoch then return end
+    self.meshMarks[t]=epoch
+    local a,b,c=meshTriangle(shape,t)
+    self:_testGeomTriangle(prim,geom,a,b,c,flip)
+end
+
+function World:_narrowMesh(prim,geom,flip)
+    local shape=self.shape[geom]
+    local lmn,lmx=transformedBoundsLocal(self.qv[geom],self.qw[geom],self.pos[geom],self.aabbMin[prim],self.aabbMax[prim])
+    local cs=shape.cellSize
+    local x0,y0,z0=math.floor(lmn.X/cs),math.floor(lmn.Y/cs),math.floor(lmn.Z/cs)
+    local x1,y1,z1=math.floor(lmx.X/cs),math.floor(lmx.Y/cs),math.floor(lmx.Z/cs)
+    local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
+    self.meshMarkEpoch+=1
+    local epoch=self.meshMarkEpoch
+    if cells>self.meshQueryCellLimit then
+        for t=0,shape.triangleCount-1 do self:_meshTriangleOnce(prim,geom,shape,t,flip,epoch) end
+        return
+    end
+    for x=x0,x1 do for y=y0,y1 do for z=z0,z1 do
+        local key=packCell(x,y,z)
+        if key then
+            local node=shape.heads[key] or 0
+            while node~=0 do
+                self:_meshTriangleOnce(prim,geom,shape,shape.nodeTri[node],flip,epoch)
+                node=shape.nextNode[node]
+            end
+        end
+    end end end
+    for k=1,#shape.overflow do self:_meshTriangleOnce(prim,geom,shape,shape.overflow[k],flip,epoch) end
+end
+
+function World:_narrowHeightfield(prim,geom,flip)
+    local shape=self.shape[geom]
+    local lmn,lmx=transformedBoundsLocal(self.qv[geom],self.qw[geom],self.pos[geom],self.aabbMin[prim],self.aabbMax[prim])
+    local o=shape.origin
+    local x0=clamp(math.floor((lmn.X-o.X)/shape.cellSizeX),0,shape.width-2)
+    local x1=clamp(math.floor((lmx.X-o.X)/shape.cellSizeX),0,shape.width-2)
+    local z0=clamp(math.floor((lmn.Z-o.Z)/shape.cellSizeZ),0,shape.depth-2)
+    local z1=clamp(math.floor((lmx.Z-o.Z)/shape.cellSizeZ),0,shape.depth-2)
+    if x1<x0 or z1<z0 then return end
+    for z=z0,z1 do for x=x0,x1 do
+        local v00=heightVertex(shape,x,z)
+        local v10=heightVertex(shape,x+1,z)
+        local v01=heightVertex(shape,x,z+1)
+        local v11=heightVertex(shape,x+1,z+1)
+        self:_testGeomTriangle(prim,geom,v00,v10,v11,flip)
+        self:_testGeomTriangle(prim,geom,v00,v11,v01,flip)
+    end end
+end
+
+function World:_narrowGeometry(a,b)
+    local sa,sb=self.shape[a],self.shape[b]
+    local aGeom=sa.kind==SHAPE_MESH or sa.kind==SHAPE_HEIGHTFIELD
+    local bGeom=sb.kind==SHAPE_MESH or sb.kind==SHAPE_HEIGHTFIELD
+    if aGeom and bGeom then return end
+    local prim,geom,flip
+    if aGeom then prim,geom,flip=b,a,true else prim,geom,flip=a,b,false end
+    self.geomContactCount=0
+    if self.shape[geom].kind==SHAPE_MESH then self:_narrowMesh(prim,geom,flip) else self:_narrowHeightfield(prim,geom,flip) end
+    for k=1,self.geomContactCount do self:_addContact(a,b,self.geomNormal[k],self.geomPoint[k],self.geomPen[k]) end
+end
+
+
+function World:_testCompoundPrimitive(ashape,ap,aqv,aqw,bshape,bp,bqv,bqw)
+    local ok,n,p,pen=collidePrimitives(ashape,ap,aqv,aqw,bshape,bp,bqv,bqw,self.contactMargin)
+    if ok then self:_pushGeomContact(n,p,pen) end
+end
+
+function World:_narrowCompound(a,b)
+    local sa,sb=self.shape[a],self.shape[b]
+    local aComp=sa.kind==SHAPE_COMPOUND
+    local bComp=sb.kind==SHAPE_COMPOUND
+    self.geomContactCount=0
+    if aComp and bComp then
+        for i=1,sa.count do
+            local aqv,aqw=qMul(self.qv[a],self.qw[a],sa.qv[i],sa.qw[i]);local ap=self.pos[a]+qRotate(self.qv[a],self.qw[a],sa.positions[i])
+            for j=1,sb.count do
+                local bqv,bqw=qMul(self.qv[b],self.qw[b],sb.qv[j],sb.qw[j]);local bp=self.pos[b]+qRotate(self.qv[b],self.qw[b],sb.positions[j])
+                self:_testCompoundPrimitive(sa.shapes[i],ap,aqv,aqw,sb.shapes[j],bp,bqv,bqw)
+            end
+        end
+    elseif aComp then
+        for i=1,sa.count do
+            local aqv,aqw=qMul(self.qv[a],self.qw[a],sa.qv[i],sa.qw[i]);local ap=self.pos[a]+qRotate(self.qv[a],self.qw[a],sa.positions[i])
+            self:_testCompoundPrimitive(sa.shapes[i],ap,aqv,aqw,sb,self.pos[b],self.qv[b],self.qw[b])
+        end
+    else
+        for j=1,sb.count do
+            local bqv,bqw=qMul(self.qv[b],self.qw[b],sb.qv[j],sb.qw[j]);local bp=self.pos[b]+qRotate(self.qv[b],self.qw[b],sb.positions[j])
+            self:_testCompoundPrimitive(sa,self.pos[a],self.qv[a],self.qw[a],sb.shapes[j],bp,bqv,bqw)
+        end
+    end
+    for k=1,self.geomContactCount do self:_addContact(a,b,self.geomNormal[k],self.geomPoint[k],self.geomPen[k]) end
+end
 function World:_narrow(a,b)
     local sa,sb=self.shape[a],self.shape[b]
+    if sa.kind==SHAPE_MESH or sa.kind==SHAPE_HEIGHTFIELD or sb.kind==SHAPE_MESH or sb.kind==SHAPE_HEIGHTFIELD then
+        self:_narrowGeometry(a,b)
+        return
+    end
+    if sa.kind==SHAPE_COMPOUND or sb.kind==SHAPE_COMPOUND then
+        self:_narrowCompound(a,b)
+        return
+    end
     local ap,bp=self.pos[a],self.pos[b]
     local aqv,aqw,bqv,bqw=self.qv[a],self.qw[a],self.qv[b],self.qw[b]
     local ok,n,p,pen
@@ -1007,12 +1729,13 @@ function World:_collideSap()
     end
 end
 
-function World:_collideGrid()
+function World:_buildGridIndex()
     local heads,keys,nextIn=self.gridHeads,self.gridKeys,self.gridNext
     for k=1,#keys do heads[keys[k]]=nil; keys[k]=nil end
     local large=self.gridLarge
     for k=#large,1,-1 do large[k]=nil end
     local cs=self.broadphaseCellSize
+    local smallCount=0
 
     for i=1,self.high do
         if not self.alive[i] then continue end
@@ -1022,6 +1745,7 @@ function World:_collideGrid()
         local cx,cy,cz=math.floor(p.X/cs),math.floor(p.Y/cs),math.floor(p.Z/cs)
         local key=if ex<=cs and ey<=cs and ez<=cs then packCell(cx,cy,cz) else nil
         if key then
+            smallCount+=1
             self.gridX[i],self.gridY[i],self.gridZ[i]=cx,cy,cz
             self.gridKey[i]=key
             local old=heads[key]
@@ -1037,6 +1761,21 @@ function World:_collideGrid()
             large[#large+1]=i
         end
     end
+    self.gridSmallCount=smallCount
+    self.gridValid=true
+end
+
+function World:_ensureQueryGrid()
+    if self.gridValid then return end
+    for i=1,self.high do if self.alive[i] then self:_updateAabb(i) end end
+    self:_buildGridIndex()
+end
+
+function World:_collideGrid()
+    self:_buildGridIndex()
+    local heads,keys,nextIn=self.gridHeads,self.gridKeys,self.gridNext
+    local large=self.gridLarge
+    local cs=self.broadphaseCellSize
 
     -- Small-small: walk occupied cells, not bodies. Every cell checks only the lexicographic
     -- forward half of its 3x3x3 neighborhood, so pair generation is unique without a pair set.
@@ -1162,15 +1901,18 @@ function World:_buildIslands()
     end
     for c=1,self.contactCount do
         local a,b=self.ca[c],self.cb[c]
-        if self.bodyType[a]==BODY_DYNAMIC and self.bodyType[b]==BODY_DYNAMIC then
+        if not self.sensor[a] and not self.sensor[b] and self.bodyType[a]==BODY_DYNAMIC and self.bodyType[b]==BODY_DYNAMIC then
             unionBodies(parent,size,a,b)
         end
     end
-    for _,j in self.joints do
-        local a,b=j.a,j.b
-        if self.alive[a] and self.alive[b] and self.generation[a]==j.ga and self.generation[b]==j.gb
-            and self.bodyType[a]==BODY_DYNAMIC and self.bodyType[b]==BODY_DYNAMIC then
-            unionBodies(parent,size,a,b)
+    for id=1,self.nextJoint-1 do
+        local j=self.joints[id]
+        if j then
+            local a,b=j.a,j.b
+            if self.alive[a] and self.alive[b] and self.generation[a]==j.ga and self.generation[b]==j.gb
+                and self.bodyType[a]==BODY_DYNAMIC and self.bodyType[b]==BODY_DYNAMIC then
+                unionBodies(parent,size,a,b)
+            end
         end
     end
 
@@ -1287,11 +2029,55 @@ local function contactTangents(n)
     return t1,vector.cross(n,t1)
 end
 
+function World:_buildContactEvents()
+    self.contactEventEpoch+=1
+    local epoch=self.contactEventEpoch
+    local seen=self.contactPairSeen
+    local active=self.contactPairActive
+    local pairA,pairB,pairSensor=self.contactPairA,self.contactPairB,self.contactPairSensor
+    local prev,nextKeys=self.contactPairPrev,self.contactPairNext
+    for k=#nextKeys,1,-1 do nextKeys[k]=nil end
+    local eventCount=0
+    for c=1,self.contactCount do
+        local a,b=self.ca[c],self.cb[c]
+        local key=bodyPairKey(a,b)
+        if seen[key]~=epoch then
+            seen[key]=epoch
+            nextKeys[#nextKeys+1]=key
+            pairA[key],pairB[key]=a,b
+            local sensor=self.sensor[a] or self.sensor[b]
+            pairSensor[key]=sensor
+            eventCount+=1
+            self.eventA[eventCount],self.eventB[eventCount]=a,b
+            self.eventKind[eventCount]=if active[key] then EVENT_STAY else EVENT_ENTER
+            self.eventSensor[eventCount]=sensor
+            active[key]=true
+        end
+    end
+    for k=1,#prev do
+        local key=prev[k]
+        if seen[key]~=epoch and active[key] then
+            local a,b=pairA[key],pairB[key]
+            if a and b then
+                eventCount+=1
+                self.eventA[eventCount],self.eventB[eventCount]=a,b
+                self.eventKind[eventCount]=EVENT_EXIT
+                self.eventSensor[eventCount]=pairSensor[key]==true
+            end
+            active[key]=nil;pairA[key]=nil;pairB[key]=nil;pairSensor[key]=nil
+        end
+        prev[k]=nil
+    end
+    self.contactPairPrev,self.contactPairNext=nextKeys,prev
+    self.contactEventCount=eventCount
+end
+
 function World:_wakeContacts()
     local speed2=self.wakeSpeed*self.wakeSpeed
     local wakePen=self.wakePenetration
     for c=1,self.contactCount do
         local a,b=self.ca[c],self.cb[c]
+        if self.sensor[a] or self.sensor[b] then continue end
         local sa,sb=self.sleeping[a],self.sleeping[b]
         if sa==sb then continue end
         local sleeper=if sa then a else b
@@ -1312,7 +2098,7 @@ function World:_prepareContacts(dt)
     local activeCount=0
     for c=1,self.contactCount do
         local a,b=self.ca[c],self.cb[c]
-        local active=(self.invMass[a]>0 and not self.sleeping[a]) or (self.invMass[b]>0 and not self.sleeping[b])
+        local active=not (self.sensor[a] or self.sensor[b]) and ((self.invMass[a]>0 and not self.sleeping[a]) or (self.invMass[b]>0 and not self.sleeping[b]))
         self.cactive[c]=active
         if active then
             activeCount+=1
@@ -1481,7 +2267,9 @@ local function solveBallAxes(self,j,a,b,ra,rb,wa,wb,dt)
 end
 
 function World:_solveJoints(dt)
-    for id,j in self.joints do
+    for id=1,self.nextJoint-1 do
+        local j=self.joints[id]
+        if not j then continue end
         local a,b=j.a,j.b
         if not self.alive[a] or not self.alive[b] or self.generation[a]~=j.ga or self.generation[b]~=j.gb then self:_dropJoint(id,j); continue end
         if (self.invMass[a]==0 or self.sleeping[a]) and (self.invMass[b]==0 or self.sleeping[b]) then continue end
@@ -1592,12 +2380,115 @@ function World:_integrate(dt)
     end
 end
 
+
+function World:_sweepSphereMesh(geom,startPos,endPos,radius)
+    local shape=self.shape[geom]
+    local gqv,gqw,gp=self.qv[geom],self.qw[geom],self.pos[geom]
+    local ls=qInvRotate(gqv,gqw,startPos-gp)
+    local le=qInvRotate(gqv,gqw,endPos-gp)
+    local e=vector.create(radius,radius,radius)
+    local mn=vector.create(math.min(ls.X,le.X),math.min(ls.Y,le.Y),math.min(ls.Z,le.Z))-e
+    local mx=vector.create(math.max(ls.X,le.X),math.max(ls.Y,le.Y),math.max(ls.Z,le.Z))+e
+    local cs=shape.cellSize
+    local x0,y0,z0=math.floor(mn.X/cs),math.floor(mn.Y/cs),math.floor(mn.Z/cs)
+    local x1,y1,z1=math.floor(mx.X/cs),math.floor(mx.Y/cs),math.floor(mx.Z/cs)
+    local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
+    self.meshMarkEpoch+=1
+    local epoch=self.meshMarkEpoch
+    local bestT,bestN=1,nil
+    if cells>self.meshQueryCellLimit then
+        for t=0,shape.triangleCount-1 do
+            self.meshMarks[t]=epoch
+            local a,b,c=meshTriangle(shape,t)
+            local tt,n=sweepSphereTriangle(ls,le,radius,a,b,c)
+            if tt and tt<bestT then bestT,bestN=tt,n end
+        end
+    else
+        for x=x0,x1 do for y=y0,y1 do for z=z0,z1 do
+            local key=packCell(x,y,z)
+            if key then
+                local node=shape.heads[key] or 0
+                while node~=0 do
+                    local t=shape.nodeTri[node]
+                    if self.meshMarks[t]~=epoch then
+                        self.meshMarks[t]=epoch
+                        local a,b,c=meshTriangle(shape,t)
+                        local tt,n=sweepSphereTriangle(ls,le,radius,a,b,c)
+                        if tt and tt<bestT then bestT,bestN=tt,n end
+                    end
+                    node=shape.nextNode[node]
+                end
+            end
+        end end end
+        for k=1,#shape.overflow do
+            local t=shape.overflow[k]
+            if self.meshMarks[t]~=epoch then
+                self.meshMarks[t]=epoch
+                local a,b,c=meshTriangle(shape,t)
+                local tt,n=sweepSphereTriangle(ls,le,radius,a,b,c)
+                if tt and tt<bestT then bestT,bestN=tt,n end
+            end
+        end
+    end
+    if not bestN then return nil end
+    return bestT,qRotate(gqv,gqw,bestN)
+end
+
+function World:_sweepSphereHeightfield(geom,startPos,endPos,radius)
+    local shape=self.shape[geom]
+    local gqv,gqw,gp=self.qv[geom],self.qw[geom],self.pos[geom]
+    local ls=qInvRotate(gqv,gqw,startPos-gp)
+    local le=qInvRotate(gqv,gqw,endPos-gp)
+    local o=shape.origin
+    local x0=clamp(math.floor((math.min(ls.X,le.X)-radius-o.X)/shape.cellSizeX),0,shape.width-2)
+    local x1=clamp(math.floor((math.max(ls.X,le.X)+radius-o.X)/shape.cellSizeX),0,shape.width-2)
+    local z0=clamp(math.floor((math.min(ls.Z,le.Z)-radius-o.Z)/shape.cellSizeZ),0,shape.depth-2)
+    local z1=clamp(math.floor((math.max(ls.Z,le.Z)+radius-o.Z)/shape.cellSizeZ),0,shape.depth-2)
+    local bestT,bestN=1,nil
+    for z=z0,z1 do for x=x0,x1 do
+        local v00=heightVertex(shape,x,z)
+        local v10=heightVertex(shape,x+1,z)
+        local v01=heightVertex(shape,x,z+1)
+        local v11=heightVertex(shape,x+1,z+1)
+        local t,n=sweepSphereTriangle(ls,le,radius,v00,v10,v11)
+        if t and t<bestT then bestT,bestN=t,n end
+        t,n=sweepSphereTriangle(ls,le,radius,v00,v11,v01)
+        if t and t<bestT then bestT,bestN=t,n end
+    end end
+    if not bestN then return nil end
+    return bestT,qRotate(gqv,gqw,bestN)
+end
+
+
+function World:_sweepSphereCompound(geom,startPos,endPos,radius)
+    local shape=self.shape[geom]
+    local bp,bqv,bqw=self.pos[geom],self.qv[geom],self.qw[geom]
+    local bestT,bestN=1,nil
+    for k=1,shape.count do
+        local cp=bp+qRotate(bqv,bqw,shape.positions[k])
+        local cqv,cqw=qMul(bqv,bqw,shape.qv[k],shape.qw[k])
+        local child=shape.shapes[k]
+        local t,n
+        if child.kind==SHAPE_SPHERE then
+            t,n=sweepSphereSphere(startPos,endPos,radius,cp,child.radius)
+        elseif child.kind==SHAPE_BOX then
+            t,n=sweepSphereBox(startPos,endPos,radius,cp,cqv,cqw,child.halfExtents)
+        else
+            local a,b=capsuleEndpoints(cp,cqv,cqw,child.halfHeight)
+            t,n=sweepSphereSegment(startPos,endPos,radius+child.radius,a,b)
+        end
+        if t and t<bestT then bestT,bestN=t,n end
+    end
+    if not bestN then return nil end
+    return bestT,bestN
+end
+
 function World:_ccd()
     self.ccdHitCount=0
     for i=1,self.high do
         if not self.alive[i] or self.bodyType[i]~=BODY_DYNAMIC or self.sleeping[i] or not self.ccd[i] then continue end
         local shape=self.shape[i]
-        if shape.kind~=SHAPE_SPHERE then continue end -- v0.2 CCD is intentionally sphere-first.
+        if shape.kind~=SHAPE_SPHERE then continue end -- CCD is intentionally sphere-first.
         local start=self.prevPos[i]
         local finish=self.pos[i]
         local motion=finish-start
@@ -1613,6 +2504,12 @@ function World:_ccd()
                 t,n=sweepSphereSphere(start,finish,shape.radius,self.pos[j],target.radius)
             elseif target.kind==SHAPE_BOX then
                 t,n=sweepSphereBox(start,finish,shape.radius,self.pos[j],self.qv[j],self.qw[j],target.halfExtents)
+            elseif target.kind==SHAPE_MESH then
+                t,n=self:_sweepSphereMesh(j,start,finish,shape.radius)
+            elseif target.kind==SHAPE_HEIGHTFIELD then
+                t,n=self:_sweepSphereHeightfield(j,start,finish,shape.radius)
+            elseif target.kind==SHAPE_COMPOUND then
+                t,n=self:_sweepSphereCompound(j,start,finish,shape.radius)
             end
             if t and t<bestT then bestT,bestN,bestJ=t,n,j end
         end
@@ -1679,6 +2576,7 @@ function World:step(dt,substeps)
         self:_integrate(h)
         self:_ccd()
         self:_collide()
+        if self.trackContactEvents then self:_buildContactEvents() else self.contactEventCount=0 end
         self:_wakeContacts()
         self:_buildIslands()
         self:_prepareContacts(h)
@@ -1686,6 +2584,9 @@ function World:step(dt,substeps)
         self:_storeContactCache()
         self:_correctPositions()
         self:_sleep(h)
+        -- Position correction can move bodies after the collision broadphase was built.
+        -- Queries rebuild lazily only if a query is actually issued.
+        self.gridValid=false
     end
     self.frame+=1
     return self.contactCount
@@ -1705,60 +2606,597 @@ local function raySphere(origin,dir,maxDist,center,radius)
     return t,safeUnit(p-center,-dir),p
 end
 
+local function rayCenteredSlab(o,d,h,tmin,tmax,axis,hitAxis,hitSign)
+    if math.abs(d)<EPS then return math.abs(o)<=h,tmin,tmax,hitAxis,hitSign end
+    local inv=1/d
+    local t1=(-h-o)*inv
+    local t2=(h-o)*inv
+    local sign=-1
+    if t1>t2 then t1,t2=t2,t1;sign=1 end
+    if t1>tmin then tmin=t1;hitAxis=axis;hitSign=sign end
+    if t2<tmax then tmax=t2 end
+    return tmin<=tmax,tmin,tmax,hitAxis,hitSign
+end
+
 local function rayBox(origin,dir,maxDist,center,qv,qw,half)
     local o=qInvRotate(qv,qw,origin-center)
     local d=qInvRotate(qv,qw,dir)
     local tmin,tmax=0,maxDist
     local hitAxis,hitSign=1,1
-    local function slab(ov,dv,h,axis)
-        if math.abs(dv)<EPS then
-            return math.abs(ov)<=h
-        end
-        local inv=1/dv
-        local t1=(-h-ov)*inv
-        local t2=(h-ov)*inv
-        local s=-1
-        if t1>t2 then t1,t2=t2,t1;s=1 end
-        if t1>tmin then tmin=t1;hitAxis=axis;hitSign=s end
-        if t2<tmax then tmax=t2 end
-        return tmin<=tmax
-    end
-    if not slab(o.X,d.X,half.X,1) or not slab(o.Y,d.Y,half.Y,2) or not slab(o.Z,d.Z,half.Z,3) then return nil end
+    local ok
+    ok,tmin,tmax,hitAxis,hitSign=rayCenteredSlab(o.X,d.X,half.X,tmin,tmax,1,hitAxis,hitSign);if not ok then return nil end
+    ok,tmin,tmax,hitAxis,hitSign=rayCenteredSlab(o.Y,d.Y,half.Y,tmin,tmax,2,hitAxis,hitSign);if not ok then return nil end
+    ok,tmin,tmax,hitAxis,hitSign=rayCenteredSlab(o.Z,d.Z,half.Z,tmin,tmax,3,hitAxis,hitSign);if not ok then return nil end
     if tmin<0 or tmin>maxDist then return nil end
     local nl=if hitAxis==1 then vector.create(hitSign,0,0) elseif hitAxis==2 then vector.create(0,hitSign,0) else vector.create(0,0,hitSign)
-    local p=origin+dir*tmin
-    return tmin,qRotate(qv,qw,nl),p
+    return tmin,qRotate(qv,qw,nl),origin+dir*tmin
 end
 
-function World:raycast(origin,direction,maxDistance,mask)
+local function rayRangeSlab(o,d,lo,hi,tmin,tmax)
+    if math.abs(d)<EPS then return o>=lo and o<=hi,tmin,tmax end
+    local inv=1/d
+    local a,b=(lo-o)*inv,(hi-o)*inv
+    if a>b then a,b=b,a end
+    if a>tmin then tmin=a end
+    if b<tmax then tmax=b end
+    return tmin<=tmax,tmin,tmax
+end
+
+local function rayAabbInterval(origin,dir,maxDist,mn,mx)
+    local tmin,tmax=0,maxDist
+    local ok
+    ok,tmin,tmax=rayRangeSlab(origin.X,dir.X,mn.X,mx.X,tmin,tmax);if not ok then return nil end
+    ok,tmin,tmax=rayRangeSlab(origin.Y,dir.Y,mn.Y,mx.Y,tmin,tmax);if not ok then return nil end
+    ok,tmin,tmax=rayRangeSlab(origin.Z,dir.Z,mn.Z,mx.Z,tmin,tmax);if not ok then return nil end
+    return tmin,tmax
+end
+
+function World:_rayMeshTriangleT(shape,t,origin,dir,bestT,epoch)
+    if self.meshMarks[t]==epoch then return nil end
+    self.meshMarks[t]=epoch
+    local a,b,c=meshTriangle(shape,t)
+    return rayTriangleT(origin,dir,bestT,a,b,c)
+end
+
+function World:_rayMesh(i,origin,dir,maxDist)
+    local shape=self.shape[i]
+    local lo=qInvRotate(self.qv[i],self.qw[i],origin-self.pos[i])
+    local ld=qInvRotate(self.qv[i],self.qw[i],dir)
+    local enter,exit=rayAabbInterval(lo,ld,maxDist,shape.localMin,shape.localMax)
+    if not enter then return nil end
+    local a=lo+ld*math.max(enter,0)
+    local b=lo+ld*exit
+    local mn=vector.create(math.min(a.X,b.X),math.min(a.Y,b.Y),math.min(a.Z,b.Z))
+    local mx=vector.create(math.max(a.X,b.X),math.max(a.Y,b.Y),math.max(a.Z,b.Z))
+    local cs=shape.cellSize
+    local x0,y0,z0=math.floor(mn.X/cs),math.floor(mn.Y/cs),math.floor(mn.Z/cs)
+    local x1,y1,z1=math.floor(mx.X/cs),math.floor(mx.Y/cs),math.floor(mx.Z/cs)
+    local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
+    self.meshMarkEpoch+=1
+    local epoch=self.meshMarkEpoch
+    local bestT,bestTri=maxDist,nil
+    if cells>self.meshQueryCellLimit then
+        for t=0,shape.triangleCount-1 do
+            local tt=self:_rayMeshTriangleT(shape,t,lo,ld,bestT,epoch)
+            if tt and tt<bestT then bestT,bestTri=tt,t end
+        end
+    else
+        for x=x0,x1 do for y=y0,y1 do for z=z0,z1 do
+            local key=packCell(x,y,z)
+            if key then
+                local node=shape.heads[key] or 0
+                while node~=0 do
+                    local tri=shape.nodeTri[node]
+                    local tt=self:_rayMeshTriangleT(shape,tri,lo,ld,bestT,epoch)
+                    if tt and tt<bestT then bestT,bestTri=tt,tri end
+                    node=shape.nextNode[node]
+                end
+            end
+        end end end
+        for k=1,#shape.overflow do
+            local tri=shape.overflow[k]
+            local tt=self:_rayMeshTriangleT(shape,tri,lo,ld,bestT,epoch)
+            if tt and tt<bestT then bestT,bestTri=tt,tri end
+        end
+    end
+    if bestTri==nil then return nil end
+    local ta,tb,tc=meshTriangle(shape,bestTri)
+    local bestN=triangleRayNormal(ta,tb,tc,ld)
+    return bestT,qRotate(self.qv[i],self.qw[i],bestN),origin+dir*bestT
+end
+
+function World:_rayHeightfield(i,origin,dir,maxDist)
+    local shape=self.shape[i]
+    local lo=qInvRotate(self.qv[i],self.qw[i],origin-self.pos[i])
+    local ld=qInvRotate(self.qv[i],self.qw[i],dir)
+    local enter,exit=rayAabbInterval(lo,ld,maxDist,shape.localMin,shape.localMax)
+    if not enter then return nil end
+    local a=lo+ld*math.max(enter,0)
+    local b=lo+ld*exit
+    local o=shape.origin
+    local x0=clamp(math.floor((math.min(a.X,b.X)-o.X)/shape.cellSizeX),0,shape.width-2)
+    local x1=clamp(math.floor((math.max(a.X,b.X)-o.X)/shape.cellSizeX),0,shape.width-2)
+    local z0=clamp(math.floor((math.min(a.Z,b.Z)-o.Z)/shape.cellSizeZ),0,shape.depth-2)
+    local z1=clamp(math.floor((math.max(a.Z,b.Z)-o.Z)/shape.cellSizeZ),0,shape.depth-2)
+    local bestT,bestA,bestB,bestC=maxDist,nil,nil,nil
+    for z=z0,z1 do for x=x0,x1 do
+        local v00=heightVertex(shape,x,z)
+        local v10=heightVertex(shape,x+1,z)
+        local v01=heightVertex(shape,x,z+1)
+        local v11=heightVertex(shape,x+1,z+1)
+        local t=rayTriangleT(lo,ld,bestT,v00,v10,v11)
+        if t and t<bestT then bestT,bestA,bestB,bestC=t,v00,v10,v11 end
+        t=rayTriangleT(lo,ld,bestT,v00,v11,v01)
+        if t and t<bestT then bestT,bestA,bestB,bestC=t,v00,v11,v01 end
+    end end
+    if not bestA then return nil end
+    local bestN=triangleRayNormal(bestA,bestB,bestC,ld)
+    return bestT,qRotate(self.qv[i],self.qw[i],bestN),origin+dir*bestT
+end
+
+
+local function rayPrimitiveShape(shape,p,qv,qw,origin,dir,maxDist)
+    if shape.kind==SHAPE_SPHERE then return raySphere(origin,dir,maxDist,p,shape.radius) end
+    if shape.kind==SHAPE_BOX then return rayBox(origin,dir,maxDist,p,qv,qw,shape.halfExtents) end
+    local a,b=capsuleEndpoints(p,qv,qw,shape.halfHeight)
+    local m=(a+b)*0.5
+    local ta,na,pa=raySphere(origin,dir,maxDist,a,shape.radius)
+    local tm,nm,pm=raySphere(origin,dir,maxDist,m,shape.radius)
+    local tb,nb,pb=raySphere(origin,dir,maxDist,b,shape.radius)
+    local t,n,pt=ta,na,pa
+    if tm and (not t or tm<t) then t,n,pt=tm,nm,pm end
+    if tb and (not t or tb<t) then t,n,pt=tb,nb,pb end
+    return t,n,pt
+end
+
+function World:_rayCompound(i,origin,dir,maxDist)
+    local shape=self.shape[i]
+    local bp,bqv,bqw=self.pos[i],self.qv[i],self.qw[i]
+    local bestT,bestN,bestP=maxDist,nil,nil
+    for k=1,shape.count do
+        local cp=bp+qRotate(bqv,bqw,shape.positions[k])
+        local cqv,cqw=qMul(bqv,bqw,shape.qv[k],shape.qw[k])
+        local t,n,p=rayPrimitiveShape(shape.shapes[k],cp,cqv,cqw,origin,dir,bestT)
+        if t and t<bestT then bestT,bestN,bestP=t,n,p end
+    end
+    if not bestN then return nil end
+    return bestT,bestN,bestP
+end
+
+function World:_raycastBody(i,origin,dir,bestT,mask)
+    if not self.alive[i] or bit32.band(mask,self.group[i])==0 then return nil end
+    local mn,mx=self.aabbMin[i],self.aabbMax[i]
+    if not rayAabbInterval(origin,dir,bestT,mn,mx) then return nil end
+    local s=self.shape[i]
+    if s.kind==SHAPE_SPHERE then
+        return raySphere(origin,dir,bestT,self.pos[i],s.radius)
+    elseif s.kind==SHAPE_BOX then
+        return rayBox(origin,dir,bestT,self.pos[i],self.qv[i],self.qw[i],s.halfExtents)
+    elseif s.kind==SHAPE_MESH then
+        return self:_rayMesh(i,origin,dir,bestT)
+    elseif s.kind==SHAPE_HEIGHTFIELD then
+        return self:_rayHeightfield(i,origin,dir,bestT)
+    elseif s.kind==SHAPE_COMPOUND then
+        return self:_rayCompound(i,origin,dir,bestT)
+    end
+    local a,b=capsuleEndpoints(self.pos[i],self.qv[i],self.qw[i],s.halfHeight)
+    local m=(a+b)*0.5
+    local ta,na,pa=raySphere(origin,dir,bestT,a,s.radius)
+    local tm,nm,pm=raySphere(origin,dir,bestT,m,s.radius)
+    local tb,nb,pb=raySphere(origin,dir,bestT,b,s.radius)
+    local t,n,p=ta,na,pa
+    if tm and (not t or tm<t) then t,n,p=tm,nm,pm end
+    if tb and (not t or tb<t) then t,n,p=tb,nb,pb end
+    return t,n,p
+end
+
+function World:_raycastRawScan(origin,dir,maxDistance,mask)
+    local bestT,bestI,bestN,bestP=maxDistance,nil,nil,nil
+    for i=1,self.high do
+        local t,n,p=self:_raycastBody(i,origin,dir,bestT,mask)
+        if t and t<bestT then bestT,bestI,bestN,bestP=t,i,n,p end
+    end
+    return bestI,bestT,bestP,bestN
+end
+
+function World:_raycastRaw(origin,direction,maxDistance,mask)
     maxDistance=maxDistance or math.huge
     mask=if mask==nil then 0xffffffff else mask
     local dl2=vector.dot(direction,direction)
     if dl2<=EPS then return nil end
     local dir=direction/math.sqrt(dl2)
+    self:_ensureQueryGrid()
+
+    -- Oversized bodies (world meshes, terrain, large compounds) are normally few. Test them first;
+    -- a world hit gives the grid walk a finite early-out distance even for an unbounded ray.
     local bestT,bestI,bestN,bestP=maxDistance,nil,nil,nil
-    for i=1,self.high do
-        if not self.alive[i] or bit32.band(mask,self.group[i])==0 then continue end
-        local s=self.shape[i]
-        local t,n,p
-        if s.kind==SHAPE_SPHERE then
-            t,n,p=raySphere(origin,dir,bestT,self.pos[i],s.radius)
-        elseif s.kind==SHAPE_BOX then
-            t,n,p=rayBox(origin,dir,bestT,self.pos[i],self.qv[i],self.qw[i],s.halfExtents)
-        else
-            local a,b=capsuleEndpoints(self.pos[i],self.qv[i],self.qw[i],s.halfHeight)
-            local m=(a+b)*0.5
-            local ta,na,pa=raySphere(origin,dir,bestT,a,s.radius)
-            local tm,nm,pm=raySphere(origin,dir,bestT,m,s.radius)
-            local tb,nb,pb=raySphere(origin,dir,bestT,b,s.radius)
-            t,n,p=ta,na,pa
-            if tm and (not t or tm<t) then t,n,p=tm,nm,pm end
-            if tb and (not t or tb<t) then t,n,p=tb,nb,pb end
-        end
+    local large=self.gridLarge
+    for k=1,#large do
+        local i=large[k]
+        local t,n,p=self:_raycastBody(i,origin,dir,bestT,mask)
         if t and t<bestT then bestT,bestI,bestN,bestP=t,i,n,p end
     end
+    if self.gridSmallCount==0 then return bestI,bestT,bestP,bestN end
+
+    -- If the ray is effectively unbounded and oversized geometry did not cap it, a DDA could walk
+    -- forever. Fall back to the linear scan in that unusual case.
+    if bestT==math.huge then
+        return self:_raycastRawScan(origin,dir,maxDistance,mask)
+    end
+
+    local cs=self.broadphaseCellSize
+    local estimated=(math.abs(dir.X)+math.abs(dir.Y)+math.abs(dir.Z))*bestT/cs+3
+    if estimated>self.queryRayCellLimit then
+        return self:_raycastRawScan(origin,dir,maxDistance,mask)
+    end
+
+    self.queryMarkEpoch+=1
+    local epoch=self.queryMarkEpoch
+    local marks=self.queryMarks
+    local heads,nextIn=self.gridHeads,self.gridNext
+    local cx,cy,cz=math.floor(origin.X/cs),math.floor(origin.Y/cs),math.floor(origin.Z/cs)
+    local sx=if dir.X>EPS then 1 elseif dir.X<-EPS then -1 else 0
+    local sy=if dir.Y>EPS then 1 elseif dir.Y<-EPS then -1 else 0
+    local sz=if dir.Z>EPS then 1 elseif dir.Z<-EPS then -1 else 0
+    local inf=math.huge
+    local tdx=if sx~=0 then cs/math.abs(dir.X) else inf
+    local tdy=if sy~=0 then cs/math.abs(dir.Y) else inf
+    local tdz=if sz~=0 then cs/math.abs(dir.Z) else inf
+    local bx=if sx>0 then (cx+1)*cs else cx*cs
+    local by=if sy>0 then (cy+1)*cs else cy*cs
+    local bz=if sz>0 then (cz+1)*cs else cz*cs
+    local tx=if sx~=0 then (bx-origin.X)/dir.X else inf
+    local ty=if sy~=0 then (by-origin.Y)/dir.Y else inf
+    local tz=if sz~=0 then (bz-origin.Z)/dir.Z else inf
+    if tx<0 then tx=0 end;if ty<0 then ty=0 end;if tz<0 then tz=0 end
+    local tcell=0
+    while tcell<=bestT do
+        -- Small bodies are stored by center cell while their AABB may touch an adjacent cell.
+        -- Probe the 3x3x3 neighborhood and de-duplicate by body index.
+        for ox=-1,1 do for oy=-1,1 do for oz=-1,1 do
+            local key=packCell(cx+ox,cy+oy,cz+oz)
+            if key then
+                local i=heads[key] or 0
+                while i~=0 do
+                    if marks[i]~=epoch then
+                        marks[i]=epoch
+                        local t,n,p=self:_raycastBody(i,origin,dir,bestT,mask)
+                        if t and t<bestT then bestT,bestI,bestN,bestP=t,i,n,p end
+                    end
+                    i=nextIn[i] or 0
+                end
+            end
+        end end end
+        local nextT=math.min(tx,ty,tz)
+        if nextT>bestT or nextT==inf then break end
+        local edge=nextT+1e-12
+        if tx<=edge then cx+=sx;tx+=tdx end
+        if ty<=edge then cy+=sy;ty+=tdy end
+        if tz<=edge then cz+=sz;tz+=tdz end
+        tcell=nextT
+    end
+    return bestI,bestT,bestP,bestN
+end
+
+function World:_sphereCastRaw(startPos,endPos,radius,mask,ignoreHandle)
+    assert(typeof(startPos)=="vector" and typeof(endPos)=="vector" and type(radius)=="number" and radius>0,"physik.sphereCast: expected start/end vectors and radius > 0")
+    mask=if mask==nil then 0xffffffff else mask
+    local ignore=nil
+    if ignoreHandle~=nil then ignore=self:_check(ignoreHandle) end
+    local rvec=vector.create(radius,radius,radius)
+    local mn=vector.create(math.min(startPos.X,endPos.X),math.min(startPos.Y,endPos.Y),math.min(startPos.Z,endPos.Z))-rvec
+    local mx=vector.create(math.max(startPos.X,endPos.X),math.max(startPos.Y,endPos.Y),math.max(startPos.Z,endPos.Z))+rvec
+    local handles,count=self:queryAabb(mn,mx,mask,self.castCandidates)
+    self.castCandidates=handles
+    local bestT,bestN,bestI=1,nil,nil
+    for k=1,count do
+        local i=self:_check(handles[k])
+        if i==ignore then continue end
+        local target=self.shape[i]
+        local t,n
+        if target.kind==SHAPE_SPHERE then
+            t,n=sweepSphereSphere(startPos,endPos,radius,self.pos[i],target.radius)
+        elseif target.kind==SHAPE_BOX then
+            t,n=sweepSphereBox(startPos,endPos,radius,self.pos[i],self.qv[i],self.qw[i],target.halfExtents)
+        elseif target.kind==SHAPE_CAPSULE then
+            local a,b=capsuleEndpoints(self.pos[i],self.qv[i],self.qw[i],target.halfHeight)
+            t,n=sweepSphereSegment(startPos,endPos,radius+target.radius,a,b)
+        elseif target.kind==SHAPE_MESH then
+            t,n=self:_sweepSphereMesh(i,startPos,endPos,radius)
+        elseif target.kind==SHAPE_HEIGHTFIELD then
+            t,n=self:_sweepSphereHeightfield(i,startPos,endPos,radius)
+        elseif target.kind==SHAPE_COMPOUND then
+            t,n=self:_sweepSphereCompound(i,startPos,endPos,radius)
+        end
+        if t and t<bestT then bestT,bestN,bestI=t,n,i end
+    end
     if not bestI then return nil end
-    return { handle=makeHandle(bestI,self.generation[bestI]), distance=bestT, point=bestP, normal=bestN, userData=self.userData[bestI] }
+    local center=startPos+(endPos-startPos)*bestT
+    return bestI,bestT,bestN,center
+end
+
+function World:sphereCast(startPos,endPos,radius,mask,ignoreHandle)
+    local i,t,n,center=self:_sphereCastRaw(startPos,endPos,radius,mask,ignoreHandle)
+    if not i then return nil end
+    local motion=endPos-startPos
+    local distance=vector.magnitude(motion)*t
+    return {handle=makeHandle(i,self.generation[i]),fraction=t,distance=distance,center=center,point=center-n*radius,normal=n,userData=self.userData[i]}
+end
+
+function World:sphereCastBatchSoA(starts,ends,radii,masks,ignoreHandles,out)
+    assert(type(starts)=="table" and type(ends)=="table" and #starts==#ends,"physik.sphereCastBatchSoA: starts and ends must be equal-length arrays")
+    out=out or {}
+    local hit=out.hit or {};out.hit=hit
+    local handles=out.handles or {};out.handles=handles
+    local fractions=out.fractions or {};out.fractions=fractions
+    local distances=out.distances or {};out.distances=distances
+    local centers=out.centers or {};out.centers=centers
+    local points=out.points or {};out.points=points
+    local normals=out.normals or {};out.normals=normals
+    local userData=out.userData or {};out.userData=userData
+    local count=#starts
+    local oldCount=out.count or 0
+    for q=1,count do
+        local radius=if type(radii)=="table" then radii[q] else radii
+        local mask=if masks then masks[q] else nil
+        local ignore=if ignoreHandles then ignoreHandles[q] else nil
+        local i,t,n,center=self:_sphereCastRaw(starts[q],ends[q],radius,mask,ignore)
+        if i then
+            local motion=ends[q]-starts[q]
+            hit[q]=true;handles[q]=makeHandle(i,self.generation[i]);fractions[q]=t;distances[q]=vector.magnitude(motion)*t
+            centers[q]=center;points[q]=center-n*radius;normals[q]=n;userData[q]=self.userData[i]
+        else
+            hit[q]=false;handles[q]=nil;fractions[q]=nil;distances[q]=nil;centers[q]=nil;points[q]=nil;normals[q]=nil;userData[q]=nil
+        end
+    end
+    for q=count+1,oldCount do
+        hit[q]=nil;handles[q]=nil;fractions[q]=nil;distances[q]=nil;centers[q]=nil;points[q]=nil;normals[q]=nil;userData[q]=nil
+    end
+    out.count=count
+    return out,count
+end
+
+function World:raycast(origin,direction,maxDistance,mask)
+    local i,t,p,n=self:_raycastRaw(origin,direction,maxDistance,mask)
+    if not i then return nil end
+    return { handle=makeHandle(i,self.generation[i]), distance=t, point=p, normal=n, userData=self.userData[i] }
+end
+
+function World:raycastBatch(origins,directions,maxDistances,masks,out)
+    assert(type(origins)=="table" and type(directions)=="table" and #origins==#directions,"physik.raycastBatch: origins and directions must be equal-length arrays")
+    out=out or {}
+    local count=#origins
+    local oldCount=out.count or #out
+    for q=1,count do
+        local i,t,p,n=self:_raycastRaw(origins[q],directions[q],if maxDistances then maxDistances[q] else nil,if masks then masks[q] else nil)
+        if i then
+            local hit=out[q]
+            if type(hit)~="table" then hit={};out[q]=hit end
+            hit.handle=makeHandle(i,self.generation[i])
+            hit.distance=t
+            hit.point=p
+            hit.normal=n
+            hit.userData=self.userData[i]
+        else
+            out[q]=nil
+        end
+    end
+    for q=count+1,oldCount do out[q]=nil end
+    out.count=count
+    return out
+end
+
+function World:raycastBatchSoA(origins,directions,maxDistances,masks,out)
+    assert(type(origins)=="table" and type(directions)=="table" and #origins==#directions,"physik.raycastBatchSoA: origins and directions must be equal-length arrays")
+    out=out or {}
+    local hit=out.hit or {};out.hit=hit
+    local handles=out.handles or {};out.handles=handles
+    local distances=out.distances or {};out.distances=distances
+    local points=out.points or {};out.points=points
+    local normals=out.normals or {};out.normals=normals
+    local userData=out.userData or {};out.userData=userData
+    local count=#origins
+    local oldCount=out.count or 0
+    for q=1,count do
+        local i,t,p,n=self:_raycastRaw(origins[q],directions[q],if maxDistances then maxDistances[q] else nil,if masks then masks[q] else nil)
+        if i then
+            hit[q]=true
+            handles[q]=makeHandle(i,self.generation[i])
+            distances[q]=t
+            points[q]=p
+            normals[q]=n
+            userData[q]=self.userData[i]
+        else
+            hit[q]=false
+            handles[q]=nil
+            distances[q]=nil
+            points[q]=nil
+            normals[q]=nil
+            userData[q]=nil
+        end
+    end
+    for q=count+1,oldCount do
+        hit[q]=nil;handles[q]=nil;distances[q]=nil;points[q]=nil;normals[q]=nil;userData[q]=nil
+    end
+    out.count=count
+    return out,count
+end
+
+
+function World:_queryAabbScan(mn,mx,mask,out)
+    local n=0
+    for i=1,self.high do
+        if not self.alive[i] or bit32.band(mask,self.group[i])==0 then continue end
+        local a,b=self.aabbMin[i],self.aabbMax[i]
+        if b.X<mn.X or a.X>mx.X or b.Y<mn.Y or a.Y>mx.Y or b.Z<mn.Z or a.Z>mx.Z then continue end
+        n+=1
+        out[n]=makeHandle(i,self.generation[i])
+    end
+    return n
+end
+
+function World:queryAabb(mn,mx,mask,out)
+    assert(typeof(mn)=="vector" and typeof(mx)=="vector","physik.queryAabb: bounds must be vectors")
+    mask=if mask==nil then 0xffffffff else mask
+    out=out or {}
+    self:_ensureQueryGrid()
+    local cs=self.broadphaseCellSize
+    -- Small bodies live in their center cell, but may extend into the immediately adjacent cell.
+    local x0,y0,z0=math.floor(mn.X/cs)-1,math.floor(mn.Y/cs)-1,math.floor(mn.Z/cs)-1
+    local x1,y1,z1=math.floor(mx.X/cs)+1,math.floor(mx.Y/cs)+1,math.floor(mx.Z/cs)+1
+    local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
+    local n=0
+    if cells>self.queryAabbCellLimit then
+        n=self:_queryAabbScan(mn,mx,mask,out)
+    else
+        -- Oversized bodies are outside the grid and are normally few.
+        for k=1,#self.gridLarge do
+            local i=self.gridLarge[k]
+            if self.alive[i] and bit32.band(mask,self.group[i])~=0 then
+                local a,b=self.aabbMin[i],self.aabbMax[i]
+                if not (b.X<mn.X or a.X>mx.X or b.Y<mn.Y or a.Y>mx.Y or b.Z<mn.Z or a.Z>mx.Z) then
+                    n+=1;out[n]=makeHandle(i,self.generation[i])
+                end
+            end
+        end
+        self.queryMarkEpoch+=1
+        local epoch=self.queryMarkEpoch
+        local marks,heads,nextIn=self.queryMarks,self.gridHeads,self.gridNext
+        for x=x0,x1 do for y=y0,y1 do for z=z0,z1 do
+            local key=packCell(x,y,z)
+            if key then
+                local i=heads[key] or 0
+                while i~=0 do
+                    if marks[i]~=epoch then
+                        marks[i]=epoch
+                        if bit32.band(mask,self.group[i])~=0 then
+                            local a,b=self.aabbMin[i],self.aabbMax[i]
+                            if not (b.X<mn.X or a.X>mx.X or b.Y<mn.Y or a.Y>mx.Y or b.Z<mn.Z or a.Z>mx.Z) then
+                                n+=1;out[n]=makeHandle(i,self.generation[i])
+                            end
+                        end
+                    end
+                    i=nextIn[i] or 0
+                end
+            end
+        end end end
+    end
+    for i=#out,n+1,-1 do out[i]=nil end
+    return out,n
+end
+
+
+function World:writeTransforms(out,opts)
+    out=out or {}
+    opts=opts or {}
+    local handles=out.handles or {};out.handles=handles
+    local positions=out.positions or {};out.positions=positions
+    local rotations=out.rotations or {};out.rotations=rotations
+    local rotationW=out.rotationW or {};out.rotationW=rotationW
+    local velocities=out.velocities or {};out.velocities=velocities
+    local angularVelocities=out.angularVelocities or {};out.angularVelocities=angularVelocities
+    local n=0
+    local awakeOnly=opts.awakeOnly==true
+    local dynamicOnly=opts.dynamicOnly==true
+    for i=1,self.high do
+        if not self.alive[i] then continue end
+        if awakeOnly and self.sleeping[i] then continue end
+        if dynamicOnly and self.bodyType[i]~=BODY_DYNAMIC then continue end
+        n+=1
+        handles[n]=makeHandle(i,self.generation[i])
+        positions[n]=self.pos[i]
+        rotations[n]=self.qv[i]
+        rotationW[n]=self.qw[i]
+        velocities[n]=self.linVel[i]
+        angularVelocities[n]=self.angVel[i]
+    end
+    for i=#handles,n+1,-1 do handles[i]=nil;positions[i]=nil;rotations[i]=nil;rotationW[i]=nil;velocities[i]=nil;angularVelocities[i]=nil end
+    out.count=n
+    return out,n
+end
+
+
+function World:applyTransforms(data,wake)
+    assert(type(data)=="table" and type(data.handles)=="table" and type(data.positions)=="table","physik.applyTransforms: expected writeTransforms-compatible data")
+    local count=data.count or #data.handles
+    local qvs,qws=data.rotations,data.rotationW
+    local vels,ang=data.velocities,data.angularVelocities
+    for n=1,count do
+        local i=self:_check(data.handles[n])
+        self.pos[i]=data.positions[n]
+        if qvs and qws and qvs[n] and qws[n] then
+            self.qv[i],self.qw[i]=qNormalize(qvs[n],qws[n])
+            self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.qv[i],self.qw[i])
+        end
+        if vels and vels[n] then self.linVel[i]=vels[n] end
+        if ang and ang[n] then self.angVel[i]=ang[n] end
+        self.prevPos[i]=self.pos[i]
+        self:_updateAabb(i)
+        if wake~=false and self.bodyType[i]==BODY_DYNAMIC then self.sleeping[i]=false;self.sleepTime[i]=0 end
+    end
+    -- Topology is unchanged, but authoritative teleports invalidate persistent anchors and query cells.
+    self.cacheEpoch+=2
+    self.gridValid=false
+    return count
+end
+
+function World:writeContacts(out)
+    out=out or {}
+    local aa=out.a or {};out.a=aa
+    local bb=out.b or {};out.b=bb
+    local normals=out.normals or {};out.normals=normals
+    local points=out.points or {};out.points=points
+    local penetration=out.penetration or {};out.penetration=penetration
+    local impulses=out.normalImpulse or {};out.normalImpulse=impulses
+    local sensors=out.sensor or {};out.sensor=sensors
+    local n=self.contactCount
+    for c=1,n do
+        local a,b=self.ca[c],self.cb[c]
+        aa[c]=makeHandle(a,self.generation[a]);bb[c]=makeHandle(b,self.generation[b])
+        normals[c]=self.cn[c];points[c]=self.cp[c];penetration[c]=self.cpen[c];impulses[c]=self.cnormalImpulse[c]
+        sensors[c]=self.sensor[a] or self.sensor[b]
+    end
+    for c=#aa,n+1,-1 do aa[c]=nil;bb[c]=nil;normals[c]=nil;points[c]=nil;penetration[c]=nil;impulses[c]=nil;sensors[c]=nil end
+    out.count=n
+    return out,n
+end
+
+function World:writeContactEvents(out,includeStay)
+    out=out or {}
+    local aa=out.a or {};out.a=aa
+    local bb=out.b or {};out.b=bb
+    local kind=out.kind or {};out.kind=kind
+    local sensors=out.sensor or {};out.sensor=sensors
+    local n=0
+    for e=1,self.contactEventCount do
+        local k=self.eventKind[e]
+        if includeStay~=false or k~=EVENT_STAY then
+            local a,b=self.eventA[e],self.eventB[e]
+            if self.alive[a] and self.alive[b] then
+                n+=1
+                aa[n]=makeHandle(a,self.generation[a]);bb[n]=makeHandle(b,self.generation[b])
+                kind[n]=k;sensors[n]=self.eventSensor[e]
+            end
+        end
+    end
+    for i=#aa,n+1,-1 do aa[i]=nil;bb[i]=nil;kind[i]=nil;sensors[i]=nil end
+    out.count=n
+    return out,n
+end
+
+function World:advance(dt,fixedDt,maxSteps)
+    assert(type(dt)=="number" and dt>=0,"physik.advance: dt must be >= 0")
+    local h=fixedDt or self.fixedDt
+    local limit=maxSteps or self.maxCatchUpSteps
+    assert(h>0 and limit>=1 and limit%1==0,"physik.advance: fixedDt must be > 0 and maxSteps a positive integer")
+    self.accumulator+=dt
+    local wanted=math.floor(self.accumulator/h)
+    local steps=math.min(wanted,limit)
+    for _=1,steps do self:step(h) end
+    self.accumulator-=steps*h
+    local dropped=false
+    if self.accumulator>=h then self.accumulator=self.accumulator%h;dropped=true end
+    return steps,self.accumulator/h,dropped
 end
 
 function World:contacts()
@@ -1769,19 +3207,20 @@ function World:contacts()
             a=makeHandle(a,self.generation[a]),
             b=makeHandle(b,self.generation[b]),
             normal=self.cn[c],point=self.cp[c],penetration=self.cpen[c],
-            normalImpulse=self.cnormalImpulse[c],
+            normalImpulse=self.cnormalImpulse[c],sensor=self.sensor[a] or self.sensor[b],
         }
     end
     return out
 end
 
 function World:stats()
-    local asleep=0
+    local asleep,sensorContacts=0,0
     for i=1,self.high do if self.alive[i] and self.sleeping[i] then asleep+=1 end end
+    for c=1,self.contactCount do if self.sensor[self.ca[c]] or self.sensor[self.cb[c]] then sensorContacts+=1 end end
     return {
         frame=self.frame,bodies=self.aliveCount,sleeping=asleep,islands=self.islandCount,
-        candidates=self.candidateCount,contacts=self.contactCount,activeContacts=self.activeContactCount,manifolds=self.manifoldCount,warmStarted=self.warmStartedCount,ccdHits=self.ccdHitCount,
-        joints=(function() local n=0 for _ in self.joints do n+=1 end return n end)(),
+        candidates=self.candidateCount,contacts=self.contactCount,sensorContacts=sensorContacts,activeContacts=self.activeContactCount,manifolds=self.manifoldCount,warmStarted=self.warmStartedCount,ccdHits=self.ccdHitCount,
+        joints=self.jointCount,
     }
 end
 
@@ -1805,6 +3244,7 @@ function M.newWorld(opts)
     w.wakeSpeed=opts.wakeSpeed or 0.5
     w.wakePenetration=opts.wakePenetration or 0.05
     w.warmStarting=if opts.warmStarting==nil then true else opts.warmStarting
+    w.trackContactEvents=opts.contactEvents==true
     w.warmStartFactor=opts.warmStartFactor or 0.85
     w.manifoldMatchDistance=opts.manifoldMatchDistance or 0.08
     w.contactMargin=if opts.contactMargin==nil then 0.015 else opts.contactMargin
@@ -1816,8 +3256,18 @@ function M.newWorld(opts)
     assert(w.broadphaseCellSize>0,"physik.newWorld: broadphaseCellSize must be > 0")
     w.directLargeThreshold=opts.directLargeThreshold or 16
     assert(w.directLargeThreshold>=0 and w.directLargeThreshold%1==0,"physik.newWorld: directLargeThreshold must be a non-negative integer")
+    w.meshQueryCellLimit=opts.meshQueryCellLimit or 4096
+    assert(w.meshQueryCellLimit>=1 and w.meshQueryCellLimit%1==0,"physik.newWorld: meshQueryCellLimit must be a positive integer")
+    w.queryRayCellLimit=opts.queryRayCellLimit or 2048
+    assert(w.queryRayCellLimit>=1 and w.queryRayCellLimit%1==0,"physik.newWorld: queryRayCellLimit must be a positive integer")
+    w.queryAabbCellLimit=opts.queryAabbCellLimit or 8192
+    assert(w.queryAabbCellLimit>=1 and w.queryAabbCellLimit%1==0,"physik.newWorld: queryAabbCellLimit must be a positive integer")
+    w.fixedDt=opts.fixedDt or (1/60)
+    w.maxCatchUpSteps=opts.maxCatchUpSteps or 8
+    w.accumulator=0
     w.gridHeads={};w.gridKeys={};w.gridNext={};w.gridLarge={};w.gridX={};w.gridY={};w.gridZ={};w.gridKey={}
     w.gridKeyX={};w.gridKeyY={};w.gridKeyZ={}
+    w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
     w.frame=0
     w.cacheEpoch=0
     w.ccdHitCount=0
@@ -1846,6 +3296,7 @@ function M.newWorld(opts)
     w.group={}
     w.mask={}
     w.userData={}
+    w.sensor={}
     w.ccd={};w.prevPos={}
     w.sleeping={}
     w.sleepTime={}
@@ -1865,11 +3316,18 @@ function M.newWorld(opts)
     w.ctangentAng1A={};w.ctangentAng1B={};w.ctangentAng2A={};w.ctangentAng2B={}
     w.contactCache={}
     w.activeContacts={}
+    w.contactEventEpoch=0;w.contactEventCount=0
+    w.contactPairSeen={};w.contactPairActive={};w.contactPairA={};w.contactPairB={};w.contactPairSensor={}
+    w.contactPairPrev={};w.contactPairNext={}
+    w.eventA={};w.eventB={};w.eventKind={};w.eventSensor={}
     w.clipA={};w.clipB={};w.manifoldPoints={};w.manifoldDepths={}
+    w.geomNormal={};w.geomPoint={};w.geomPen={};w.geomContactCount=0
+    w.meshMarks={};w.meshMarkEpoch=0
     w.islandParent={};w.islandSize={};w.islandAwake={};w.islandRoots={};w.islandCanSleep={};w.islandMinTime={}
-    w.joints={};w.jointNoCollide={};w.nextJoint=1
+    w.joints={};w.jointNoCollide={};w.nextJoint=1;w.jointCount=0
     return w
 end
 
-M._constants = table.freeze({ sphere=SHAPE_SPHERE, box=SHAPE_BOX, capsule=SHAPE_CAPSULE })
+M.contactEvent = table.freeze({ enter=EVENT_ENTER, stay=EVENT_STAY, exit=EVENT_EXIT })
+M._constants = table.freeze({ sphere=SHAPE_SPHERE, box=SHAPE_BOX, capsule=SHAPE_CAPSULE, mesh=SHAPE_MESH, heightfield=SHAPE_HEIGHTFIELD, compound=SHAPE_COMPOUND })
 return table.freeze(M)
