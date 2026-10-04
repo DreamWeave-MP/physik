@@ -1,0 +1,15 @@
+manifest_version = 1
+
+[package]
+id = "org.dreamweave.physik"
+version = "0.1.0"
+jess_api = "1"
+include = ["src", "docs"]
+tests = ["tests/physik_test.luau"]
+
+[modules]
+"@dream/physik" = "src/physik.luau"
+
+[[layer]]
+id = "dream.physik"
+exports = ["@dream/physik"]
