@@ -44,6 +44,10 @@ local CELL_BASE2 = 4294967296
 local GRID_DX = {0, 1,1,1,1,1,1,1,1,1, 0,0,0, 0}
 local GRID_DY = {0,-1,-1,-1,0,0,0,1,1,1, 1,1,1, 0}
 local GRID_DZ = {0,-1, 0, 1,-1,0,1,-1,0,1,-1,0,1, 1}
+local GRID_KEY_DELTA = {}
+for i=1,#GRID_DX do
+    GRID_KEY_DELTA[i]=GRID_DX[i]*CELL_BASE2+GRID_DY[i]*CELL_BASE+GRID_DZ[i]
+end
 
 local function packCell(x,y,z)
     if x < -CELL_OFFSET or x >= CELL_OFFSET or y < -CELL_OFFSET or y >= CELL_OFFSET or z < -CELL_OFFSET or z >= CELL_OFFSET then
@@ -1788,14 +1792,18 @@ function World:_collideGrid()
             while b and b~=0 do self:_tryPair(a,b); b=nextIn[b] end
             a=nextIn[a]
         end
+        local interior=cx<CELL_OFFSET-1 and cy>-CELL_OFFSET and cy<CELL_OFFSET-1 and cz>-CELL_OFFSET and cz<CELL_OFFSET-1
         for o=2,14 do
-            local key=packCell(cx+GRID_DX[o],cy+GRID_DY[o],cz+GRID_DZ[o])
+            local key=if interior then key0+GRID_KEY_DELTA[o] else packCell(cx+GRID_DX[o],cy+GRID_DY[o],cz+GRID_DZ[o])
             if key then
-                a=heads[key0]
-                while a and a~=0 do
-                    local b2=heads[key]
-                    while b2 and b2~=0 do self:_tryPair(a,b2); b2=nextIn[b2] end
-                    a=nextIn[a]
+                local b2=heads[key]
+                if b2 and b2~=0 then
+                    a=heads[key0]
+                    while a and a~=0 do
+                        local b=b2
+                        while b and b~=0 do self:_tryPair(a,b); b=nextIn[b] end
+                        a=nextIn[a]
+                    end
                 end
             end
         end
@@ -3085,6 +3093,36 @@ function World:queryAabb(mn,mx,mask,out)
     return out,n
 end
 
+
+function World:writeLinearState(out,opts)
+    out=out or {}
+    opts=opts or {}
+    local includeHandles=opts.handles~=false
+    local includeUserData=opts.userData==true
+    local handles=if includeHandles then (out.handles or {}) else nil
+    local userData=if includeUserData then (out.userData or {}) else nil
+    local positions=out.positions or {}
+    local velocities=out.velocities or {}
+    out.handles=handles;out.userData=userData;out.positions=positions;out.velocities=velocities
+    local n=0
+    local awakeOnly=opts.awakeOnly==true
+    local dynamicOnly=opts.dynamicOnly==true
+    for i=1,self.high do
+        if not self.alive[i] then continue end
+        if awakeOnly and self.sleeping[i] then continue end
+        if dynamicOnly and self.bodyType[i]~=BODY_DYNAMIC then continue end
+        n+=1
+        if handles then handles[n]=makeHandle(i,self.generation[i]) end
+        if userData then userData[n]=self.userData[i] end
+        positions[n]=self.pos[i]
+        velocities[n]=self.linVel[i]
+    end
+    if handles then for i=#handles,n+1,-1 do handles[i]=nil end end
+    if userData then for i=#userData,n+1,-1 do userData[i]=nil end end
+    for i=#positions,n+1,-1 do positions[i]=nil;velocities[i]=nil end
+    out.count=n
+    return out,n
+end
 
 function World:writeTransforms(out,opts)
     out=out or {}

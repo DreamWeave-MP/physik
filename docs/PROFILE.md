@@ -218,3 +218,23 @@ CCD already contained exact sphere TOI kernels for primitive and world-geometry 
 ### M4J-facing rule: drains, not callbacks
 
 Physics-to-ECS integration remains bulk and pull-based: transforms, contacts, pair events, ray batches, and sphere casts drain into reusable parallel arrays. This keeps package code deterministic in scheduling terms, avoids reentrant callback policy, and makes it possible for the host/network layer to decide how much data to replicate or inspect.
+
+
+## v0.3.1 MJ12 hot-drain / sparse-grid pass
+
+MJ12 supplied two measured integration pressures.
+
+First, `writeTransforms()` always filled rotation and angular-velocity arrays even when an external
+ECS bridge needed only position and linear velocity. `writeLinearState()` now emits just those hot
+columns, optionally includes `userData`, and can omit generated handles. This keeps the pull/drain
+doctrine while avoiding work the consumer explicitly does not request.
+
+Second, the numeric grid recomputed full packed cell keys for all thirteen forward neighbor probes of
+every occupied cell. Packed cell keys are affine in x/y/z, so v0.3.1 precomputes the thirteen numeric
+key deltas and uses `key0 + delta` for interior cells, retaining the checked `packCell()` fallback at
+coordinate boundaries. Randomized scene parity against v0.3.0 produced identical contact accumulation
+and final transform sums in the regression probe.
+
+Combined with Dream ECS 0.2.1, the MJ12 120-step benchmark on this sandbox moved from median roughly
+0.639 / 2.834 / 13.153 ms per step at 256 / 1000 / 5000 bodies to roughly 0.39-0.41 / 1.60-1.72 /
+8.45-8.9 ms before snapshot encoding work. Exact wall-clock values remain machine/workload dependent.

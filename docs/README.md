@@ -6,7 +6,7 @@
 local physik = require("@dream/physik")
 ```
 
-Current package version: **0.3.0**.
+Current package version: **0.3.1**.
 
 ## v0.3 architecture
 
@@ -339,3 +339,13 @@ Not implemented yet:
 - solver parallelism across independent islands.
 
 For M4J-style integration, the intended immediate shape is: fixed authoritative ticks, compound dynamic actors/ships, static mesh/heightfield world chunks, origin rebasing, bulk ECS transform exchange, batched spatial queries/sphere sweeps, and optional contact-pair event drains.
+
+
+## Linear-state drains
+
+`world:writeLinearState(out, opts)` is the allocation-reusing hot drain for consumers that only need
+position and linear velocity. It accepts the same `awakeOnly` / `dynamicOnly` filters as
+`writeTransforms`. Set `userData = true` to emit body user data alongside each row, and
+`handles = false` when the consumer can identify bodies from user data and does not need generated
+handles. This is intended for ECS/network/animation bridges that should not pay for rotations and
+angular velocities they do not consume.

@@ -2,9 +2,9 @@ manifest_version = 1
 
 [package]
 id = "org.dreamweave.physik"
-version = "0.3.0"
+version = "0.3.1"
 jess_api = "1"
-include = ["src", "docs"]
+include = ["src", "docs", "tests"]
 tests = ["tests/physik_test.luau"]
 
 [modules]
