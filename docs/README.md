@@ -6,7 +6,7 @@
 local physik = require("@dream/physik")
 ```
 
-Current package version: **0.3.1**.
+Current package version: **0.3.2**.
 
 ## v0.3 architecture
 
@@ -349,3 +349,21 @@ position and linear velocity. It accepts the same `awakeOnly` / `dynamicOnly` fi
 `handles = false` when the consumer can identify bodies from user data and does not need generated
 handles. This is intended for ECS/network/animation bridges that should not pay for rotations and
 angular velocities they do not consume.
+
+
+## v0.3.2 coherent-grid / zero-copy view pass
+
+MJ12 exposed a sparse-world broadphase tax: coherent bodies were rebuilding the numeric hash grid and
+probing all thirteen forward neighbor cells every tick even when no body crossed a cell boundary.
+Physik now retains bucket membership while topology is unchanged, caches only actually occupied
+neighbor-cell pairs, and rebuilds those pairs only when a body changes cell or small/large
+classification. Sphere broadphase membership is derived directly from center/radius; sphere AABBs are
+no longer rewritten every frame merely to prove that empty neighboring cells are still empty.
+
+Trusted bulk consumers may use `world:linearStateView()` for an ephemeral zero-copy view of Physik's
+parallel hot arrays. The arrays remain Physik-owned and are read-only by contract. Ordinary callers can
+continue using the copying `writeLinearState()` drain.
+
+The previous independent-sleep optimization experiment was rejected because it introduced tiny
+floating evolution differences in a mixed contact parity scene. v0.3.2 preserves the 0.3.1 contact
+accumulation and displayed final-state sums in that regression while keeping the larger broadphase win.

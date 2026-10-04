@@ -1218,6 +1218,8 @@ function World:addBody(desc)
     self.aabbMax[i] = ZERO
     self:_updateAabb(i)
     self.gridValid=false
+    self.gridTopologyDirty=true
+    if self.ccd[i] then self.ccdCount+=1 end
     return makeHandle(i,self.generation[i])
 end
 
@@ -1229,6 +1231,7 @@ function World:removeBody(handle)
     end
     self.alive[i] = false
     self.aliveCount -= 1
+    if self.ccd[i] then self.ccdCount-=1 end
     self.free[#self.free+1] = i
     self.userData[i] = nil
     self.sleeping[i] = false
@@ -1241,6 +1244,7 @@ function World:removeBody(handle)
         end
     end
     self.gridValid=false
+    self.gridTopologyDirty=true
 end
 
 function World:getBody(handle)
@@ -1447,8 +1451,10 @@ function World:_updateAabb(i)
     local shape = self.shape[i]
     local p = self.pos[i]
     if shape.kind == SHAPE_SPHERE then
-        local e = vector.create(shape.radius,shape.radius,shape.radius)
-        self.aabbMin[i],self.aabbMax[i] = p-e,p+e
+        local r=shape.radius+self.contactMargin
+        local e=vector.create(r,r,r)
+        self.aabbMin[i],self.aabbMax[i]=p-e,p+e
+        return
     elseif shape.kind == SHAPE_BOX then
         local a0,a1,a2=qAxes(self.qv[i],self.qw[i])
         self.axis0[i],self.axis1[i],self.axis2[i]=a0,a1,a2
@@ -1708,9 +1714,24 @@ function World:_tryPair(a,b)
     if self.jointNoCollide[bodyPairKey(a,b)] then return end
     if self.bodyType[a]==BODY_STATIC and self.bodyType[b]==BODY_STATIC then return end
     if bit32.band(self.mask[a],self.group[b])==0 or bit32.band(self.mask[b],self.group[a])==0 then return end
-    local amin,amax=self.aabbMin[a],self.aabbMax[a]
-    local bmin,bmax=self.aabbMin[b],self.aabbMax[b]
-    if bmin.X>amax.X or bmax.X<amin.X or bmin.Y>amax.Y or bmax.Y<amin.Y or bmin.Z>amax.Z or bmax.Z<amin.Z then return end
+    local sa,sb=self.shape[a],self.shape[b]
+    if sa.kind==SHAPE_SPHERE and sb.kind==SHAPE_SPHERE then
+        local reach=sa.radius+sb.radius+self.contactMargin*2
+        local d=self.pos[b]-self.pos[a]
+        if math.abs(d.X)>reach or math.abs(d.Y)>reach or math.abs(d.Z)>reach then return end
+    elseif sa.kind==SHAPE_SPHERE then
+        local p=self.pos[a];local r=sa.radius+self.contactMargin
+        local bmin,bmax=self.aabbMin[b],self.aabbMax[b]
+        if p.X+r<bmin.X or p.X-r>bmax.X or p.Y+r<bmin.Y or p.Y-r>bmax.Y or p.Z+r<bmin.Z or p.Z-r>bmax.Z then return end
+    elseif sb.kind==SHAPE_SPHERE then
+        local p=self.pos[b];local r=sb.radius+self.contactMargin
+        local amin,amax=self.aabbMin[a],self.aabbMax[a]
+        if p.X+r<amin.X or p.X-r>amax.X or p.Y+r<amin.Y or p.Y-r>amax.Y or p.Z+r<amin.Z or p.Z-r>amax.Z then return end
+    else
+        local amin,amax=self.aabbMin[a],self.aabbMax[a]
+        local bmin,bmax=self.aabbMin[b],self.aabbMax[b]
+        if bmin.X>amax.X or bmax.X<amin.X or bmin.Y>amax.Y or bmax.Y<amin.Y or bmin.Z>amax.Z or bmax.Z<amin.Z then return end
+    end
     self.candidateCount+=1
     local before=self.contactCount
     self:_narrow(a,b)
@@ -1733,20 +1754,97 @@ function World:_collideSap()
     end
 end
 
-function World:_buildGridIndex()
+function World:_rebuildGridPairs()
     local heads,keys,nextIn=self.gridHeads,self.gridKeys,self.gridNext
-    for k=1,#keys do heads[keys[k]]=nil; keys[k]=nil end
+    local dense=self.gridDenseKeys
+    local pairA,pairB=self.gridPairA,self.gridPairB
+    local denseCount,pairCount=0,0
+    for ki=1,#keys do
+        local key0=keys[ki]
+        local head=heads[key0] or 0
+        if head~=0 and (nextIn[head] or 0)~=0 then
+            denseCount+=1;dense[denseCount]=key0
+        end
+        local cx,cy,cz=self.gridKeyX[ki],self.gridKeyY[ki],self.gridKeyZ[ki]
+        local interior=cx<CELL_OFFSET-1 and cy>-CELL_OFFSET and cy<CELL_OFFSET-1 and cz>-CELL_OFFSET and cz<CELL_OFFSET-1
+        for o=2,14 do
+            local key=if interior then key0+GRID_KEY_DELTA[o] else packCell(cx+GRID_DX[o],cy+GRID_DY[o],cz+GRID_DZ[o])
+            if key and heads[key]~=nil then
+                pairCount+=1;pairA[pairCount]=key0;pairB[pairCount]=key
+            end
+        end
+    end
+    for i=#dense,denseCount+1,-1 do dense[i]=nil end
+    for i=#pairA,pairCount+1,-1 do pairA[i]=nil;pairB[i]=nil end
+    self.gridDenseCount=denseCount
+    self.gridPairCount=pairCount
+end
+
+function World:_buildGridIndex(refreshAabbs)
+    local heads,keys,nextIn=self.gridHeads,self.gridKeys,self.gridNext
     local large=self.gridLarge
-    for k=#large,1,-1 do large[k]=nil end
     local cs=self.broadphaseCellSize
+
+    -- Most coherent worlds keep bodies in the same broad-phase cells for many frames. Validate
+    -- membership first; when topology is unchanged, retain bucket chains and occupied-neighbor
+    -- pairs instead of rebuilding Lua hash tables and probing thirteen empty neighbors per cell.
+    if self.gridTopologyReady and not self.gridTopologyDirty then
+        local same=true
+        for i=1,self.high do
+            if not self.alive[i] then continue end
+            local shape=self.shape[i]
+            local ex,ey,ez
+            if shape.kind==SHAPE_SPHERE then
+                local d=(shape.radius+self.contactMargin)*2
+                ex,ey,ez=d,d,d
+            else
+                if refreshAabbs then self:_updateAabb(i) end
+                local mn,mx=self.aabbMin[i],self.aabbMax[i]
+                ex,ey,ez=mx.X-mn.X,mx.Y-mn.Y,mx.Z-mn.Z
+            end
+            local old=self.gridKey[i]
+            if old~=nil then
+                if ex>cs or ey>cs or ez>cs then
+                    same=false
+                else
+                    local pos=self.pos[i]
+                    local cx,cy,cz=math.floor(pos.X/cs),math.floor(pos.Y/cs),math.floor(pos.Z/cs)
+                    if cx~=self.gridX[i] or cy~=self.gridY[i] or cz~=self.gridZ[i] then same=false end
+                end
+            elseif ex<=cs and ey<=cs and ez<=cs then
+                local pos=self.pos[i]
+                local cx,cy,cz=math.floor(pos.X/cs),math.floor(pos.Y/cs),math.floor(pos.Z/cs)
+                if packCell(cx,cy,cz)~=nil then same=false end
+            end
+        end
+        if same then
+            self.gridValid=true
+            return false
+        end
+    end
+
+    if refreshAabbs and (not self.gridTopologyReady or self.gridTopologyDirty) then
+        for i=1,self.high do
+            if self.alive[i] and self.shape[i].kind~=SHAPE_SPHERE then self:_updateAabb(i) end
+        end
+    end
+    for k=1,#keys do heads[keys[k]]=nil; keys[k]=nil end
+    for k=#large,1,-1 do large[k]=nil end
     local smallCount=0
 
     for i=1,self.high do
-        if not self.alive[i] then continue end
-        local mn,mx=self.aabbMin[i],self.aabbMax[i]
-        local ex,ey,ez=mx.X-mn.X,mx.Y-mn.Y,mx.Z-mn.Z
-        local p=self.pos[i]
-        local cx,cy,cz=math.floor(p.X/cs),math.floor(p.Y/cs),math.floor(p.Z/cs)
+        if not self.alive[i] then self.gridKey[i]=nil;continue end
+        local shape=self.shape[i]
+        local ex,ey,ez
+        if shape.kind==SHAPE_SPHERE then
+            local d=(shape.radius+self.contactMargin)*2
+            ex,ey,ez=d,d,d
+        else
+            local mn,mx=self.aabbMin[i],self.aabbMax[i]
+            ex,ey,ez=mx.X-mn.X,mx.Y-mn.Y,mx.Z-mn.Z
+        end
+        local pos=self.pos[i]
+        local cx,cy,cz=math.floor(pos.X/cs),math.floor(pos.Y/cs),math.floor(pos.Z/cs)
         local key=if ex<=cs and ey<=cs and ez<=cs then packCell(cx,cy,cz) else nil
         if key then
             smallCount+=1
@@ -1766,46 +1864,45 @@ function World:_buildGridIndex()
         end
     end
     self.gridSmallCount=smallCount
+    self.gridTopologyReady=true
+    self.gridTopologyDirty=false
+    self:_rebuildGridPairs()
     self.gridValid=true
+    return true
 end
 
 function World:_ensureQueryGrid()
     if self.gridValid then return end
-    for i=1,self.high do if self.alive[i] then self:_updateAabb(i) end end
-    self:_buildGridIndex()
+    self:_buildGridIndex(true)
 end
 
 function World:_collideGrid()
-    self:_buildGridIndex()
-    local heads,keys,nextIn=self.gridHeads,self.gridKeys,self.gridNext
+    self:_buildGridIndex(true)
+    local heads,nextIn=self.gridHeads,self.gridNext
+    local dense=self.gridDenseKeys
+    local pairA,pairB=self.gridPairA,self.gridPairB
     local large=self.gridLarge
-    local cs=self.broadphaseCellSize
 
-    -- Small-small: walk occupied cells, not bodies. Every cell checks only the lexicographic
-    -- forward half of its 3x3x3 neighborhood, so pair generation is unique without a pair set.
-    for ki=1,#keys do
-        local key0=keys[ki]
-        local cx,cy,cz=self.gridKeyX[ki],self.gridKeyY[ki],self.gridKeyZ[ki]
-        local a=heads[key0]
-        while a and a~=0 do
-            local b=nextIn[a]
-            while b and b~=0 do self:_tryPair(a,b); b=nextIn[b] end
-            a=nextIn[a]
+    -- Same-cell pairs only exist in cells cached as non-singleton during the most recent topology
+    -- rebuild. Their body membership is stable until a center crosses a cell boundary.
+    for di=1,self.gridDenseCount do
+        local a=heads[dense[di]] or 0
+        while a~=0 do
+            local b=nextIn[a] or 0
+            while b~=0 do self:_tryPair(a,b); b=nextIn[b] or 0 end
+            a=nextIn[a] or 0
         end
-        local interior=cx<CELL_OFFSET-1 and cy>-CELL_OFFSET and cy<CELL_OFFSET-1 and cz>-CELL_OFFSET and cz<CELL_OFFSET-1
-        for o=2,14 do
-            local key=if interior then key0+GRID_KEY_DELTA[o] else packCell(cx+GRID_DX[o],cy+GRID_DY[o],cz+GRID_DZ[o])
-            if key then
-                local b2=heads[key]
-                if b2 and b2~=0 then
-                    a=heads[key0]
-                    while a and a~=0 do
-                        local b=b2
-                        while b and b~=0 do self:_tryPair(a,b); b=nextIn[b] end
-                        a=nextIn[a]
-                    end
-                end
-            end
+    end
+
+    -- Cross-cell work walks only occupied neighboring cell pairs. Empty-neighbor hash probes are
+    -- paid once per topology change rather than every simulation tick.
+    for pi=1,self.gridPairCount do
+        local a=heads[pairA[pi]] or 0
+        local b2=heads[pairB[pi]] or 0
+        while a~=0 do
+            local b=b2
+            while b~=0 do self:_tryPair(a,b); b=nextIn[b] or 0 end
+            a=nextIn[a] or 0
         end
     end
 
@@ -1814,9 +1911,6 @@ function World:_collideGrid()
     -- are skipped here because the grid already emitted them.
     if #large>0 then
         if #large<=self.directLargeThreshold then
-            -- A handful of oversized bodies (the usual case is one world/floor collider)
-            -- should not force an all-body sweep that merely rediscovers small-small pairs.
-            -- Emit each large-small pair once, plus large-large pairs by stable body index.
             for li=1,#large do
                 local a=large[li]
                 for b=1,self.high do
@@ -1849,8 +1943,12 @@ function World:_collide()
     self.candidateCount=0
     self.manifoldCount=0
     self.cacheEpoch+=1
-    for i=1,self.high do if self.alive[i] then self:_updateAabb(i) end end
-    if self.broadphase=="sap" then self:_collideSap() else self:_collideGrid() end
+    if self.broadphase=="sap" then
+        for i=1,self.high do if self.alive[i] then self:_updateAabb(i) end end
+        self:_collideSap()
+    else
+        self:_collideGrid()
+    end
 end
 
 local function pointVelocity(self,i,r)
@@ -2493,6 +2591,7 @@ end
 
 function World:_ccd()
     self.ccdHitCount=0
+    if self.ccdCount==0 then return end
     for i=1,self.high do
         if not self.alive[i] or self.bodyType[i]~=BODY_DYNAMIC or self.sleeping[i] or not self.ccd[i] then continue end
         local shape=self.shape[i]
@@ -2533,6 +2632,30 @@ function World:_ccd()
             self.ccdHitCount+=1
         end
     end
+end
+
+
+function World:_sleepIndependent(dt)
+    if not self.allowSleep then return end
+    local lin2=self.sleepLinear*self.sleepLinear
+    local ang2=self.sleepAngular*self.sleepAngular
+    local count=0
+    for i=1,self.high do
+        if not self.alive[i] or self.bodyType[i]~=BODY_DYNAMIC then continue end
+        count+=1
+        if self.sleeping[i] then continue end
+        if vector.dot(self.linVel[i],self.linVel[i])>=lin2 or vector.dot(self.angVel[i],self.angVel[i])>=ang2 then
+            self.sleepTime[i]=0
+        else
+            local t=self.sleepTime[i]+dt
+            self.sleepTime[i]=t
+            if t>=self.sleepDelay then
+                self.sleeping[i]=true
+                self.linVel[i],self.angVel[i]=ZERO,ZERO
+            end
+        end
+    end
+    self.islandCount=count
 end
 
 function World:_sleep(dt)
@@ -2585,13 +2708,26 @@ function World:step(dt,substeps)
         self:_ccd()
         self:_collide()
         if self.trackContactEvents then self:_buildContactEvents() else self.contactEventCount=0 end
-        self:_wakeContacts()
-        self:_buildIslands()
-        self:_prepareContacts(h)
-        self:_solveContacts(h)
-        self:_storeContactCache()
-        self:_correctPositions()
-        self:_sleep(h)
+        if self.contactCount==0 and self.jointCount==0 then
+            -- With no contact/joint graph every dynamic body is an independent island. Avoid
+            -- building union-find state merely to rediscover that fact.
+            self.activeContactCount=0
+            self.warmStartedCount=0
+            self:_sleepIndependent(h)
+            if self.cacheEpoch%64==0 then
+                for key,e in self.contactCache do
+                    if self.cacheEpoch-e[CACHE_EPOCH]>2 then self.contactCache[key]=nil end
+                end
+            end
+        else
+            self:_wakeContacts()
+            self:_buildIslands()
+            self:_prepareContacts(h)
+            self:_solveContacts(h)
+            self:_storeContactCache()
+            self:_correctPositions()
+            self:_sleep(h)
+        end
         -- Position correction can move bodies after the collision broadphase was built.
         -- Queries rebuild lazily only if a query is actually issued.
         self.gridValid=false
@@ -3031,12 +3167,21 @@ function World:raycastBatchSoA(origins,directions,maxDistances,masks,out)
 end
 
 
+local function bodyOverlapsAabb(self,i,mn,mx)
+    local shape=self.shape[i]
+    if shape.kind==SHAPE_SPHERE then
+        local p=self.pos[i];local r=shape.radius+self.contactMargin
+        return not (p.X+r<mn.X or p.X-r>mx.X or p.Y+r<mn.Y or p.Y-r>mx.Y or p.Z+r<mn.Z or p.Z-r>mx.Z)
+    end
+    local a,b=self.aabbMin[i],self.aabbMax[i]
+    return not (b.X<mn.X or a.X>mx.X or b.Y<mn.Y or a.Y>mx.Y or b.Z<mn.Z or a.Z>mx.Z)
+end
+
 function World:_queryAabbScan(mn,mx,mask,out)
     local n=0
     for i=1,self.high do
         if not self.alive[i] or bit32.band(mask,self.group[i])==0 then continue end
-        local a,b=self.aabbMin[i],self.aabbMax[i]
-        if b.X<mn.X or a.X>mx.X or b.Y<mn.Y or a.Y>mx.Y or b.Z<mn.Z or a.Z>mx.Z then continue end
+        if not bodyOverlapsAabb(self,i,mn,mx) then continue end
         n+=1
         out[n]=makeHandle(i,self.generation[i])
     end
@@ -3061,8 +3206,7 @@ function World:queryAabb(mn,mx,mask,out)
         for k=1,#self.gridLarge do
             local i=self.gridLarge[k]
             if self.alive[i] and bit32.band(mask,self.group[i])~=0 then
-                local a,b=self.aabbMin[i],self.aabbMax[i]
-                if not (b.X<mn.X or a.X>mx.X or b.Y<mn.Y or a.Y>mx.Y or b.Z<mn.Z or a.Z>mx.Z) then
+                if bodyOverlapsAabb(self,i,mn,mx) then
                     n+=1;out[n]=makeHandle(i,self.generation[i])
                 end
             end
@@ -3078,8 +3222,7 @@ function World:queryAabb(mn,mx,mask,out)
                     if marks[i]~=epoch then
                         marks[i]=epoch
                         if bit32.band(mask,self.group[i])~=0 then
-                            local a,b=self.aabbMin[i],self.aabbMax[i]
-                            if not (b.X<mn.X or a.X>mx.X or b.Y<mn.Y or a.Y>mx.Y or b.Z<mn.Z or a.Z>mx.Z) then
+                            if bodyOverlapsAabb(self,i,mn,mx) then
                                 n+=1;out[n]=makeHandle(i,self.generation[i])
                             end
                         end
@@ -3093,6 +3236,17 @@ function World:queryAabb(mn,mx,mask,out)
     return out,n
 end
 
+
+-- Ephemeral zero-copy view of hot linear state for trusted bulk consumers. The returned arrays
+-- are Physik-owned and must be treated as read-only; their contents may change on the next world
+-- mutation/step. This avoids copying positions/velocities into an intermediate drain when a caller
+-- is immediately streaming them into another packed store.
+function World:linearStateView()
+    local view=self.linearView
+    view.high=self.high
+    view.dynamicCode=BODY_DYNAMIC
+    return view
+end
 
 function World:writeLinearState(out,opts)
     out=out or {}
@@ -3305,10 +3459,13 @@ function M.newWorld(opts)
     w.accumulator=0
     w.gridHeads={};w.gridKeys={};w.gridNext={};w.gridLarge={};w.gridX={};w.gridY={};w.gridZ={};w.gridKey={}
     w.gridKeyX={};w.gridKeyY={};w.gridKeyZ={}
+    w.gridDenseKeys={};w.gridPairA={};w.gridPairB={};w.gridDenseCount=0;w.gridPairCount=0
+    w.gridTopologyReady=false;w.gridTopologyDirty=true
     w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
     w.frame=0
     w.cacheEpoch=0
     w.ccdHitCount=0
+    w.ccdCount=0
     w.high=0
     w.aliveCount=0
     w.free={}
@@ -3336,6 +3493,7 @@ function M.newWorld(opts)
     w.userData={}
     w.sensor={}
     w.ccd={};w.prevPos={}
+    w.linearView={alive=w.alive,bodyType=w.bodyType,userData=w.userData,positions=w.pos,velocities=w.linVel,high=0,dynamicCode=BODY_DYNAMIC}
     w.sleeping={}
     w.sleepTime={}
     w.aabbMin={}

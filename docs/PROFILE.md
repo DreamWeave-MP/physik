@@ -238,3 +238,23 @@ and final transform sums in the regression probe.
 Combined with Dream ECS 0.2.1, the MJ12 120-step benchmark on this sandbox moved from median roughly
 0.639 / 2.834 / 13.153 ms per step at 256 / 1000 / 5000 bodies to roughly 0.39-0.41 / 1.60-1.72 /
 8.45-8.9 ms before snapshot encoding work. Exact wall-clock values remain machine/workload dependent.
+
+
+## v0.3.2 coherent topology cache / lazy sphere AABBs
+
+MJ12's sparse 5000-sphere encounter benchmark showed that the broadphase was dominated by work that
+contained no collisions: rebuilding 5000 center-cell bucket chains and probing thirteen neighboring
+hash keys for every occupied cell on every 60 Hz tick. Coherent motion means that topology usually
+does not change at frame frequency.
+
+v0.3.2 keeps the numeric buckets and occupied-neighbor pair list until a body crosses a cell boundary,
+becomes oversized, becomes compact again, is added, or is removed. Collision work then walks only
+non-singleton cells and neighbor pairs that actually exist. Spheres also derive grid eligibility and
+cell membership directly from center/radius, avoiding full AABB refreshes until a candidate/query needs
+that information.
+
+On the supplied sandbox, with 0.5-radius spheres on a 4-unit lattice and a 2-unit grid cell, the MJ12
+5000-body integrated fixed step moved from roughly 8.4 ms in the 0.3.1-era stack to roughly 1.6-1.7 ms
+after the coherent-grid, ECS-row-cache, and zero-copy-view path. The number is workload/hardware
+dependent; the important result is elimination of empty-space bookkeeping. A mixed 96-body sphere/box
+180-step parity probe retains the exact 0.3.1 contact accumulation and displayed state sums.

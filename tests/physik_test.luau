@@ -40,4 +40,41 @@ suite.describe('numeric grid broadphase', function()
   end)
 end)
 
+
+suite.describe('coherent grid cache', function()
+  suite.it('rebuilds occupied-neighbor topology when moving bodies cross cells', function()
+    local world = physik.newWorld({ gravity = vector.create(0, 0, 0), broadphase = 'grid', broadphaseCellSize = 1 })
+    world:addBody({ shape = physik.sphere(0.35), position = vector.create(0.2, 0, 0), velocity = vector.create(1.5, 0, 0), mass = 1, linearDamping = 0 })
+    world:addBody({ shape = physik.sphere(0.35), position = vector.create(3.8, 0, 0), velocity = vector.create(-1.5, 0, 0), mass = 1, linearDamping = 0 })
+    local touched = false
+    for _ = 1, 120 do
+      world:step(1 / 60)
+      if world:stats().contacts > 0 then touched = true end
+    end
+    expect(touched).toBe(true)
+  end)
+
+  suite.it('keeps sphere AABB queries correct after coherent motion', function()
+    local world = physik.newWorld({ gravity = vector.create(0, 0, 0), broadphase = 'grid', broadphaseCellSize = 2 })
+    world:addBody({ shape = physik.sphere(0.5), position = vector.create(0, 0, 0), velocity = vector.create(1, 0, 0), mass = 1, linearDamping = 0 })
+    for _ = 1, 30 do world:step(1 / 60) end
+    local hits, count = world:queryAabb(vector.create(0.3, -1, -1), vector.create(1.2, 1, 1))
+    expect(count).toBe(1)
+    expect(#hits).toBe(1)
+  end)
+end)
+
+suite.describe('linear state view', function()
+  suite.it('exposes the current Physik-owned hot arrays without copying', function()
+    local world = physik.newWorld({ gravity = vector.create(0, 0, 0) })
+    world:addBody({ shape = physik.sphere(0.5), position = vector.create(1, 0, 0), velocity = vector.create(2, 0, 0), mass = 1, linearDamping = 0, userData = 9 })
+    local view = world:linearStateView()
+    expect(view.high).toBe(1)
+    expect(view.userData[1]).toBe(9)
+    expect(view.positions[1].X).toBe(1)
+    world:step(0.5)
+    expect(view.positions[1].X).toBe(2)
+  end)
+end)
+
 return suite
