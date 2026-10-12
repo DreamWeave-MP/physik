@@ -200,76 +200,148 @@ local function buildMeshGrid(vbuf,ibuf,triCount,cellSize,maxCellsPerTriangle)
     return heads,nextNode,nodeTri,overflow
 end
 
-function M.triangleMesh(vertices,indices,opts)
-    opts=opts or {}
-    local vbuf,vcount
-    if typeof(vertices)=="buffer" then
-        assert(buffer.len(vertices)%12==0,"physik.triangleMesh: vertex buffer must contain packed f32 xyz triples")
-        vbuf=vertices; vcount=buffer.len(vertices)/12
-    else
-        assert(type(vertices)=="table" and #vertices>=3,"physik.triangleMesh: vertices must be a vector array or packed f32 buffer")
-        vcount=#vertices; vbuf=buffer.create(vcount*12)
-        for i=1,vcount do assert(typeof(vertices[i])=="vector","physik.triangleMesh: every vertex must be a vector"); writeVec3(vbuf,i-1,vertices[i]) end
+-- The data plane's readers of what shapes pack: a mesh's vertices, three f32 to each, and a
+-- heightfield's samples.
+local VertexFields: dream_data_Kind_f32 = data.f32(12)
+local Samples: dream_data_Kind_f32 = data.f32()
+
+function M.triangleMesh(vertices, indices, opts)
+  opts = opts or {}
+
+  local packed, vertexCount
+
+  if typeof(vertices) == 'buffer' then
+    assert(buffer.len(vertices) % 12 == 0, 'physik.triangleMesh: vertex buffer must contain packed f32 xyz triples')
+    packed, vertexCount = vertices, buffer.len(vertices) / 12
+  else
+    assert(type(vertices) == 'table' and #vertices >= 3, 'physik.triangleMesh: vertices must be a vector array or packed f32 buffer')
+    vertexCount = #vertices
+    packed = buffer.create(vertexCount * 12)
+
+    for index = 1, vertexCount do
+      local vertex = vertices[index]
+
+      assert(typeof(vertex) == 'vector', 'physik.triangleMesh: every vertex must be a vector')
+      writeVec3(packed, index - 1, vertex)
     end
-    local ibuf,icount
-    if indices==nil then
-        assert(vcount%3==0,"physik.triangleMesh: without indices, vertex count must be divisible by 3")
-        icount=vcount; ibuf=buffer.create(icount*4)
-        for i=0,icount-1 do buffer.writeu32(ibuf,i*4,i) end
-    elseif typeof(indices)=="buffer" then
-        assert(buffer.len(indices)%12==0,"physik.triangleMesh: index buffer length must be divisible by 3 u32 indices")
-        ibuf=indices; icount=buffer.len(indices)/4
-    else
-        assert(type(indices)=="table" and #indices%3==0,"physik.triangleMesh: indices must be a triangle-list table or u32 buffer")
-        icount=#indices; ibuf=buffer.create(icount*4)
-        for i=1,icount do
-            local idx=indices[i]
-            assert(type(idx)=="number" and idx%1==0 and idx>=1 and idx<=vcount,"physik.triangleMesh: table indices are 1-based and must reference a vertex")
-            buffer.writeu32(ibuf,(i-1)*4,idx-1)
-        end
+  end
+
+  local triangles, indexCount
+
+  if indices == nil then
+    assert(vertexCount % 3 == 0, 'physik.triangleMesh: without indices, vertex count must be divisible by 3')
+    indexCount = vertexCount
+    triangles = buffer.create(indexCount * 4)
+    into(triangles, 'u32')[for index in range(0, indexCount - 1) => index]
+  elseif typeof(indices) == 'buffer' then
+    assert(buffer.len(indices) % 12 == 0, 'physik.triangleMesh: index buffer length must be divisible by 3 u32 indices')
+    triangles, indexCount = indices, buffer.len(indices) / 4
+  else
+    assert(type(indices) == 'table' and #indices % 3 == 0, 'physik.triangleMesh: indices must be a triangle-list table or u32 buffer')
+    indexCount = #indices
+    triangles = buffer.create(indexCount * 4)
+
+    for position = 1, indexCount do
+      local index = indices[position]
+
+      assert(
+        type(index) == 'number' and index % 1 == 0 and index >= 1 and index <= vertexCount,
+        'physik.triangleMesh: table indices are 1-based and must reference a vertex'
+      )
+
+      buffer.writeu32(triangles, (position - 1) * 4, index - 1)
     end
-    local triCount=icount/3
-    assert(triCount>=1,"physik.triangleMesh: mesh must contain at least one triangle")
-    local mn=vector.create(math.huge,math.huge,math.huge)
-    local mx=vector.create(-math.huge,-math.huge,-math.huge)
-    for i=0,vcount-1 do
-        local v=readVec3(vbuf,i)
-        mn=vector.create(math.min(mn.X,v.X),math.min(mn.Y,v.Y),math.min(mn.Z,v.Z))
-        mx=vector.create(math.max(mx.X,v.X),math.max(mx.Y,v.Y),math.max(mx.Z,v.Z))
-    end
-    local extent=mx-mn
-    local longest=math.max(extent.X,extent.Y,extent.Z)
-    local cellSize=opts.cellSize or math.max(longest/math.max(math.sqrt(triCount)*0.5,1),0.25)
-    assert(type(cellSize)=="number" and cellSize>0,"physik.triangleMesh: cellSize must be > 0")
-    local maxCells=opts.maxCellsPerTriangle or 64
-    local heads,nextNode,nodeTri,overflow=buildMeshGrid(vbuf,ibuf,triCount,cellSize,maxCells)
-    return table.freeze({kind=SHAPE_MESH,vertices=vbuf,indices=ibuf,vertexCount=vcount,triangleCount=triCount,localMin=mn,localMax=mx,cellSize=cellSize,heads=heads,nextNode=nextNode,nodeTri=nodeTri,overflow=overflow})
+  end
+
+  local triangleCount = indexCount / 3
+  assert(triangleCount >= 1, 'physik.triangleMesh: mesh must contain at least one triangle')
+
+  -- A coordinate that is not a number is in neither bound: it compares with nothing.
+  local low = vector.create(math.huge, math.huge, math.huge)
+  local high = -low
+
+  if vertexCount > 0 then
+    low = vector.create(
+      VertexFields:minLt(packed, 0, vertexCount, math.huge) or math.huge,
+      VertexFields:minLt(packed, 4, vertexCount, math.huge) or math.huge,
+      VertexFields:minLt(packed, 8, vertexCount, math.huge) or math.huge
+    )
+
+    high = vector.create(
+      VertexFields:maxGt(packed, 0, vertexCount, -math.huge) or -math.huge,
+      VertexFields:maxGt(packed, 4, vertexCount, -math.huge) or -math.huge,
+      VertexFields:maxGt(packed, 8, vertexCount, -math.huge) or -math.huge
+    )
+  end
+
+  local extent = high - low
+  local longest = math.max(extent.X, extent.Y, extent.Z)
+  local cellSize = opts.cellSize or math.max(longest / math.max(math.sqrt(triangleCount) * 0.5, 1), 0.25)
+  assert(type(cellSize) == 'number' and cellSize > 0, 'physik.triangleMesh: cellSize must be > 0')
+
+  local heads, nextNode, nodeTri, overflow = buildMeshGrid(packed, triangles, triangleCount, cellSize, opts.maxCellsPerTriangle or 64)
+
+  return table.freeze({
+    kind = SHAPE_MESH,
+    vertices = packed,
+    indices = triangles,
+    vertexCount = vertexCount,
+    triangleCount = triangleCount,
+    localMin = low,
+    localMax = high,
+    cellSize = cellSize,
+    heads = heads,
+    nextNode = nextNode,
+    nodeTri = nodeTri,
+    overflow = overflow,
+  })
 end
 
-function M.heightfield(width,depth,heights,opts)
-    opts=opts or {}
-    assert(type(width)=="number" and width%1==0 and width>=2,"physik.heightfield: width must be an integer >= 2")
-    assert(type(depth)=="number" and depth%1==0 and depth>=2,"physik.heightfield: depth must be an integer >= 2")
-    local count=width*depth
-    local hbuf
-    if typeof(heights)=="buffer" then
-        assert(buffer.len(heights)==count*4,"physik.heightfield: height buffer must contain width*depth f32 values")
-        hbuf=heights
-    else
-        assert(type(heights)=="table" and #heights==count,"physik.heightfield: heights must contain width*depth values")
-        hbuf=buffer.create(count*4)
-        for i=1,count do assert(type(heights[i])=="number","physik.heightfield: heights must be numbers");buffer.writef32(hbuf,(i-1)*4,heights[i]) end
+function M.heightfield(width, depth, heights, opts)
+  opts = opts or {}
+  assert(type(width) == 'number' and width % 1 == 0 and width >= 2, 'physik.heightfield: width must be an integer >= 2')
+  assert(type(depth) == 'number' and depth % 1 == 0 and depth >= 2, 'physik.heightfield: depth must be an integer >= 2')
+
+  local count = width * depth
+  local samples
+
+  if typeof(heights) == 'buffer' then
+    assert(buffer.len(heights) == count * 4, 'physik.heightfield: height buffer must contain width*depth f32 values')
+    samples = heights
+  else
+    assert(type(heights) == 'table' and #heights == count, 'physik.heightfield: heights must contain width*depth values')
+    samples = buffer.create(count * 4)
+
+    for index = 1, count do
+      local height = heights[index]
+
+      assert(type(height) == 'number', 'physik.heightfield: heights must be numbers')
+      buffer.writef32(samples, (index - 1) * 4, height)
     end
-    local sx=opts.cellSizeX or opts.cellSize or 1
-    local sz=opts.cellSizeZ or opts.cellSize or 1
-    assert(sx>0 and sz>0,"physik.heightfield: cell sizes must be > 0")
-    local origin=opts.origin or ZERO
-    assert(typeof(origin)=="vector","physik.heightfield: origin must be a vector")
-    local minY,maxY=math.huge,-math.huge
-    for i=0,count-1 do local h=buffer.readf32(hbuf,i*4);if h<minY then minY=h end;if h>maxY then maxY=h end end
-    local mn=vector.create(origin.X,origin.Y+minY,origin.Z)
-    local mx=vector.create(origin.X+(width-1)*sx,origin.Y+maxY,origin.Z+(depth-1)*sz)
-    return table.freeze({kind=SHAPE_HEIGHTFIELD,width=width,depth=depth,heights=hbuf,cellSizeX=sx,cellSizeZ=sz,origin=origin,localMin=mn,localMax=mx})
+  end
+
+  local cellSizeX = opts.cellSizeX or opts.cellSize or 1
+  local cellSizeZ = opts.cellSizeZ or opts.cellSize or 1
+  assert(cellSizeX > 0 and cellSizeZ > 0, 'physik.heightfield: cell sizes must be > 0')
+
+  local origin = opts.origin or ZERO
+  assert(typeof(origin) == 'vector', 'physik.heightfield: origin must be a vector')
+
+  -- A sample that is not a number is in neither bound: it compares with nothing.
+  local lowest = Samples:minLt(samples, 0, count, math.huge) or math.huge
+  local highest = Samples:maxGt(samples, 0, count, -math.huge) or -math.huge
+
+  return table.freeze({
+    kind = SHAPE_HEIGHTFIELD,
+    width = width,
+    depth = depth,
+    heights = samples,
+    cellSizeX = cellSizeX,
+    cellSizeZ = cellSizeZ,
+    origin = origin,
+    localMin = vector.create(origin.X, origin.Y + lowest, origin.Z),
+    localMax = vector.create(origin.X + (width - 1) * cellSizeX, origin.Y + highest, origin.Z + (depth - 1) * cellSizeZ),
+  })
 end
 
 
