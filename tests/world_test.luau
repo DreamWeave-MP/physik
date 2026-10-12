@@ -823,6 +823,31 @@ suite.describe('queries', function()
     end
   end)
 
+  suite.it('finds nothing along a ray that starts where no number is', function()
+    local nowhere = 0 / 0
+    local origins = { vector.create(nowhere, 8, 0), vector.create(0, nowhere, 0), vector.create(0, 8, nowhere) }
+
+    for _, broadphase in { 'grid', 'sap' } do
+      local world = physik.newWorld({ gravity = vector.create(0, 0, 0), broadphase = broadphase, broadphaseCellSize = 4 })
+
+      -- Spheres small enough to be in the grid's cells, which is where such a ray is not.
+      world:addBody({ type = 'static', shape = physik.sphere(1) })
+      world:addBody({ type = 'static', shape = physik.sphere(0.5), position = vector.create(3, -2, 3) })
+
+      for _, origin in origins do
+        expect(world:raycast(origin, vector.create(0, -1, 0), 20)).toBe(nil)
+        expect(world:raycast(origin, vector.create(1, -1, 1), 20)).toBe(nil)
+        expect(world:raycast(origin, vector.create(0, -1, 0))).toBe(nil)
+      end
+
+      local drained, count = world:raycastBatchSoA(origins, [for _ in origins => vector.create(0, -1, 0)], { 20, 20, 20 })
+
+      expect(count).toBe(3)
+      expect(drained.hit).toEqual({ false, false, false })
+      expect(world:raycast(vector.create(0, 8, 0), vector.create(0, -1, 0), 20).distance).toBe(7)
+    end
+  end)
+
   suite.it('answers a batch of rays as records and as columns, like the rays one by one', function()
     local world = gallery()
     local origins = [for column in range(0, 52.5, 2.5) => vector.create(column, 6, 0.2)]

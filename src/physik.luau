@@ -3385,6 +3385,11 @@ function World:_raycastRaw(origin, direction, maxDistance, mask)
 
   local {queryMarks: marks, gridHeads: heads, gridNext: nextIn, gridOccupied: occupied} = self
   local column, row, layer = math.floor(origin.X / cellSize), math.floor(origin.Y / cellSize), math.floor(origin.Z / cellSize)
+
+  -- An origin that is not a number is in no cell, so nothing in the grid is in the ray's way, and
+  -- a cell that is not a number has no byte in the filter to ask for.
+  if column ~= column or row ~= row or layer ~= layer then return bestBody, bestDistance, bestPoint, bestNormal end
+
   local stepX = if dir.X > EPS then 1 elseif dir.X < -EPS then -1 else 0
   local stepY = if dir.Y > EPS then 1 elseif dir.Y < -EPS then -1 else 0
   local stepZ = if dir.Z > EPS then 1 elseif dir.Z < -EPS then -1 else 0
