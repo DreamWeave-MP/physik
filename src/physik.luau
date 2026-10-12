@@ -2157,6 +2157,14 @@ function World:_collideGrid()
     return
   end
 
+  -- The sweep orders and prunes on every body's box, and a sphere's is not kept current as it
+  -- moves: the grid asks no more of a sphere than its centre.
+  local radii = self.sphereRadius
+
+  for body = 1, self.high do
+    if alive[body] and radii[body] then self:_updateAabb(body) end
+  end
+
   self:_sortOrder()
   local {order, aabbMin, aabbMax} = self
   local count = #order

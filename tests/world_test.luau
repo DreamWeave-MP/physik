@@ -584,6 +584,31 @@ suite.describe('stepping', function()
     end
   end)
 
+  suite.it('stops a small sphere at the first of more oversized bodies than are paired one by one', function()
+    local world = physik.newWorld({ gravity = vector.create(0, 0, 0), broadphaseCellSize = 1 })
+
+    -- Twenty walls, each wider than a cell: more than the sixteen that are tested against
+    -- every body directly, so the pairs come from the sweep along X.
+    for index = 1, 20 do
+      world:addBody({ type = 'static', shape = physik.box(vector.create(1, 1, 1)), position = vector.create(100 + index * 5, 0, 0) })
+    end
+
+    local ball = world:addBody({
+      shape = physik.sphere(0.3),
+      velocity = vector.create(20, 0, 0),
+      linearDamping = 0,
+    })
+
+    local contacts = 0
+
+    for _ = 1, 400 do
+      contacts += world:step(1 / 60)
+    end
+
+    expect(contacts > 0).toBe(true)
+    expect(world:getBody(ball).position.X < 104).toBe(true)
+  end)
+
   suite.it('keeps a sensor out of the solve and reports what it touches', function()
     local world = physik.newWorld({ gravity = vector.create(0, 0, 0), contactEvents = true })
     local sensor = world:addBody({ type = 'static', shape = physik.sphere(1), sensor = true })
