@@ -434,6 +434,41 @@ suite.describe('stepping', function()
       expect(world:stats().contacts).toBe(5)
     end)
 
+    suite.it(`keeps a sphere on the terrain it rolls across, by {broadphase}`, function()
+      local flat = table.create(33 * 33, 0)
+      local vertices = { vector.create(-16, 0, -16), vector.create(16, 0, -16), vector.create(16, 0, 16), vector.create(-16, 0, 16) }
+
+      local terrains = {
+        physik.heightfield(33, 33, flat, { origin = vector.create(-16, 0, -16) }),
+        physik.triangleMesh(vertices, { 1, 3, 2, 1, 4, 3 }, { cellSize = 1, maxCellsPerTriangle = 4096 }),
+      }
+
+      for _, terrain in terrains do
+        local world = physik.newWorld({ broadphase = broadphase })
+        world:addBody({ type = 'static', shape = terrain })
+
+        local ball = world:addBody({
+          shape = physik.sphere(0.4),
+          position = vector.create(-10, 0.4, 0.3),
+          velocity = vector.create(6, 0, 0),
+          linearDamping = 0,
+          friction = 0,
+        })
+
+        local lowest = math.huge
+
+        for _ = 1, 150 do
+          world:step(1 / 60)
+          lowest = math.min(lowest, world:getBody(ball).position.Y)
+        end
+
+        -- Ten units on, far from the cells it started over, it is still resting on the surface.
+        expect(lowest > 0.3).toBe(true)
+        expect(world:getBody(ball).position.X > 0).toBe(true)
+        expect(world:stats().contacts > 0).toBe(true)
+      end
+    end)
+
     suite.it(`pairs bodies that share a least X in the order they were added, by {broadphase}`, function()
       local world = physik.newWorld({ broadphase = broadphase, gravity = vector.create(0, 0, 0), broadphaseCellSize = 2 })
 

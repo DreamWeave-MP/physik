@@ -1766,6 +1766,11 @@ function World:_narrowGeometry(a,b)
     if aGeom and bGeom then return end
     local prim,geom,flip
     if aGeom then prim,geom,flip=b,a,true else prim,geom,flip=a,b,false end
+
+    -- The triangles under a body are found from its box, and a sphere's is not kept current as it
+    -- moves: the grid asks no more of a sphere than its centre.
+    if self.sphereRadius[prim] then self:_updateAabb(prim) end
+
     self.geomContactCount=0
     if self.shape[geom].kind==SHAPE_MESH then self:_narrowMesh(prim,geom,flip) else self:_narrowHeightfield(prim,geom,flip) end
     for k=1,self.geomContactCount do self:_addContact(a,b,self.geomNormal[k],self.geomPoint[k],self.geomPen[k]) end
