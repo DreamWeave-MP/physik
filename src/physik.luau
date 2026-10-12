@@ -2,6 +2,8 @@
 -- physik: compact 3D rigid-body physics for Jess/Luau.
 -- Hot state uses Luau's native vector value type. Cold metadata stays scalar/packed-friendly.
 
+local data = require('@dream/data')
+
 local M = {}
 
 local ZERO = vector.create(0, 0, 0)
@@ -1504,28 +1506,73 @@ function World:_updateAabb(i)
     end
 end
 
+--- Sorts `order` by each body's least X from scratch: the keys go into a buffer, the data plane
+--- orders them, and the bodies follow. It is stable, as the insertion sort it stands in for is, so
+--- it ends where that would have. Returns false, having moved nothing, when a key is not a number,
+--- which the two sorts place differently.
+local function sortOrderByKeys(self, order: { number }, count: number): boolean
+  local aabbMin = self.aabbMin
+  local keys, permutation = buffer.create(count * 4), buffer.create(count * 4)
+
+  into(keys, 'f32')[for body in order => aabbMin[body].X]
+
+  -- A sum is not a number when a key is not, or when both infinities are among the keys.
+  local total = data.sum(keys, 'f32', 0, count)
+  if total ~= total then return false end
+
+  data.argsort(keys, 'f32', 0, count, permutation)
+  table.move([for slot in permutation[1:count, 'u32'] => order[slot + 1]], 1, count, 1, order)
+
+  return true
+end
+
 function World:_sortOrder()
-    -- Compact dead slots opportunistically, then insertion-sort on min X. Physics motion is coherent,
-    -- so after the first frame this is normally close to O(n).
-    local order = self.order
-    if #order > self.aliveCount + 64 then
-        local n = 0
-        for k=1,#order do
-            local i=order[k]
-            if self.alive[i] then n+=1; order[n]=i end
-        end
-        for k=#order,n+1,-1 do order[k]=nil end
+  local {order, alive, aabbMin} = self
+  local count = #order
+
+  -- Compact dead slots opportunistically.
+  if count > self.aliveCount + 64 then
+    local kept = 0
+
+    for index = 1, count do
+      local body = order[index]
+      if not alive[body] then continue end
+
+      kept += 1
+      order[kept] = body
     end
-    for k=2,#order do
-        local v=order[k]
-        local x=self.aabbMin[v].X
-        local j=k-1
-        while j>=1 and self.aabbMin[order[j]].X > x do
-            order[j+1]=order[j]
-            j-=1
-        end
-        order[j+1]=v
+
+    for index = count, kept + 1, -1 do
+      order[index] = nil
     end
+
+    count = kept
+  end
+
+  -- Insertion sort on min X. Physics motion is coherent, so after the first frame this is normally
+  -- close to O(n). When it is not, with bodies just added or scattered, its moves soon outnumber
+  -- what sorting from scratch costs, and what is left is handed to that.
+  local allowance = count * 8
+
+  for position = 2, count do
+    local body = order[position]
+    local key = aabbMin[body].X
+    local slot = position - 1
+
+    while slot >= 1 and aabbMin[order[slot]].X > key do
+      order[slot + 1] = order[slot]
+      slot -= 1
+    end
+
+    order[slot + 1] = body
+    allowance -= position - 1 - slot
+
+    if allowance < 0 then
+      if sortOrderByKeys(self, order, count) then return end
+
+      allowance = math.huge
+    end
+  end
 end
 
 local impulseDenom
