@@ -769,6 +769,32 @@ suite.describe('queries', function()
     near(back.distance, 29, 1e-4)
   end)
 
+  suite.it('finds a sphere where it has moved to, not where it was added', function()
+    for _, broadphase in { 'grid', 'sap' } do
+      local world = physik.newWorld({ gravity = vector.create(0, 0, 0), broadphase = broadphase, broadphaseCellSize = 2 })
+
+      world:addBody({
+        shape = physik.sphere(0.5),
+        velocity = vector.create(1, 0, 0),
+        linearDamping = 0,
+        userData = 'ball',
+      })
+
+      for _ = 1, 300 do
+        world:step(1 / 60)
+      end
+
+      local hit = world:raycast(vector.create(5, 5, 0), vector.create(0, -1, 0), 10)
+      local swept = world:sphereCast(vector.create(5, 5, 0), vector.create(5, -5, 0), 0.2)
+
+      expect(hit.userData).toBe('ball')
+      near(hit.distance, 4.5, 1e-3)
+      expect(swept.userData).toBe('ball')
+      expect(world:raycast(vector.create(0, 5, 0), vector.create(0, -1, 0), 10)).toBe(nil)
+      expect(named(world, world:queryAabb(vector.create(4.8, -1, -1), vector.create(5.2, 1, 1)), 1)).toEqual({ 'ball' })
+    end
+  end)
+
   suite.it('answers a batch of rays as records and as columns, like the rays one by one', function()
     local world = gallery()
     local origins = [for column in range(0, 52.5, 2.5) => vector.create(column, 6, 0.2)]

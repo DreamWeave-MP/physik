@@ -3259,9 +3259,12 @@ end
 --- Where a ray first meets one body, if it does within `reach` and the body's group is in `mask`.
 local function raycastBody(self, body: number, origin: vector, dir: vector, reach: number, mask: number)
   if not self.alive[body] or bit32.band(mask, self.group[body]) == 0 then return nil end
+
+  -- A sphere's box is not kept current as it moves, and the sphere is as quick to test as a box.
+  local shape = self.shape[body]
+  if shape.kind == SHAPE_SPHERE then return raySphere(origin, dir, reach, self.pos[body], shape.radius) end
   if not rayAabbInterval(origin, dir, reach, self.aabbMin[body], self.aabbMax[body]) then return nil end
 
-  local shape = self.shape[body]
   local kind = shape.kind
   if kind == SHAPE_MESH then return self:_rayMesh(body, origin, dir, reach) end
   if kind == SHAPE_HEIGHTFIELD then return self:_rayHeightfield(body, origin, dir, reach) end
