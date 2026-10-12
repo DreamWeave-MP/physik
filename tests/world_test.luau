@@ -722,6 +722,104 @@ suite.describe('stepping', function()
     expect(contacts(false)).toBe(0)
     expect(contacts(true)).toBe(1)
   end)
+
+  suite.it('lets the two bodies of a world\'s only joint overlap until it is removed', function()
+    local world = physik.newWorld({ gravity = vector.create(0, 0, 0) })
+    local left = world:addBody({ shape = physik.sphere(0.5) })
+    local right = world:addBody({ shape = physik.sphere(0.5), position = vector.create(0.6, 0, 0) })
+    local joint = world:addDistanceJoint(left, right, { length = 0.6 })
+
+    expect(world:step(1 / 60)).toBe(0)
+    world:removeJoint(joint)
+    expect(world:step(1 / 60)).toBe(1)
+  end)
+
+  suite.it('finds a sphere in the cell it has crossed into, along each axis', function()
+    local target = vector.create(0.5, 0.5, 0.5)
+
+    for _, heading in { vector.create(1, 0, 0), vector.create(0, 1, 0), vector.create(0, 0, 1) } do
+      local world = physik.newWorld({ gravity = vector.create(0, 0, 0) })
+      world:addBody({ type = 'static', shape = physik.sphere(0.3), position = target })
+
+      local mover = world:addBody({
+        shape = physik.sphere(0.3),
+        position = target - heading * 4,
+        velocity = heading * 3,
+        linearDamping = 0,
+      })
+
+      local contacts = 0
+
+      for _ = 1, 90 do
+        contacts += world:step(1 / 60)
+      end
+
+      -- Four cells on, it has met the sphere in its way, and has not gone through it.
+      expect(contacts > 0).toBe(true)
+      expect(vector.dot(world:getBody(mover).position - target, heading) < 0).toBe(true)
+    end
+  end)
+
+  suite.it('pairs spheres too wide for a cell with what is two cells away', function()
+    local world = physik.newWorld({ gravity = vector.create(0, 0, 0) })
+    world:addBody({ type = 'static', shape = physik.sphere(0.9), position = vector.create(0.5, 0.5, 0.5) })
+    world:addBody({ shape = physik.sphere(0.9), position = vector.create(2.2, 0.5, 0.5) })
+
+    expect(world:step(1 / 60)).toBe(1)
+  end)
+
+  suite.it('turns a piece of a compound by its own rotation, then by its body\'s', function()
+    local quarter = math.pi / 2
+    local world = physik.newWorld({ gravity = vector.create(0, 0, 0) })
+
+    -- A capsule lies along Y. The piece's quarter turn about X lays it along Z, and the body's
+    -- about Z leaves it there; turned in the other order it would lie along X.
+    world:addBody({
+      type = 'static',
+      rotation = physik.axisAngle(vector.create(0, 0, 1), quarter),
+      shape = physik.compound({
+        { shape = physik.capsule(0.2, 0.6), rotation = physik.axisAngle(vector.create(1, 0, 0), quarter) },
+      }),
+    })
+
+    local atItsEnd = world:addBody({ shape = physik.sphere(0.1), position = vector.create(0, 0, 0.85) })
+    world:addBody({ shape = physik.sphere(0.1), position = vector.create(0.85, 0, 0) })
+
+    expect(world:step(1 / 60)).toBe(1)
+
+    local contact = world:contacts()[1]
+
+    expect(contact.b).toBe(atItsEnd)
+    expect(contact.normal.Z > 0.9).toBe(true)
+  end)
+
+  suite.it('wakes a sleeping body that a kinematic one runs into', function()
+    local world = physik.newWorld()
+    ground(world)
+
+    -- Added before what will push it, so the sleeper is the first body of their pair.
+    local ball = world:addBody({ shape = physik.sphere(0.4), position = vector.create(0, 0.4, 0) })
+
+    for _ = 1, 120 do
+      world:step(1 / 60)
+    end
+
+    expect(world:getBody(ball).sleeping).toBe(true)
+
+    world:addBody({
+      type = 'kinematic',
+      shape = physik.box(vector.create(0.2, 0.4, 0.4)),
+      position = vector.create(-2, 0.45, 0),
+      velocity = vector.create(2, 0, 0),
+    })
+
+    for _ = 1, 60 do
+      world:step(1 / 60)
+    end
+
+    expect(world:getBody(ball).sleeping).toBe(false)
+    expect(world:getBody(ball).position.X > 0.2).toBe(true)
+  end)
 end)
 
 suite.describe('queries', function()
@@ -991,6 +1089,35 @@ suite.describe('queries', function()
     end
   end)
 
+  suite.it('counts a sphere\'s margin when a box asks what it overlaps', function()
+    local world = physik.newWorld({ gravity = vector.create(0, 0, 0), contactMargin = 0.1 })
+
+    -- One sphere too wide for a cell and one in a cell, each reaching 0.1 past its radius.
+    world:addBody({ type = 'static', shape = physik.sphere(1) })
+    world:addBody({ type = 'static', shape = physik.sphere(0.25), position = vector.create(0, 5, 0) })
+
+    expect(select(2, world:queryAabb(vector.create(1.05, -0.1, -0.1), vector.create(2, 0.1, 0.1)))).toBe(1)
+    expect(select(2, world:queryAabb(vector.create(1.15, -0.1, -0.1), vector.create(2, 0.1, 0.1)))).toBe(0)
+    expect(select(2, world:queryAabb(vector.create(0.3, 4.9, -0.1), vector.create(1, 5.1, 0.1)))).toBe(1)
+    expect(select(2, world:queryAabb(vector.create(0.4, 4.9, -0.1), vector.create(1, 5.1, 0.1)))).toBe(0)
+  end)
+
+  suite.it('sweeps a sphere to a body in a slot that another body had before it', function()
+    local world = physik.newWorld({ gravity = vector.create(0, 0, 0) })
+
+    world:addBody({ type = 'static', shape = physik.sphere(0.5), position = vector.create(0, 10, 0), userData = 'aside' })
+    world:removeBody(world:addBody({ type = 'static', shape = physik.sphere(0.5), userData = 'gone' }))
+
+    local again = world:addBody({ type = 'static', shape = physik.box(vector.create(0.5, 0.5, 0.5)), userData = 'again' })
+    local hit = world:sphereCast(vector.create(0, 5, 0), vector.create(0, -5, 0), 0.25)
+
+    expect(again).toBe(2 * Generation + 2)
+    expect(hit.handle).toBe(again)
+    expect(hit.userData).toBe('again')
+    near(hit.center.Y, 0.75, 1e-3)
+    expect(world:sphereCast(vector.create(0, 5, 0), vector.create(0, -5, 0), 0.25, nil, again)).toBe(nil)
+  end)
+
   suite.it('sweeps a sphere to where it first touches each kind of shape', function()
     local world = gallery()
 
@@ -1166,6 +1293,21 @@ suite.describe('drains', function()
     expect(function()
       world:applyTransforms({})
     end).toThrow('physik.applyTransforms: expected writeTransforms-compatible data')
+  end)
+
+  suite.it('moves the origin under the contacts of the last step too', function()
+    local world = physik.newWorld({ gravity = vector.create(0, 0, 0) })
+    world:addBody({ type = 'static', shape = physik.sphere(0.5) })
+    world:addBody({ shape = physik.sphere(0.5), position = vector.create(0.9, 0, 0) })
+
+    expect(world:step(1 / 60)).toBe(1)
+
+    local shift = vector.create(8, -4, 2)
+    local point = world:contacts()[1].point
+
+    world:shiftOrigin(shift)
+    expect(world:contacts()[1].point).toBe(point - shift)
+    expect(world:writeContacts().points[1]).toBe(point - shift)
   end)
 
   suite.it('counts what the last step did', function()
