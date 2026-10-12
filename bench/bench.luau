@@ -6,7 +6,9 @@
 -- says. Every workload's result is checked against what 0.3.2 computes, to the bit, so a path
 -- that stopped doing the work, or does different work, fails here instead of posting a time.
 -- With `results` as the second argument each workload's result is printed instead of timed,
--- which is how the table of expectations is made.
+-- which is how the table of expectations is made. A filter that starts with `!` leaves out the
+-- workloads it names instead: the three marked "which 0.3.2 gets wrong" compute what a world
+-- should, and 0.3.2, which lets a sphere's bounds go stale under the grid, cannot be held to them.
 local physik = require '@dream/physik'
 
 -- A build without the verified toolchain runs Luau slower than a release does, so a number from
@@ -36,11 +38,14 @@ local Expected: { [string]: string } = {
   ['step: 600 capsules and boxes on a mesh of 8,192 triangles, 30 steps'] = '27582 contacts, 472 candidates, 435 manifolds, 804 warm, 0 asleep, 578 islands, 0 swept, checksum -48016.297100868112',
   ['step: 600 spheres, capsules and boxes on a heightfield 65 by 65, swept and pruned, 30 steps'] = '28667 contacts, 472 candidates, 445 manifolds, 834 warm, 0 asleep, 567 islands, 0 swept, checksum -56460.197085937391',
   ['step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, swept and pruned, 30 steps'] = '28595 contacts, 474 candidates, 438 manifolds, 817 warm, 0 asleep, 569 islands, 0 swept, checksum -58989.406010374587',
+  ['step: 600 spheres, capsules and boxes on a heightfield 65 by 65, 30 steps, which 0.3.2 gets wrong'] = '28642 contacts, 473 candidates, 445 manifolds, 832 warm, 0 asleep, 567 islands, 0 swept, checksum -56679.727851996227',
+  ['step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, 30 steps, which 0.3.2 gets wrong'] = '28573 contacts, 474 candidates, 438 manifolds, 813 warm, 0 asleep, 569 islands, 0 swept, checksum -58709.886807853727',
   ['step: 5,000 spheres drifting far apart with contact events, drained, 30 steps'] = '150000 drained, 107 contacts, 107 candidates, 40 manifolds, 25 warm, 0 asleep, 4960 islands, 0 swept, checksum 4163370.6571599795',
   ['step: 1,000 spheres asleep on the floor, 1 step'] = '1000 contacts, 1000 candidates, 1000 manifolds, 0 warm, 1000 asleep, 1000 islands, 0 swept, checksum 18256.543475389481',
   ['step: 60 chains of 8 links on distance, ball and hinge joints, 30 steps'] = '9000 contacts, 120 candidates, 120 manifolds, 0 warm, 0 asleep, 60 islands, 0 swept, checksum 33160.638126875238',
   ['step: 200 swept spheres fired at walls, spheres, compounds and terrain, swept and pruned, 6 steps'] = '267 stopped, 545 contacts, 53 candidates, 38 manifolds, 0 warm, 0 asleep, 200 islands, 17 swept, checksum 805801.30064624094',
   ['step: 200 swept spheres fired at walls, spheres and compounds in the grid, 6 steps'] = '135 stopped, 359 contacts, 28 candidates, 21 manifolds, 0 warm, 0 asleep, 200 islands, 1 swept, checksum 1253572.866368195',
+  ['step: 200 swept spheres fired at walls, spheres, compounds and terrain, 6 steps, which 0.3.2 gets wrong'] = '267 stopped, 545 contacts, 53 candidates, 38 manifolds, 0 warm, 0 asleep, 200 islands, 17 swept, checksum 805801.30064624094',
   ['query: 2,048 rays in a batch, as columns'] = '918 hits, checksum 67171.772320490592',
   ['query: 2,048 rays in a batch, as columns, unbounded and downward'] = '2048 hits, checksum 115321.69588919714',
   ['query: 2,048 rays in a batch, as records'] = '918 hits, checksum 28709.165104394498',
@@ -75,7 +80,10 @@ local function pin(value: number): string
 end
 
 local function wanted(name: string): boolean
-  return not only or string.find(name, only, 1, true) ~= nil
+  if not only then return true end
+  if string.sub(only, 1, 1) == '!' then return not string.find(name, string.sub(only, 2), 1, true) end
+
+  return string.find(name, only, 1, true) ~= nil
 end
 
 local function check(name: string, result: string)
@@ -369,6 +377,14 @@ workload('step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, sw
   return run(overTerrain(mesh, 'sap', mixed), 30)
 end)
 
+workload('step: 600 spheres, capsules and boxes on a heightfield 65 by 65, 30 steps, which 0.3.2 gets wrong', function(): string
+  return run(overTerrain(heightfield, 'grid', mixed), 30)
+end)
+
+workload('step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, 30 steps, which 0.3.2 gets wrong', function(): string
+  return run(overTerrain(mesh, 'grid', mixed), 30)
+end)
+
 workload('step: 5,000 spheres drifting far apart with contact events, drained, 30 steps', function(): string
   local random = generator(61)
   local world = physik.newWorld({ gravity = vector.create(0, 0, 0), contactEvents = true, broadphaseCellSize = 2 })
@@ -520,6 +536,10 @@ end)
 
 workload('step: 200 swept spheres fired at walls, spheres and compounds in the grid, 6 steps', function(): string
   return barrage({ broadphaseCellSize = 8 }, false)
+end)
+
+workload('step: 200 swept spheres fired at walls, spheres, compounds and terrain, 6 steps, which 0.3.2 gets wrong', function(): string
+  return barrage({ broadphaseCellSize = 2 }, true)
 end)
 
 -- A crowd for the queries: 4,096 small bodies of every primitive in a block, over one floor.
