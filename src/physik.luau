@@ -2125,15 +2125,17 @@ function World:_buildGridIndex(refreshAabbs)
 
     local head = heads[key]
 
+    -- The table of cells is written before the filter is, so a cell that is not a number, which
+    -- a body whose position is not a number is in, is refused by the table, as it always was.
+    nextIn[body] = head or 0
+    heads[key] = body
+
     if not head then
       keyCount += 1
       keys[keyCount] = key
       columns[keyCount], rows[keyCount], layers[keyCount] = column, row, layer
       buffer.writeu8(occupied, key % GridFilterSize, 1)
     end
-
-    nextIn[body] = head or 0
-    heads[key] = body
   end
 
   self.gridSmallCount = smallCount
