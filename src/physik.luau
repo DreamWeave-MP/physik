@@ -3124,156 +3124,210 @@ function World:_rayCompound(i,origin,dir,maxDist)
     return bestT,bestN,bestP
 end
 
-function World:_raycastBody(i,origin,dir,bestT,mask)
-    if not self.alive[i] or bit32.band(mask,self.group[i])==0 then return nil end
-    local mn,mx=self.aabbMin[i],self.aabbMax[i]
-    if not rayAabbInterval(origin,dir,bestT,mn,mx) then return nil end
-    local s=self.shape[i]
-    if s.kind==SHAPE_SPHERE then
-        return raySphere(origin,dir,bestT,self.pos[i],s.radius)
-    elseif s.kind==SHAPE_BOX then
-        return rayBox(origin,dir,bestT,self.pos[i],self.qv[i],self.qw[i],s.halfExtents)
-    elseif s.kind==SHAPE_MESH then
-        return self:_rayMesh(i,origin,dir,bestT)
-    elseif s.kind==SHAPE_HEIGHTFIELD then
-        return self:_rayHeightfield(i,origin,dir,bestT)
-    elseif s.kind==SHAPE_COMPOUND then
-        return self:_rayCompound(i,origin,dir,bestT)
-    end
-    local a,b=capsuleEndpoints(self.pos[i],self.qv[i],self.qw[i],s.halfHeight)
-    local m=(a+b)*0.5
-    local ta,na,pa=raySphere(origin,dir,bestT,a,s.radius)
-    local tm,nm,pm=raySphere(origin,dir,bestT,m,s.radius)
-    local tb,nb,pb=raySphere(origin,dir,bestT,b,s.radius)
-    local t,n,p=ta,na,pa
-    if tm and (not t or tm<t) then t,n,p=tm,nm,pm end
-    if tb and (not t or tb<t) then t,n,p=tb,nb,pb end
-    return t,n,p
+--- Where a ray first meets one body, if it does within `reach` and the body's group is in `mask`.
+local function raycastBody(self, body: number, origin: vector, dir: vector, reach: number, mask: number)
+  if not self.alive[body] or bit32.band(mask, self.group[body]) == 0 then return nil end
+  if not rayAabbInterval(origin, dir, reach, self.aabbMin[body], self.aabbMax[body]) then return nil end
+
+  local shape = self.shape[body]
+  local kind = shape.kind
+  if kind == SHAPE_MESH then return self:_rayMesh(body, origin, dir, reach) end
+  if kind == SHAPE_HEIGHTFIELD then return self:_rayHeightfield(body, origin, dir, reach) end
+  if kind == SHAPE_COMPOUND then return self:_rayCompound(body, origin, dir, reach) end
+
+  return rayPrimitiveShape(shape, self.pos[body], self.qv[body], self.qw[body], origin, dir, reach)
 end
 
-function World:_raycastRawScan(origin,dir,maxDistance,mask)
-    local bestT,bestI,bestN,bestP=maxDistance,nil,nil,nil
-    for i=1,self.high do
-        local t,n,p=self:_raycastBody(i,origin,dir,bestT,mask)
-        if t and t<bestT then bestT,bestI,bestN,bestP=t,i,n,p end
+function World:_raycastRawScan(origin, dir, maxDistance, mask)
+  local bestDistance = maxDistance
+  local bestBody, bestNormal, bestPoint
+
+  for body = 1, self.high do
+    local distance, normal, point = raycastBody(self, body, origin, dir, bestDistance, mask)
+
+    if distance and distance < bestDistance then
+      bestDistance, bestBody, bestNormal, bestPoint = distance, body, normal, point
     end
-    return bestI,bestT,bestP,bestN
+  end
+
+  return bestBody, bestDistance, bestPoint, bestNormal
 end
 
-function World:_raycastRaw(origin,direction,maxDistance,mask)
-    maxDistance=maxDistance or math.huge
-    mask=if mask==nil then 0xffffffff else mask
-    local dl2=vector.dot(direction,direction)
-    if dl2<=EPS then return nil end
-    local dir=direction/math.sqrt(dl2)
-    self:_ensureQueryGrid()
+function World:_raycastRaw(origin, direction, maxDistance, mask)
+  maxDistance = maxDistance or math.huge
+  mask = if mask == nil then 0xffffffff else mask
 
-    -- Oversized bodies (world meshes, terrain, large compounds) are normally few. Test them first;
-    -- a world hit gives the grid walk a finite early-out distance even for an unbounded ray.
-    local bestT,bestI,bestN,bestP=maxDistance,nil,nil,nil
-    local large=self.gridLarge
-    for k=1,#large do
-        local i=large[k]
-        local t,n,p=self:_raycastBody(i,origin,dir,bestT,mask)
-        if t and t<bestT then bestT,bestI,bestN,bestP=t,i,n,p end
+  local lengthSquared = vector.dot(direction, direction)
+  if lengthSquared <= EPS then return nil end
+
+  local dir = direction / math.sqrt(lengthSquared)
+  self:_ensureQueryGrid()
+
+  -- Oversized bodies (world meshes, terrain, large compounds) are normally few. Test them first;
+  -- a world hit gives the grid walk a finite early-out distance even for an unbounded ray.
+  local bestDistance = maxDistance
+  local bestBody, bestNormal, bestPoint
+
+  for _, body in self.gridLarge do
+    local distance, normal, point = raycastBody(self, body, origin, dir, bestDistance, mask)
+
+    if distance and distance < bestDistance then
+      bestDistance, bestBody, bestNormal, bestPoint = distance, body, normal, point
     end
-    if self.gridSmallCount==0 then return bestI,bestT,bestP,bestN end
+  end
 
-    -- If the ray is effectively unbounded and oversized geometry did not cap it, a DDA could walk
-    -- forever. Fall back to the linear scan in that unusual case.
-    if bestT==math.huge then
-        return self:_raycastRawScan(origin,dir,maxDistance,mask)
-    end
+  if self.gridSmallCount == 0 then return bestBody, bestDistance, bestPoint, bestNormal end
 
-    local cs=self.broadphaseCellSize
-    local estimated=(math.abs(dir.X)+math.abs(dir.Y)+math.abs(dir.Z))*bestT/cs+3
-    if estimated>self.queryRayCellLimit then
-        return self:_raycastRawScan(origin,dir,maxDistance,mask)
-    end
+  -- If the ray is effectively unbounded and oversized geometry did not cap it, a DDA could walk
+  -- forever. Fall back to the linear scan in that unusual case.
+  if bestDistance == math.huge then return self:_raycastRawScan(origin, dir, maxDistance, mask) end
 
-    self.queryMarkEpoch+=1
-    local epoch=self.queryMarkEpoch
-    local marks=self.queryMarks
-    local heads,nextIn=self.gridHeads,self.gridNext
-    local cx,cy,cz=math.floor(origin.X/cs),math.floor(origin.Y/cs),math.floor(origin.Z/cs)
-    local sx=if dir.X>EPS then 1 elseif dir.X<-EPS then -1 else 0
-    local sy=if dir.Y>EPS then 1 elseif dir.Y<-EPS then -1 else 0
-    local sz=if dir.Z>EPS then 1 elseif dir.Z<-EPS then -1 else 0
-    local inf=math.huge
-    local tdx=if sx~=0 then cs/math.abs(dir.X) else inf
-    local tdy=if sy~=0 then cs/math.abs(dir.Y) else inf
-    local tdz=if sz~=0 then cs/math.abs(dir.Z) else inf
-    local bx=if sx>0 then (cx+1)*cs else cx*cs
-    local by=if sy>0 then (cy+1)*cs else cy*cs
-    local bz=if sz>0 then (cz+1)*cs else cz*cs
-    local tx=if sx~=0 then (bx-origin.X)/dir.X else inf
-    local ty=if sy~=0 then (by-origin.Y)/dir.Y else inf
-    local tz=if sz~=0 then (bz-origin.Z)/dir.Z else inf
-    if tx<0 then tx=0 end;if ty<0 then ty=0 end;if tz<0 then tz=0 end
-    local tcell=0
-    while tcell<=bestT do
-        -- Small bodies are stored by center cell while their AABB may touch an adjacent cell.
-        -- Probe the 3x3x3 neighborhood and de-duplicate by body index.
-        for ox=-1,1 do for oy=-1,1 do for oz=-1,1 do
-            local key=packCell(cx+ox,cy+oy,cz+oz)
-            if key then
-                local i=heads[key] or 0
-                while i~=0 do
-                    if marks[i]~=epoch then
-                        marks[i]=epoch
-                        local t,n,p=self:_raycastBody(i,origin,dir,bestT,mask)
-                        if t and t<bestT then bestT,bestI,bestN,bestP=t,i,n,p end
-                    end
-                    i=nextIn[i] or 0
-                end
+  local cellSize = self.broadphaseCellSize
+  local estimated = (math.abs(dir.X) + math.abs(dir.Y) + math.abs(dir.Z)) * bestDistance / cellSize + 3
+  if estimated > self.queryRayCellLimit then return self:_raycastRawScan(origin, dir, maxDistance, mask) end
+
+  local epoch = self.queryMarkEpoch + 1
+  self.queryMarkEpoch = epoch
+
+  local {queryMarks: marks, gridHeads: heads, gridNext: nextIn, gridOccupied: occupied} = self
+  local column, row, layer = math.floor(origin.X / cellSize), math.floor(origin.Y / cellSize), math.floor(origin.Z / cellSize)
+  local stepX = if dir.X > EPS then 1 elseif dir.X < -EPS then -1 else 0
+  local stepY = if dir.Y > EPS then 1 elseif dir.Y < -EPS then -1 else 0
+  local stepZ = if dir.Z > EPS then 1 elseif dir.Z < -EPS then -1 else 0
+  local spanX = if stepX ~= 0 then cellSize / math.abs(dir.X) else math.huge
+  local spanY = if stepY ~= 0 then cellSize / math.abs(dir.Y) else math.huge
+  local spanZ = if stepZ ~= 0 then cellSize / math.abs(dir.Z) else math.huge
+  local wallX = if stepX > 0 then (column + 1) * cellSize else column * cellSize
+  local wallY = if stepY > 0 then (row + 1) * cellSize else row * cellSize
+  local wallZ = if stepZ > 0 then (layer + 1) * cellSize else layer * cellSize
+  local nextX = if stepX ~= 0 then (wallX - origin.X) / dir.X else math.huge
+  local nextY = if stepY ~= 0 then (wallY - origin.Y) / dir.Y else math.huge
+  local nextZ = if stepZ ~= 0 then (wallZ - origin.Z) / dir.Z else math.huge
+  if nextX < 0 then nextX = 0 end
+  if nextY < 0 then nextY = 0 end
+  if nextZ < 0 then nextZ = 0 end
+
+  -- How far the neighbourhood moved along each axis since it was last scanned. Three is further
+  -- than a step moves it, so the first scan leaves nothing out.
+  local movedX, movedY, movedZ = 3, 3, 3
+  local travelled = 0
+
+  while travelled <= bestDistance do
+    -- Small bodies are stored by center cell while their AABB may touch an adjacent cell, so the
+    -- 3x3x3 neighbourhood is probed. A cell that was in the neighbourhood probed before this one
+    -- holds only bodies already tested, and is left out.
+    for offsetX = -1, 1 do
+      local seenX = math.abs(offsetX + movedX) <= 1
+
+      for offsetY = -1, 1 do
+        local seenXY = seenX and math.abs(offsetY + movedY) <= 1
+        if seenXY and movedZ == 0 then continue end
+
+        for offsetZ = -1, 1 do
+          if seenXY and math.abs(offsetZ + movedZ) <= 1 then continue end
+
+          local key = packCell(column + offsetX, row + offsetY, layer + offsetZ)
+          if not key or buffer.readu8(occupied, key % GridFilterSize) == 0 then continue end
+
+          local body = heads[key] or 0
+
+          while body ~= 0 do
+            if marks[body] ~= epoch then
+              marks[body] = epoch
+              local distance, normal, point = raycastBody(self, body, origin, dir, bestDistance, mask)
+
+              if distance and distance < bestDistance then
+                bestDistance, bestBody, bestNormal, bestPoint = distance, body, normal, point
+              end
             end
-        end end end
-        local nextT=math.min(tx,ty,tz)
-        if nextT>bestT or nextT==inf then break end
-        local edge=nextT+1e-12
-        if tx<=edge then cx+=sx;tx+=tdx end
-        if ty<=edge then cy+=sy;ty+=tdy end
-        if tz<=edge then cz+=sz;tz+=tdz end
-        tcell=nextT
+
+            body = nextIn[body] or 0
+          end
+        end
+      end
     end
-    return bestI,bestT,bestP,bestN
+
+    local nextDistance = math.min(nextX, nextY, nextZ)
+    if nextDistance > bestDistance or nextDistance == math.huge then break end
+
+    local edge = nextDistance + 1e-12
+    movedX, movedY, movedZ = 0, 0, 0
+
+    if nextX <= edge then
+      column += stepX
+      nextX += spanX
+      movedX = stepX
+    end
+
+    if nextY <= edge then
+      row += stepY
+      nextY += spanY
+      movedY = stepY
+    end
+
+    if nextZ <= edge then
+      layer += stepZ
+      nextZ += spanZ
+      movedZ = stepZ
+    end
+
+    travelled = nextDistance
+  end
+
+  return bestBody, bestDistance, bestPoint, bestNormal
 end
 
-function World:_sphereCastRaw(startPos,endPos,radius,mask,ignoreHandle)
-    assert(typeof(startPos)=="vector" and typeof(endPos)=="vector" and type(radius)=="number" and radius>0,"physik.sphereCast: expected start/end vectors and radius > 0")
-    mask=if mask==nil then 0xffffffff else mask
-    local ignore=nil
-    if ignoreHandle~=nil then ignore=self:_check(ignoreHandle) end
-    local rvec=vector.create(radius,radius,radius)
-    local mn=vector.create(math.min(startPos.X,endPos.X),math.min(startPos.Y,endPos.Y),math.min(startPos.Z,endPos.Z))-rvec
-    local mx=vector.create(math.max(startPos.X,endPos.X),math.max(startPos.Y,endPos.Y),math.max(startPos.Z,endPos.Z))+rvec
-    local handles,count=self:queryAabb(mn,mx,mask,self.castCandidates)
-    self.castCandidates=handles
-    local bestT,bestN,bestI=1,nil,nil
-    for k=1,count do
-        local i=self:_check(handles[k])
-        if i==ignore then continue end
-        local target=self.shape[i]
-        local t,n
-        if target.kind==SHAPE_SPHERE then
-            t,n=sweepSphereSphere(startPos,endPos,radius,self.pos[i],target.radius)
-        elseif target.kind==SHAPE_BOX then
-            t,n=sweepSphereBox(startPos,endPos,radius,self.pos[i],self.qv[i],self.qw[i],target.halfExtents)
-        elseif target.kind==SHAPE_CAPSULE then
-            local a,b=capsuleEndpoints(self.pos[i],self.qv[i],self.qw[i],target.halfHeight)
-            t,n=sweepSphereSegment(startPos,endPos,radius+target.radius,a,b)
-        elseif target.kind==SHAPE_MESH then
-            t,n=self:_sweepSphereMesh(i,startPos,endPos,radius)
-        elseif target.kind==SHAPE_HEIGHTFIELD then
-            t,n=self:_sweepSphereHeightfield(i,startPos,endPos,radius)
-        elseif target.kind==SHAPE_COMPOUND then
-            t,n=self:_sweepSphereCompound(i,startPos,endPos,radius)
-        end
-        if t and t<bestT then bestT,bestN,bestI=t,n,i end
+function World:_sphereCastRaw(startPos, endPos, radius, mask, ignoreHandle)
+  assert(
+    typeof(startPos) == 'vector' and typeof(endPos) == 'vector' and type(radius) == 'number' and radius > 0,
+    'physik.sphereCast: expected start/end vectors and radius > 0'
+  )
+
+  mask = if mask == nil then 0xffffffff else mask
+
+  local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
+  local reach = vector.create(radius, radius, radius)
+  local low = vector.create(math.min(startPos.X, endPos.X), math.min(startPos.Y, endPos.Y), math.min(startPos.Z, endPos.Z)) - reach
+  local high = vector.create(math.max(startPos.X, endPos.X), math.max(startPos.Y, endPos.Y), math.max(startPos.Z, endPos.Z)) + reach
+  local handles, count = self:queryAabb(low, high, mask, self.castCandidates)
+  local {shape, pos, qv, qw} = self
+  local bestFraction = 1
+  local bestNormal, bestBody
+
+  self.castCandidates = handles
+
+  for index = 1, count do
+    -- A handle the query has just written is current, and its low bits are the body's slot.
+    local body = handles[index] % HANDLE_STRIDE
+    if body == ignored then continue end
+
+    local target = shape[body]
+    local kind = target.kind
+    local fraction, normal
+
+    if kind == SHAPE_SPHERE then
+      fraction, normal = sweepSphereSphere(startPos, endPos, radius, pos[body], target.radius)
+    elseif kind == SHAPE_BOX then
+      fraction, normal = sweepSphereBox(startPos, endPos, radius, pos[body], qv[body], qw[body], target.halfExtents)
+    elseif kind == SHAPE_CAPSULE then
+      local top, bottom = capsuleEndpoints(pos[body], qv[body], qw[body], target.halfHeight)
+      fraction, normal = sweepSphereSegment(startPos, endPos, radius + target.radius, top, bottom)
+    elseif kind == SHAPE_MESH then
+      fraction, normal = self:_sweepSphereMesh(body, startPos, endPos, radius)
+    elseif kind == SHAPE_HEIGHTFIELD then
+      fraction, normal = self:_sweepSphereHeightfield(body, startPos, endPos, radius)
+    elseif kind == SHAPE_COMPOUND then
+      fraction, normal = self:_sweepSphereCompound(body, startPos, endPos, radius)
     end
-    if not bestI then return nil end
-    local center=startPos+(endPos-startPos)*bestT
-    return bestI,bestT,bestN,center
+
+    if fraction and fraction < bestFraction then
+      bestFraction, bestNormal, bestBody = fraction, normal, body
+    end
+  end
+
+  if not bestBody then return nil end
+
+  return bestBody, bestFraction, bestNormal, startPos + (endPos - startPos) * bestFraction
 end
 
 function World:sphereCast(startPos,endPos,radius,mask,ignoreHandle)
@@ -3384,73 +3438,126 @@ function World:raycastBatchSoA(origins,directions,maxDistances,masks,out)
 end
 
 
-local function bodyOverlapsAabb(self,i,mn,mx)
-    local shape=self.shape[i]
-    if shape.kind==SHAPE_SPHERE then
-        local p=self.pos[i];local r=shape.radius+self.contactMargin
-        return not (p.X+r<mn.X or p.X-r>mx.X or p.Y+r<mn.Y or p.Y-r>mx.Y or p.Z+r<mn.Z or p.Z-r>mx.Z)
-    end
-    local a,b=self.aabbMin[i],self.aabbMax[i]
-    return not (b.X<mn.X or a.X>mx.X or b.Y<mn.Y or a.Y>mx.Y or b.Z<mn.Z or a.Z>mx.Z)
+--- Whether a body's bounds reach into a box: a sphere's from its centre and radius, anything
+--- else's from the box last written for it.
+local function bodyOverlapsAabb(self, body: number, low: vector, high: vector): boolean
+  local radius = self.sphereRadius[body]
+
+  if radius then
+    local centre, reach = self.pos[body], radius + self.contactMargin
+    if centre.X + reach < low.X or centre.X - reach > high.X then return false end
+    if centre.Y + reach < low.Y or centre.Y - reach > high.Y then return false end
+
+    return not (centre.Z + reach < low.Z or centre.Z - reach > high.Z)
+  end
+
+  local bodyLow, bodyHigh = self.aabbMin[body], self.aabbMax[body]
+  if bodyHigh.X < low.X or bodyLow.X > high.X then return false end
+  if bodyHigh.Y < low.Y or bodyLow.Y > high.Y then return false end
+
+  return not (bodyHigh.Z < low.Z or bodyLow.Z > high.Z)
 end
 
-function World:_queryAabbScan(mn,mx,mask,out)
-    local n=0
-    for i=1,self.high do
-        if not self.alive[i] or bit32.band(mask,self.group[i])==0 then continue end
-        if not bodyOverlapsAabb(self,i,mn,mx) then continue end
-        n+=1
-        out[n]=makeHandle(i,self.generation[i])
-    end
-    return n
+--- Writes the handle of every body that overlaps a box, each tested in turn. Returns how many.
+local function queryAabbScan(self, low: vector, high: vector, mask: number, out: { number }): number
+  local {alive, group, generation} = self
+  local count = 0
+
+  for body = 1, self.high do
+    if not alive[body] or bit32.band(mask, group[body]) == 0 then continue end
+    if not bodyOverlapsAabb(self, body, low, high) then continue end
+
+    count += 1
+    out[count] = makeHandle(body, generation[body])
+  end
+
+  return count
 end
 
-function World:queryAabb(mn,mx,mask,out)
-    assert(typeof(mn)=="vector" and typeof(mx)=="vector","physik.queryAabb: bounds must be vectors")
-    mask=if mask==nil then 0xffffffff else mask
-    out=out or {}
-    self:_ensureQueryGrid()
-    local cs=self.broadphaseCellSize
-    -- Small bodies live in their center cell, but may extend into the immediately adjacent cell.
-    local x0,y0,z0=math.floor(mn.X/cs)-1,math.floor(mn.Y/cs)-1,math.floor(mn.Z/cs)-1
-    local x1,y1,z1=math.floor(mx.X/cs)+1,math.floor(mx.Y/cs)+1,math.floor(mx.Z/cs)+1
-    local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
-    local n=0
-    if cells>self.queryAabbCellLimit then
-        n=self:_queryAabbScan(mn,mx,mask,out)
-    else
-        -- Oversized bodies are outside the grid and are normally few.
-        for k=1,#self.gridLarge do
-            local i=self.gridLarge[k]
-            if self.alive[i] and bit32.band(mask,self.group[i])~=0 then
-                if bodyOverlapsAabb(self,i,mn,mx) then
-                    n+=1;out[n]=makeHandle(i,self.generation[i])
-                end
-            end
+--- Writes the handle of every body that overlaps a box: the oversized ones, then the ones in a
+--- block of cells. Returns how many.
+local function queryAabbGrid(
+  self,
+  low: vector,
+  high: vector,
+  mask: number,
+  out: { number },
+  firstColumn: number,
+  lastColumn: number,
+  firstRow: number,
+  lastRow: number,
+  firstLayer: number,
+  lastLayer: number
+): number
+  local {alive, group, generation, gridHeads: heads, gridNext: nextIn, gridOccupied: occupied} = self
+  local count = 0
+
+  -- Oversized bodies are outside the grid and are normally few.
+  for _, body in self.gridLarge do
+    if alive[body] and bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(self, body, low, high) then
+      count += 1
+      out[count] = makeHandle(body, generation[body])
+    end
+  end
+
+  -- Where every cell of the range can be packed, a cell's key is one more than the key before it.
+  local packable = firstColumn >= -CELL_OFFSET
+    and lastColumn < CELL_OFFSET
+    and firstRow >= -CELL_OFFSET
+    and lastRow < CELL_OFFSET
+    and firstLayer >= -CELL_OFFSET
+    and lastLayer < CELL_OFFSET
+
+  for column = firstColumn, lastColumn do
+    for row = firstRow, lastRow do
+      local start = if packable then packCell(column, row, firstLayer) else nil
+
+      for layer = firstLayer, lastLayer do
+        local key = if start then start + (layer - firstLayer) else packCell(column, row, layer)
+        if not key or buffer.readu8(occupied, key % GridFilterSize) == 0 then continue end
+
+        local body = heads[key] or 0
+
+        while body ~= 0 do
+          if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(self, body, low, high) then
+            count += 1
+            out[count] = makeHandle(body, generation[body])
+          end
+
+          body = nextIn[body] or 0
         end
-        self.queryMarkEpoch+=1
-        local epoch=self.queryMarkEpoch
-        local marks,heads,nextIn=self.queryMarks,self.gridHeads,self.gridNext
-        for x=x0,x1 do for y=y0,y1 do for z=z0,z1 do
-            local key=packCell(x,y,z)
-            if key then
-                local i=heads[key] or 0
-                while i~=0 do
-                    if marks[i]~=epoch then
-                        marks[i]=epoch
-                        if bit32.band(mask,self.group[i])~=0 then
-                            if bodyOverlapsAabb(self,i,mn,mx) then
-                                n+=1;out[n]=makeHandle(i,self.generation[i])
-                            end
-                        end
-                    end
-                    i=nextIn[i] or 0
-                end
-            end
-        end end end
+      end
     end
-    for i=#out,n+1,-1 do out[i]=nil end
-    return out,n
+  end
+
+  return count
+end
+
+function World:queryAabb(low, high, mask, out)
+  assert(typeof(low) == 'vector' and typeof(high) == 'vector', 'physik.queryAabb: bounds must be vectors')
+  mask = if mask == nil then 0xffffffff else mask
+  out = out or {}
+  self:_ensureQueryGrid()
+
+  -- Small bodies live in their center cell, but may extend into the immediately adjacent cell.
+  local cellSize = self.broadphaseCellSize
+  local firstColumn, lastColumn = math.floor(low.X / cellSize) - 1, math.floor(high.X / cellSize) + 1
+  local firstRow, lastRow = math.floor(low.Y / cellSize) - 1, math.floor(high.Y / cellSize) + 1
+  local firstLayer, lastLayer = math.floor(low.Z / cellSize) - 1, math.floor(high.Z / cellSize) + 1
+  local cells = (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1)
+  local count
+
+  if cells > self.queryAabbCellLimit then
+    count = queryAabbScan(self, low, high, mask, out)
+  else
+    count = queryAabbGrid(self, low, high, mask, out, firstColumn, lastColumn, firstRow, lastRow, firstLayer, lastLayer)
+  end
+
+  for index = #out, count + 1, -1 do
+    out[index] = nil
+  end
+
+  return out, count
 end
 
 
