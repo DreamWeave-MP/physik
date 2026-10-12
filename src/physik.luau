@@ -1186,6 +1186,7 @@ function World:addBody(desc)
     local i = self:_allocSlot()
     self.bodyType[i] = kind
     self.shape[i] = shape
+    self.sphereRadius[i] = shape.kind == SHAPE_SPHERE and shape.radius
     self.pos[i] = desc.position or ZERO
     self.linVel[i] = desc.velocity or ZERO
     self.angVel[i] = desc.angularVelocity or ZERO
@@ -1708,50 +1709,75 @@ function World:_narrow(a,b)
     if ok then self:_addContact(a,b,n,p,pen) end
 end
 
-function World:_tryPair(a,b)
-    if a==b or not self.alive[a] or not self.alive[b] then return end
-    if b<a then a,b=b,a end -- stable pair orientation for persistent contact matching.
-    if self.jointNoCollide[bodyPairKey(a,b)] then return end
-    if self.bodyType[a]==BODY_STATIC and self.bodyType[b]==BODY_STATIC then return end
-    if bit32.band(self.mask[a],self.group[b])==0 or bit32.band(self.mask[b],self.group[a])==0 then return end
-    local sa,sb=self.shape[a],self.shape[b]
-    if sa.kind==SHAPE_SPHERE and sb.kind==SHAPE_SPHERE then
-        local reach=sa.radius+sb.radius+self.contactMargin*2
-        local d=self.pos[b]-self.pos[a]
-        if math.abs(d.X)>reach or math.abs(d.Y)>reach or math.abs(d.Z)>reach then return end
-    elseif sa.kind==SHAPE_SPHERE then
-        local p=self.pos[a];local r=sa.radius+self.contactMargin
-        local bmin,bmax=self.aabbMin[b],self.aabbMax[b]
-        if p.X+r<bmin.X or p.X-r>bmax.X or p.Y+r<bmin.Y or p.Y-r>bmax.Y or p.Z+r<bmin.Z or p.Z-r>bmax.Z then return end
-    elseif sb.kind==SHAPE_SPHERE then
-        local p=self.pos[b];local r=sb.radius+self.contactMargin
-        local amin,amax=self.aabbMin[a],self.aabbMax[a]
-        if p.X+r<amin.X or p.X-r>amax.X or p.Y+r<amin.Y or p.Y-r>amax.Y or p.Z+r<amin.Z or p.Z-r>amax.Z then return end
-    else
-        local amin,amax=self.aabbMin[a],self.aabbMax[a]
-        local bmin,bmax=self.aabbMin[b],self.aabbMax[b]
-        if bmin.X>amax.X or bmax.X<amin.X or bmin.Y>amax.Y or bmax.Y<amin.Y or bmin.Z>amax.Z or bmax.Z<amin.Z then return end
-    end
-    self.candidateCount+=1
-    local before=self.contactCount
-    self:_narrow(a,b)
-    if self.contactCount>before then self.manifoldCount+=1 end
+--- Offers a pair from a broadphase to the narrow phase, unless the pair is filtered out or its
+--- bounds are apart. Most pairs a broadphase offers are apart, and nothing else is read for those:
+--- a sphere is bounded by its centre and radius, anything else by its box.
+local function tryPair(self, first: number, second: number)
+  local radii, pos = self.sphereRadius, self.pos
+  local firstRadius, secondRadius = radii[first], radii[second]
+
+  if firstRadius and secondRadius then
+    local reach = firstRadius + secondRadius + self.contactMargin * 2
+    local between = pos[second] - pos[first]
+    if math.abs(between.X) > reach or math.abs(between.Y) > reach or math.abs(between.Z) > reach then return end
+  elseif firstRadius or secondRadius then
+    local sphere, other = first, second
+    if secondRadius then sphere, other = second, first end
+
+    local centre, reach = pos[sphere], (firstRadius or secondRadius) + self.contactMargin
+    local low, high = self.aabbMin[other], self.aabbMax[other]
+    if centre.X + reach < low.X or centre.X - reach > high.X then return end
+    if centre.Y + reach < low.Y or centre.Y - reach > high.Y then return end
+    if centre.Z + reach < low.Z or centre.Z - reach > high.Z then return end
+  else
+    local low, high = self.aabbMin[first], self.aabbMax[first]
+    local otherLow, otherHigh = self.aabbMin[second], self.aabbMax[second]
+    if otherLow.X > high.X or otherHigh.X < low.X then return end
+    if otherLow.Y > high.Y or otherHigh.Y < low.Y then return end
+    if otherLow.Z > high.Z or otherHigh.Z < low.Z then return end
+  end
+
+  if first == second or not self.alive[first] or not self.alive[second] then return end
+
+  -- A pair is always narrowed lower slot first, so a contact matches the one cached for it.
+  if second < first then
+    first, second = second, first
+  end
+
+  -- Every entry in the table is a joint's, so with no joint there is nothing to look up.
+  if self.jointCount > 0 and self.jointNoCollide[bodyPairKey(first, second)] then return end
+  if self.bodyType[first] == BODY_STATIC and self.bodyType[second] == BODY_STATIC then return end
+
+  local mask, group = self.mask, self.group
+  if bit32.band(mask[first], group[second]) == 0 or bit32.band(mask[second], group[first]) == 0 then return end
+
+  self.candidateCount += 1
+  local before = self.contactCount
+  self:_narrow(first, second)
+  if self.contactCount > before then self.manifoldCount += 1 end
 end
 
+World._tryPair = tryPair
+
 function World:_collideSap()
-    self:_sortOrder()
-    local order=self.order
-    for oi=1,#order do
-        local a=order[oi]
-        if not self.alive[a] then continue end
-        local amax=self.aabbMax[a]
-        for oj=oi+1,#order do
-            local b=order[oj]
-            if not self.alive[b] then continue end
-            if self.aabbMin[b].X > amax.X then break end
-            self:_tryPair(a,b)
-        end
+  self:_sortOrder()
+  local {order, alive, aabbMin, aabbMax} = self
+  local count = #order
+
+  for position = 1, count do
+    local first = order[position]
+    if not alive[first] then continue end
+
+    local reach = aabbMax[first].X
+
+    for after = position + 1, count do
+      local second = order[after]
+      if not alive[second] then continue end
+      if aabbMin[second].X > reach then break end
+
+      tryPair(self, first, second)
     end
+  end
 end
 
 function World:_rebuildGridPairs()
@@ -1877,65 +1903,81 @@ function World:_ensureQueryGrid()
 end
 
 function World:_collideGrid()
-    self:_buildGridIndex(true)
-    local heads,nextIn=self.gridHeads,self.gridNext
-    local dense=self.gridDenseKeys
-    local pairA,pairB=self.gridPairA,self.gridPairB
-    local large=self.gridLarge
+  self:_buildGridIndex(true)
+  local {gridHeads: heads, gridNext: nextIn, gridDenseKeys: dense, gridPairA: pairA, gridPairB: pairB} = self
 
-    -- Same-cell pairs only exist in cells cached as non-singleton during the most recent topology
-    -- rebuild. Their body membership is stable until a center crosses a cell boundary.
-    for di=1,self.gridDenseCount do
-        local a=heads[dense[di]] or 0
-        while a~=0 do
-            local b=nextIn[a] or 0
-            while b~=0 do self:_tryPair(a,b); b=nextIn[b] or 0 end
-            a=nextIn[a] or 0
-        end
+  -- Same-cell pairs only exist in cells cached as non-singleton during the most recent topology
+  -- rebuild. Their body membership is stable until a center crosses a cell boundary.
+  for index = 1, self.gridDenseCount do
+    local first = heads[dense[index]] or 0
+
+    while first ~= 0 do
+      local second = nextIn[first] or 0
+
+      while second ~= 0 do
+        tryPair(self, first, second)
+        second = nextIn[second] or 0
+      end
+
+      first = nextIn[first] or 0
+    end
+  end
+
+  -- Cross-cell work walks only occupied neighboring cell pairs. Empty-neighbor hash probes are
+  -- paid once per topology change rather than every simulation tick.
+  for index = 1, self.gridPairCount do
+    local first = heads[pairA[index]] or 0
+    local head = heads[pairB[index]] or 0
+
+    while first ~= 0 do
+      local second = head
+
+      while second ~= 0 do
+        tryPair(self, first, second)
+        second = nextIn[second] or 0
+      end
+
+      first = nextIn[first] or 0
+    end
+  end
+
+  -- Bodies wider than one grid cell stay out of the hash grid. Pair anything involving
+  -- them with a coherent X sweep instead of the old O(L^2) fallback. Small-small pairs
+  -- are skipped here because the grid already emitted them.
+  local {gridLarge: large, alive, gridKey} = self
+  local largeCount = #large
+  if largeCount == 0 then return end
+
+  if largeCount <= self.directLargeThreshold then
+    for index = 1, largeCount do
+      local first = large[index]
+
+      for second = 1, self.high do
+        if alive[second] and second ~= first and (gridKey[second] or second > first) then tryPair(self, first, second) end
+      end
     end
 
-    -- Cross-cell work walks only occupied neighboring cell pairs. Empty-neighbor hash probes are
-    -- paid once per topology change rather than every simulation tick.
-    for pi=1,self.gridPairCount do
-        local a=heads[pairA[pi]] or 0
-        local b2=heads[pairB[pi]] or 0
-        while a~=0 do
-            local b=b2
-            while b~=0 do self:_tryPair(a,b); b=nextIn[b] or 0 end
-            a=nextIn[a] or 0
-        end
-    end
+    return
+  end
 
-    -- Bodies wider than one grid cell stay out of the hash grid. Pair anything involving
-    -- them with a coherent X sweep instead of the old O(L^2) fallback. Small-small pairs
-    -- are skipped here because the grid already emitted them.
-    if #large>0 then
-        if #large<=self.directLargeThreshold then
-            for li=1,#large do
-                local a=large[li]
-                for b=1,self.high do
-                    if self.alive[b] and b~=a and (self.gridKey[b]~=nil or b>a) then
-                        self:_tryPair(a,b)
-                    end
-                end
-            end
-        else
-            self:_sortOrder()
-            local order=self.order
-            for oi=1,#order do
-                local a=order[oi]
-                if not self.alive[a] then continue end
-                local amaxX=self.aabbMax[a].X
-                local aLarge=self.gridKey[a]==nil
-                for oj=oi+1,#order do
-                    local b=order[oj]
-                    if not self.alive[b] then continue end
-                    if self.aabbMin[b].X>amaxX then break end
-                    if aLarge or self.gridKey[b]==nil then self:_tryPair(a,b) end
-                end
-            end
-        end
+  self:_sortOrder()
+  local {order, aabbMin, aabbMax} = self
+  local count = #order
+
+  for position = 1, count do
+    local first = order[position]
+    if not alive[first] then continue end
+
+    local reach = aabbMax[first].X
+    local firstLarge = not gridKey[first]
+
+    for after = position + 1, count do
+      local second = order[after]
+      if not alive[second] then continue end
+      if aabbMin[second].X > reach then break end
+      if firstLarge or not gridKey[second] then tryPair(self, first, second) end
     end
+  end
 end
 
 function World:_collide()
@@ -3474,6 +3516,7 @@ function M.newWorld(opts)
     w.alive={}
     w.bodyType={}
     w.shape={}
+    w.sphereRadius = {}
     w.pos={}
     w.qv={}
     w.qw={}
