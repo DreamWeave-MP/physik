@@ -210,6 +210,19 @@ end
 local VertexFields: dream_data_Kind_f32 = data.f32(12)
 local Samples: dream_data_Kind_f32 = data.f32()
 
+--- The least and the greatest of one coordinate of a mesh's packed vertices, as comparing each
+--- with the bound so far finds them: a coordinate that is not a number is in neither. The data
+--- plane's own bounds keep such a coordinate when it comes first, and only then is the column
+--- asked for again, filtered.
+local function coordinateBounds(packed: buffer, offset: number, count: number): (number, number)
+  local lowest = VertexFields:min(packed, offset, count)
+  local highest = VertexFields:max(packed, offset, count)
+  if lowest ~= lowest then lowest = VertexFields:minLt(packed, offset, count, math.huge) or math.huge end
+  if highest ~= highest then highest = VertexFields:maxGt(packed, offset, count, -math.huge) or -math.huge end
+
+  return lowest, highest
+end
+
 function M.triangleMesh(vertices, indices, opts)
   opts = opts or {}
 
@@ -261,22 +274,15 @@ function M.triangleMesh(vertices, indices, opts)
   local triangleCount = indexCount / 3
   assert(triangleCount >= 1, 'physik.triangleMesh: mesh must contain at least one triangle')
 
-  -- A coordinate that is not a number is in neither bound: it compares with nothing.
   local low = vector.create(math.huge, math.huge, math.huge)
   local high = -low
 
   if vertexCount > 0 then
-    low = vector.create(
-      VertexFields:minLt(packed, 0, vertexCount, math.huge) or math.huge,
-      VertexFields:minLt(packed, 4, vertexCount, math.huge) or math.huge,
-      VertexFields:minLt(packed, 8, vertexCount, math.huge) or math.huge
-    )
+    local lowX, highX = coordinateBounds(packed, 0, vertexCount)
+    local lowY, highY = coordinateBounds(packed, 4, vertexCount)
+    local lowZ, highZ = coordinateBounds(packed, 8, vertexCount)
 
-    high = vector.create(
-      VertexFields:maxGt(packed, 0, vertexCount, -math.huge) or -math.huge,
-      VertexFields:maxGt(packed, 4, vertexCount, -math.huge) or -math.huge,
-      VertexFields:maxGt(packed, 8, vertexCount, -math.huge) or -math.huge
-    )
+    low, high = vector.create(lowX, lowY, lowZ), vector.create(highX, highY, highZ)
   end
 
   local extent = high - low
@@ -332,9 +338,13 @@ function M.heightfield(width, depth, heights, opts)
   local origin = opts.origin or ZERO
   assert(typeof(origin) == 'vector', 'physik.heightfield: origin must be a vector')
 
-  -- A sample that is not a number is in neither bound: it compares with nothing.
-  local lowest = Samples:minLt(samples, 0, count, math.huge) or math.huge
-  local highest = Samples:maxGt(samples, 0, count, -math.huge) or -math.huge
+  -- A sample that is not a number is in neither bound: it compares with nothing. The data
+  -- plane's own bounds keep such a sample when it comes first, and only then are the samples
+  -- asked for again, filtered.
+  local lowest = Samples:min(samples, 0, count)
+  local highest = Samples:max(samples, 0, count)
+  if lowest ~= lowest then lowest = Samples:minLt(samples, 0, count, math.huge) or math.huge end
+  if highest ~= highest then highest = Samples:maxGt(samples, 0, count, -math.huge) or -math.huge end
 
   return table.freeze({
     kind = SHAPE_HEIGHTFIELD,
