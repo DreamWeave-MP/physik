@@ -912,6 +912,85 @@ suite.describe('queries', function()
     end).toThrow('physik.queryAabb: bounds must be vectors')
   end)
 
+  suite.it('finds through the grid what testing every body finds, in a crowd and where cells stop packing', function()
+    -- Half a unit to a cell ends the cells that pack 16,384 units out along an axis, so the
+    -- second crowd straddles that: some of its bodies are in cells and the rest are not.
+    for _, centre in { vector.create(0, 0, 0), vector.create(16382, 0, -16382) } do
+      local options = { gravity = vector.create(0, 0, 0), broadphaseCellSize = 0.5 }
+      local walked = physik.newWorld(options)
+
+      -- A limit of one cell sends every ray and every box to the test of each body in turn.
+      local scanned = physik.newWorld({
+        gravity = options.gravity,
+        broadphaseCellSize = options.broadphaseCellSize,
+        queryRayCellLimit = 1,
+        queryAabbCellLimit = 1,
+      })
+
+      local state = 7
+
+      local function random(low: number, high: number): number
+        state = (state * 1103515245 + 12345) % 2147483648
+
+        return low + (high - low) * state / 2147483648
+      end
+
+      local function scattered(reach: number): vector
+        return vector.create(random(-reach, reach), random(-reach, reach), random(-reach, reach))
+      end
+
+      for index = 1, 400 do
+        local kind = index % 4
+        local shape
+
+        if kind == 0 then
+          shape = physik.sphere(random(0.05, 0.24))
+        elseif kind == 1 then
+          shape = physik.box(vector.create(random(0.05, 0.16), random(0.05, 0.16), random(0.05, 0.16)))
+        elseif kind == 2 then
+          shape = physik.capsule(random(0.05, 0.12), random(0, 0.1))
+        else
+          -- One in four is too wide for a cell, and is kept beside the grid.
+          shape = physik.box(vector.create(random(0.3, 0.6), random(0.1, 0.3), random(0.1, 0.3)))
+        end
+
+        local body = { type = 'static', shape = shape, position = centre + scattered(4), userData = index }
+
+        walked:addBody(body)
+        scanned:addBody(body)
+      end
+
+      local hits, overlaps = 0, 0
+
+      for _ = 1, 300 do
+        local origin, direction, reach = centre + scattered(5), scattered(1), random(1, 12)
+        local found, wanted = walked:raycast(origin, direction, reach), scanned:raycast(origin, direction, reach)
+
+        expect(found ~= nil).toBe(wanted ~= nil)
+
+        if found and wanted then
+          hits += 1
+          expect(found.handle).toBe(wanted.handle)
+          expect(found.distance).toBe(wanted.distance)
+        end
+
+        local half = vector.create(random(0.2, 1.5), random(0.2, 1.5), random(0.2, 1.5))
+        local inCells, cellCount = walked:queryAabb(origin - half, origin + half)
+        local inTurn, turnCount = scanned:queryAabb(origin - half, origin + half)
+
+        table.sort(inCells)
+        table.sort(inTurn)
+        overlaps += cellCount
+        expect(cellCount).toBe(turnCount)
+        expect(inCells).toEqual(inTurn)
+      end
+
+      -- The rays and the boxes did find things, so agreeing on them says something.
+      expect(hits > 30).toBe(true)
+      expect(overlaps > 300).toBe(true)
+    end
+  end)
+
   suite.it('sweeps a sphere to where it first touches each kind of shape', function()
     local world = gallery()
 
