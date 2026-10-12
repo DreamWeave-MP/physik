@@ -1950,8 +1950,6 @@ local function tryPair(self, first: number, second: number)
   if self.contactCount > before then self.manifoldCount += 1 end
 end
 
-
-
 function World:_collideSap()
   self:_sortOrder()
   local {order, alive, aabbMin, aabbMax} = self
