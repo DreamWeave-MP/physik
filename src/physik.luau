@@ -44,6 +44,9 @@ local CELL_BASE2 = 4294967296
 local GRID_DX = {0, 1,1,1,1,1,1,1,1,1, 0,0,0, 0}
 local GRID_DY = {0,-1,-1,-1,0,0,0,1,1,1, 1,1,1, 0}
 local GRID_DZ = {0,-1, 0, 1,-1,0,1,-1,0,1,-1,0,1, 1}
+-- A byte for each residue of a packed cell: set while a cell with that residue is occupied, so
+-- a clear byte says a cell is empty without a lookup in the table of cells.
+local GridFilterSize = 65521
 local GRID_KEY_DELTA = {}
 for i=1,#GRID_DX do
     GRID_KEY_DELTA[i]=GRID_DX[i]*CELL_BASE2+GRID_DY[i]*CELL_BASE+GRID_DZ[i]
@@ -1780,121 +1783,176 @@ function World:_collideSap()
   end
 end
 
+--- Lists the cells holding more than one body, and every pair of occupied neighbouring cells, in
+--- the order the cells were first occupied.
 function World:_rebuildGridPairs()
-    local heads,keys,nextIn=self.gridHeads,self.gridKeys,self.gridNext
-    local dense=self.gridDenseKeys
-    local pairA,pairB=self.gridPairA,self.gridPairB
-    local denseCount,pairCount=0,0
-    for ki=1,#keys do
-        local key0=keys[ki]
-        local head=heads[key0] or 0
-        if head~=0 and (nextIn[head] or 0)~=0 then
-            denseCount+=1;dense[denseCount]=key0
-        end
-        local cx,cy,cz=self.gridKeyX[ki],self.gridKeyY[ki],self.gridKeyZ[ki]
-        local interior=cx<CELL_OFFSET-1 and cy>-CELL_OFFSET and cy<CELL_OFFSET-1 and cz>-CELL_OFFSET and cz<CELL_OFFSET-1
-        for o=2,14 do
-            local key=if interior then key0+GRID_KEY_DELTA[o] else packCell(cx+GRID_DX[o],cy+GRID_DY[o],cz+GRID_DZ[o])
-            if key and heads[key]~=nil then
-                pairCount+=1;pairA[pairCount]=key0;pairB[pairCount]=key
-            end
-        end
+  local {gridHeads: heads, gridKeys: keys, gridNext: nextIn, gridOccupied: occupied} = self
+  local {gridDenseKeys: dense, gridPairA: pairA, gridPairB: pairB} = self
+  local {gridKeyX: columns, gridKeyY: rows, gridKeyZ: layers} = self
+  local denseCount, pairCount = 0, 0
+
+  for index = 1, #keys do
+    local cell = keys[index]
+    local head = heads[cell] or 0
+
+    if head ~= 0 and (nextIn[head] or 0) ~= 0 then
+      denseCount += 1
+      dense[denseCount] = cell
     end
-    for i=#dense,denseCount+1,-1 do dense[i]=nil end
-    for i=#pairA,pairCount+1,-1 do pairA[i]=nil;pairB[i]=nil end
-    self.gridDenseCount=denseCount
-    self.gridPairCount=pairCount
+
+    local column, row, layer = columns[index], rows[index], layers[index]
+    local interior = column < CELL_OFFSET - 1
+      and row > -CELL_OFFSET
+      and row < CELL_OFFSET - 1
+      and layer > -CELL_OFFSET
+      and layer < CELL_OFFSET - 1
+
+    for neighbour = 2, 14 do
+      local key = if interior
+        then cell + GRID_KEY_DELTA[neighbour]
+        else packCell(column + GRID_DX[neighbour], row + GRID_DY[neighbour], layer + GRID_DZ[neighbour])
+
+      -- Most neighbours are empty, and the filter says so without a lookup.
+      if not key or buffer.readu8(occupied, key % GridFilterSize) == 0 or not heads[key] then continue end
+
+      pairCount += 1
+      pairA[pairCount], pairB[pairCount] = cell, key
+    end
+  end
+
+  for index = #dense, denseCount + 1, -1 do
+    dense[index] = nil
+  end
+
+  for index = #pairA, pairCount + 1, -1 do
+    pairA[index], pairB[index] = nil, nil
+  end
+
+  self.gridDenseCount = denseCount
+  self.gridPairCount = pairCount
 end
 
 function World:_buildGridIndex(refreshAabbs)
-    local heads,keys,nextIn=self.gridHeads,self.gridKeys,self.gridNext
-    local large=self.gridLarge
-    local cs=self.broadphaseCellSize
+  local {gridHeads: heads, gridKeys: keys, gridNext: nextIn, gridLarge: large, gridOccupied: occupied} = self
+  local {alive, sphereRadius: radii, pos, aabbMin, aabbMax, gridKey, gridX, gridY, gridZ} = self
+  local cellSize, margin = self.broadphaseCellSize, self.contactMargin
 
-    -- Most coherent worlds keep bodies in the same broad-phase cells for many frames. Validate
-    -- membership first; when topology is unchanged, retain bucket chains and occupied-neighbor
-    -- pairs instead of rebuilding Lua hash tables and probing thirteen empty neighbors per cell.
-    if self.gridTopologyReady and not self.gridTopologyDirty then
-        local same=true
-        for i=1,self.high do
-            if not self.alive[i] then continue end
-            local shape=self.shape[i]
-            local ex,ey,ez
-            if shape.kind==SHAPE_SPHERE then
-                local d=(shape.radius+self.contactMargin)*2
-                ex,ey,ez=d,d,d
-            else
-                if refreshAabbs then self:_updateAabb(i) end
-                local mn,mx=self.aabbMin[i],self.aabbMax[i]
-                ex,ey,ez=mx.X-mn.X,mx.Y-mn.Y,mx.Z-mn.Z
-            end
-            local old=self.gridKey[i]
-            if old~=nil then
-                if ex>cs or ey>cs or ez>cs then
-                    same=false
-                else
-                    local pos=self.pos[i]
-                    local cx,cy,cz=math.floor(pos.X/cs),math.floor(pos.Y/cs),math.floor(pos.Z/cs)
-                    if cx~=self.gridX[i] or cy~=self.gridY[i] or cz~=self.gridZ[i] then same=false end
-                end
-            elseif ex<=cs and ey<=cs and ez<=cs then
-                local pos=self.pos[i]
-                local cx,cy,cz=math.floor(pos.X/cs),math.floor(pos.Y/cs),math.floor(pos.Z/cs)
-                if packCell(cx,cy,cz)~=nil then same=false end
-            end
+  -- Most coherent worlds keep bodies in the same broad-phase cells for many frames. Validate
+  -- membership first; when topology is unchanged, retain bucket chains and occupied-neighbor
+  -- pairs instead of rebuilding Lua hash tables and probing thirteen empty neighbors per cell.
+  if self.gridTopologyReady and not self.gridTopologyDirty then
+    local same = true
+
+    for body = 1, self.high do
+      if not alive[body] then continue end
+
+      local radius = radii[body]
+      local width, height, depth
+
+      if radius then
+        width = (radius + margin) * 2
+        height, depth = width, width
+      else
+        if refreshAabbs then self:_updateAabb(body) end
+
+        local low, high = aabbMin[body], aabbMax[body]
+        width, height, depth = high.X - low.X, high.Y - low.Y, high.Z - low.Z
+      end
+
+      if gridKey[body] then
+        if width > cellSize or height > cellSize or depth > cellSize then
+          same = false
+          continue
         end
-        if same then
-            self.gridValid=true
-            return false
+
+        local centre = pos[body]
+
+        if
+          math.floor(centre.X / cellSize) ~= gridX[body]
+          or math.floor(centre.Y / cellSize) ~= gridY[body]
+          or math.floor(centre.Z / cellSize) ~= gridZ[body]
+        then
+          same = false
         end
+      elseif width <= cellSize and height <= cellSize and depth <= cellSize then
+        local centre = pos[body]
+        local column, row, layer = math.floor(centre.X / cellSize), math.floor(centre.Y / cellSize), math.floor(centre.Z / cellSize)
+        if packCell(column, row, layer) then same = false end
+      end
     end
 
-    if refreshAabbs and (not self.gridTopologyReady or self.gridTopologyDirty) then
-        for i=1,self.high do
-            if self.alive[i] and self.shape[i].kind~=SHAPE_SPHERE then self:_updateAabb(i) end
-        end
+    if same then
+      self.gridValid = true
+      return false
     end
-    for k=1,#keys do heads[keys[k]]=nil; keys[k]=nil end
-    for k=#large,1,-1 do large[k]=nil end
-    local smallCount=0
+  end
 
-    for i=1,self.high do
-        if not self.alive[i] then self.gridKey[i]=nil;continue end
-        local shape=self.shape[i]
-        local ex,ey,ez
-        if shape.kind==SHAPE_SPHERE then
-            local d=(shape.radius+self.contactMargin)*2
-            ex,ey,ez=d,d,d
-        else
-            local mn,mx=self.aabbMin[i],self.aabbMax[i]
-            ex,ey,ez=mx.X-mn.X,mx.Y-mn.Y,mx.Z-mn.Z
-        end
-        local pos=self.pos[i]
-        local cx,cy,cz=math.floor(pos.X/cs),math.floor(pos.Y/cs),math.floor(pos.Z/cs)
-        local key=if ex<=cs and ey<=cs and ez<=cs then packCell(cx,cy,cz) else nil
-        if key then
-            smallCount+=1
-            self.gridX[i],self.gridY[i],self.gridZ[i]=cx,cy,cz
-            self.gridKey[i]=key
-            local old=heads[key]
-            if old==nil then
-                local nk=#keys+1
-                keys[nk]=key; self.gridKeyX[nk]=cx; self.gridKeyY[nk]=cy; self.gridKeyZ[nk]=cz
-                old=0
-            end
-            nextIn[i]=old
-            heads[key]=i
-        else
-            self.gridKey[i]=nil
-            large[#large+1]=i
-        end
+  if refreshAabbs and (not self.gridTopologyReady or self.gridTopologyDirty) then
+    for body = 1, self.high do
+      if alive[body] and not radii[body] then self:_updateAabb(body) end
     end
-    self.gridSmallCount=smallCount
-    self.gridTopologyReady=true
-    self.gridTopologyDirty=false
-    self:_rebuildGridPairs()
-    self.gridValid=true
-    return true
+  end
+
+  -- Every head belongs to a key, so emptying both tables forgets every cell.
+  table.clear(heads)
+  table.clear(keys)
+  table.clear(large)
+  buffer.fill(occupied, 0, 0)
+
+  local {gridKeyX: columns, gridKeyY: rows, gridKeyZ: layers} = self
+  local smallCount, keyCount = 0, 0
+
+  for body = 1, self.high do
+    if not alive[body] then
+      gridKey[body] = nil
+      continue
+    end
+
+    local radius = radii[body]
+    local width, height, depth
+
+    if radius then
+      width = (radius + margin) * 2
+      height, depth = width, width
+    else
+      local low, high = aabbMin[body], aabbMax[body]
+      width, height, depth = high.X - low.X, high.Y - low.Y, high.Z - low.Z
+    end
+
+    local centre = pos[body]
+    local column, row, layer = math.floor(centre.X / cellSize), math.floor(centre.Y / cellSize), math.floor(centre.Z / cellSize)
+    local key = width <= cellSize and height <= cellSize and depth <= cellSize and packCell(column, row, layer)
+
+    if not key then
+      gridKey[body] = nil
+      table.insert(large, body)
+      continue
+    end
+
+    smallCount += 1
+    gridX[body], gridY[body], gridZ[body] = column, row, layer
+    gridKey[body] = key
+
+    local head = heads[key]
+
+    if not head then
+      keyCount += 1
+      keys[keyCount] = key
+      columns[keyCount], rows[keyCount], layers[keyCount] = column, row, layer
+      buffer.writeu8(occupied, key % GridFilterSize, 1)
+    end
+
+    nextIn[body] = head or 0
+    heads[key] = body
+  end
+
+  self.gridSmallCount = smallCount
+  self.gridTopologyReady = true
+  self.gridTopologyDirty = false
+  self:_rebuildGridPairs()
+  self.gridValid = true
+
+  return true
 end
 
 function World:_ensureQueryGrid()
@@ -3557,6 +3615,7 @@ function M.newWorld(opts)
     w.accumulator=0
     w.gridHeads={};w.gridKeys={};w.gridNext={};w.gridLarge={};w.gridX={};w.gridY={};w.gridZ={};w.gridKey={}
     w.gridKeyX={};w.gridKeyY={};w.gridKeyZ={}
+    w.gridOccupied = buffer.create(GridFilterSize)
     w.gridDenseKeys={};w.gridPairA={};w.gridPairB={};w.gridDenseCount=0;w.gridPairCount=0
     w.gridTopologyReady=false;w.gridTopologyDirty=true
     w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
