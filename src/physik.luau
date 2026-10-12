@@ -43,16 +43,21 @@ local CACHE_STRIDE = 5 -- localA, localB, normal, normalImpulse, tangentImpulse
 local CELL_BASE = 65536
 local CELL_OFFSET = 32768
 local CELL_BASE2 = 4294967296
-local GRID_DX = {0, 1,1,1,1,1,1,1,1,1, 0,0,0, 0}
-local GRID_DY = {0,-1,-1,-1,0,0,0,1,1,1, 1,1,1, 0}
-local GRID_DZ = {0,-1, 0, 1,-1,0,1,-1,0,1,-1,0,1, 1}
+-- A cell, then the thirteen of its twenty-six neighbours it is paired with: half of them, so that
+-- a pair of neighbouring cells is found from one side only. A packed cell is affine in its
+-- coordinates, so inside the packed range a neighbour's key is the cell's plus a constant.
+local GridStepX = { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }
+local GridStepY = { 0, -1, -1, -1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0 }
+local GridStepZ = { 0, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, 1 }
+
+local GridKeyStep = [
+  for stepX, stepY, stepZ in zipStrict(GridStepX, GridStepY, GridStepZ) =>
+    stepX * CELL_BASE2 + stepY * CELL_BASE + stepZ
+]
+
 -- A byte for each residue of a packed cell: set while a cell with that residue is occupied, so
 -- a clear byte says a cell is empty without a lookup in the table of cells.
 local GridFilterSize = 65521
-local GRID_KEY_DELTA = {}
-for i=1,#GRID_DX do
-    GRID_KEY_DELTA[i]=GRID_DX[i]*CELL_BASE2+GRID_DY[i]*CELL_BASE+GRID_DZ[i]
-end
 
 local function packCell(x,y,z)
     if x < -CELL_OFFSET or x >= CELL_OFFSET or y < -CELL_OFFSET or y >= CELL_OFFSET or z < -CELL_OFFSET or z >= CELL_OFFSET then
@@ -1041,16 +1046,19 @@ local function boxTriangle(bp,bqv,bqw,h,wa,wb,wc,margin)
     return true,qRotate(bqv,bqw,triN),bp+qRotate(bqv,bqw,localPoint),planePen
 end
 
-local function meshTriangle(shape,t)
-    local io=t*12
-    local ia,ib,ic=buffer.readu32(shape.indices,io),buffer.readu32(shape.indices,io+4),buffer.readu32(shape.indices,io+8)
-    return readVec3(shape.vertices,ia),readVec3(shape.vertices,ib),readVec3(shape.vertices,ic)
+--- The three corners of a mesh's triangle, in the mesh's own space.
+local function meshTriangle({indices, vertices}, triangle: number): (vector, vector, vector)
+  local offset = triangle * 12
+  local first, second, third = buffer.readu32(indices, offset), buffer.readu32(indices, offset + 4), buffer.readu32(indices, offset + 8)
+
+  return readVec3(vertices, first), readVec3(vertices, second), readVec3(vertices, third)
 end
 
-local function heightVertex(shape,x,z)
-    local h=buffer.readf32(shape.heights,(z*shape.width+x)*4)
-    local o=shape.origin
-    return vector.create(o.X+x*shape.cellSizeX,o.Y+h,o.Z+z*shape.cellSizeZ)
+--- A heightfield's sample at a column and row, as a point in the heightfield's own space.
+local function heightVertex({heights, width, origin, cellSizeX, cellSizeZ}, column: number, row: number): vector
+  local height = buffer.readf32(heights, (row * width + column) * 4)
+
+  return vector.create(origin.X + column * cellSizeX, origin.Y + height, origin.Z + row * cellSizeZ)
 end
 
 local function transformedBoundsLocal(qv,qw,p,mn,mx)
@@ -1935,8 +1943,8 @@ function World:_rebuildGridPairs()
 
     for neighbour = 2, 14 do
       local key = if interior
-        then cell + GRID_KEY_DELTA[neighbour]
-        else packCell(column + GRID_DX[neighbour], row + GRID_DY[neighbour], layer + GRID_DZ[neighbour])
+        then cell + GridKeyStep[neighbour]
+        else packCell(column + GridStepX[neighbour], row + GridStepY[neighbour], layer + GridStepZ[neighbour])
 
       -- Most neighbours are empty, and the filter says so without a lookup.
       if not key or buffer.readu8(occupied, key % GridFilterSize) == 0 or not heads[key] then continue end
@@ -3870,14 +3878,22 @@ function World:contacts()
 end
 
 function World:stats()
-    local asleep,sensorContacts=0,0
-    for i=1,self.high do if self.alive[i] and self.sleeping[i] then asleep+=1 end end
-    for c=1,self.contactCount do if self.sensor[self.ca[c]] or self.sensor[self.cb[c]] then sensorContacts+=1 end end
-    return {
-        frame=self.frame,bodies=self.aliveCount,sleeping=asleep,islands=self.islandCount,
-        candidates=self.candidateCount,contacts=self.contactCount,sensorContacts=sensorContacts,activeContacts=self.activeContactCount,manifolds=self.manifoldCount,warmStarted=self.warmStartedCount,ccdHits=self.ccdHitCount,
-        joints=self.jointCount,
-    }
+  local {alive, sleeping, sensor, ca: bodiesA, cb: bodiesB} = self
+
+  return {
+    frame = self.frame,
+    bodies = self.aliveCount,
+    sleeping = #[for body in range(1, self.high) if alive[body] and sleeping[body] => body],
+    islands = self.islandCount,
+    candidates = self.candidateCount,
+    contacts = self.contactCount,
+    sensorContacts = #[for contact in range(1, self.contactCount) if sensor[bodiesA[contact]] or sensor[bodiesB[contact]] => contact],
+    activeContacts = self.activeContactCount,
+    manifolds = self.manifoldCount,
+    warmStarted = self.warmStartedCount,
+    ccdHits = self.ccdHitCount,
+    joints = self.jointCount,
+  }
 end
 
 function M.newWorld(opts)
