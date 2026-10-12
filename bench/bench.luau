@@ -32,12 +32,15 @@ local Expected: { [string]: string } = {
   ['step: 600 spheres, capsules and boxes swept and pruned, 30 steps'] = '13181 contacts, 1286 candidates, 601 manifolds, 591 warm, 0 asleep, 142 islands, 0 swept, checksum -69309.090860039869',
   ['step: 2,000 spheres swept and pruned from scattered, 1 step'] = '150 contacts, 289 candidates, 150 manifolds, 0 warm, 0 asleep, 1853 islands, 0 swept, checksum 44388.679525341249',
   ['step: 256 compounds of three pieces, 30 steps'] = '5595 contacts, 1551 candidates, 170 manifolds, 153 warm, 0 asleep, 141 islands, 0 swept, checksum -36980.820001213622',
-  ['step: 600 spheres, capsules and boxes on a heightfield 65 by 65, 30 steps'] = '28625 contacts, 473 candidates, 445 manifolds, 827 warm, 0 asleep, 567 islands, 0 swept, checksum -57145.373609047492',
-  ['step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, 30 steps'] = '28570 contacts, 474 candidates, 438 manifolds, 812 warm, 0 asleep, 569 islands, 0 swept, checksum -58692.969448747368',
+  ['step: 600 capsules and boxes on a heightfield 65 by 65, 30 steps'] = '27647 contacts, 471 candidates, 431 manifolds, 791 warm, 0 asleep, 577 islands, 0 swept, checksum -47376.657145243109',
+  ['step: 600 capsules and boxes on a mesh of 8,192 triangles, 30 steps'] = '27582 contacts, 472 candidates, 435 manifolds, 804 warm, 0 asleep, 578 islands, 0 swept, checksum -48016.297100868112',
+  ['step: 600 spheres, capsules and boxes on a heightfield 65 by 65, swept and pruned, 30 steps'] = '28667 contacts, 472 candidates, 445 manifolds, 834 warm, 0 asleep, 567 islands, 0 swept, checksum -56460.197085937391',
+  ['step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, swept and pruned, 30 steps'] = '28595 contacts, 474 candidates, 438 manifolds, 817 warm, 0 asleep, 569 islands, 0 swept, checksum -58989.406010374587',
   ['step: 5,000 spheres drifting far apart with contact events, drained, 30 steps'] = '150000 drained, 107 contacts, 107 candidates, 40 manifolds, 25 warm, 0 asleep, 4960 islands, 0 swept, checksum 4163370.6571599795',
   ['step: 1,000 spheres asleep on the floor, 1 step'] = '1000 contacts, 1000 candidates, 1000 manifolds, 0 warm, 1000 asleep, 1000 islands, 0 swept, checksum 18256.543475389481',
   ['step: 60 chains of 8 links on distance, ball and hinge joints, 30 steps'] = '9000 contacts, 120 candidates, 120 manifolds, 0 warm, 0 asleep, 60 islands, 0 swept, checksum 33160.638126875238',
-  ['step: 200 swept spheres fired at walls, spheres, compounds and terrain, 6 steps'] = '221 contacts, 63 candidates, 21 manifolds, 0 warm, 0 asleep, 199 islands, 32 swept, checksum 1846988.4500978959',
+  ['step: 200 swept spheres fired at walls, spheres, compounds and terrain, swept and pruned, 6 steps'] = '267 stopped, 545 contacts, 53 candidates, 38 manifolds, 0 warm, 0 asleep, 200 islands, 17 swept, checksum 805801.30064624094',
+  ['step: 200 swept spheres fired at walls, spheres and compounds in the grid, 6 steps'] = '135 stopped, 359 contacts, 28 candidates, 21 manifolds, 0 warm, 0 asleep, 200 islands, 1 swept, checksum 1253572.866368195',
   ['query: 2,048 rays in a batch, as columns'] = '918 hits, checksum 67171.772320490592',
   ['query: 2,048 rays in a batch, as columns, unbounded and downward'] = '2048 hits, checksum 115321.69588919714',
   ['query: 2,048 rays in a batch, as records'] = '918 hits, checksum 28709.165104394498',
@@ -333,21 +336,37 @@ local terrainIndices: { number } = [
 local heightfield = physik.heightfield(TerrainSide, TerrainSide, terrainHeights, { origin = vector.create(-32, 0, -32) })
 local mesh = physik.triangleMesh(terrainVertices, terrainIndices)
 
-local function overTerrain(terrain: Shape, seed: number): World
-  local random = generator(seed)
-  local world = physik.newWorld({ broadphaseCellSize = 1.5 })
+local function prisms(random: Random): (index: number) -> Shape
+  return function(index: number): Shape
+    if index % 2 == 0 then return physik.capsule(random(0.15, 0.25), random(0.1, 0.3)) end
+
+    return physik.box(vector.create(random(0.2, 0.35), random(0.2, 0.35), random(0.2, 0.35)))
+  end
+end
+
+local function overTerrain(terrain: Shape, broadphase: string, shapes: (random: Random) -> (index: number) -> Shape): World
+  local random = generator(52)
+  local world = physik.newWorld({ broadphase = broadphase, broadphaseCellSize = 1.5 })
   world:addBody({ type = 'static', shape = terrain })
-  block(world, 600, 24, 1.3, random, mixed(random))
+  block(world, 600, 24, 1.3, random, shapes(random))
 
   return world
 end
 
-workload('step: 600 spheres, capsules and boxes on a heightfield 65 by 65, 30 steps', function(): string
-  return run(overTerrain(heightfield, 52), 30)
+workload('step: 600 capsules and boxes on a heightfield 65 by 65, 30 steps', function(): string
+  return run(overTerrain(heightfield, 'grid', prisms), 30)
 end)
 
-workload('step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, 30 steps', function(): string
-  return run(overTerrain(mesh, 52), 30)
+workload('step: 600 capsules and boxes on a mesh of 8,192 triangles, 30 steps', function(): string
+  return run(overTerrain(mesh, 'grid', prisms), 30)
+end)
+
+workload('step: 600 spheres, capsules and boxes on a heightfield 65 by 65, swept and pruned, 30 steps', function(): string
+  return run(overTerrain(heightfield, 'sap', mixed), 30)
+end)
+
+workload('step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, swept and pruned, 30 steps', function(): string
+  return run(overTerrain(mesh, 'sap', mixed), 30)
 end)
 
 workload('step: 5,000 spheres drifting far apart with contact events, drained, 30 steps', function(): string
@@ -440,11 +459,15 @@ workload('step: 60 chains of 8 links on distance, ball and hinge joints, 30 step
   return run(world, 30)
 end)
 
-workload('step: 200 swept spheres fired at walls, spheres, compounds and terrain, 6 steps', function(): string
+--- 200 fast spheres, each swept from where it was, fired at what a discrete step would cross.
+local function barrage(options: { [string]: string | number }, terrain: boolean): string
   local random = generator(81)
-  local world = physik.newWorld({ broadphaseCellSize = 2 })
-  world:addBody({ type = 'static', shape = heightfield, position = vector.create(0, -6, 0) })
-  world:addBody({ type = 'static', shape = mesh, position = vector.create(0, 14, 0) })
+  local world = physik.newWorld(options)
+
+  if terrain then
+    world:addBody({ type = 'static', shape = heightfield, position = vector.create(0, -6, 0) })
+    world:addBody({ type = 'static', shape = mesh, position = vector.create(0, 14, 0) })
+  end
 
   for index = 0, 59 do
     local position = vector.create(12 + index % 3, index // 3 % 5 * 2 - 4, index // 15 * 6 - 9)
@@ -468,17 +491,35 @@ workload('step: 200 swept spheres fired at walls, spheres, compounds and terrain
     end
   end
 
-  for _ = 1, 200 do
+  -- Every other one is aimed at the walls; the rest fan out to the terrain above and below.
+  for index = 1, 200 do
+    local spread = if index % 2 == 0 then 40 else 400
+
     world:addBody({
       shape = physik.sphere(0.1),
       position = vector.create(random(-10, -2), random(-4, 4), random(-9, 9)),
-      velocity = vector.create(random(200, 900), random(-400, 400), random(-60, 60)),
+      velocity = vector.create(random(200, 900), random(-spread, spread), random(-60, 60)),
       mass = 0.2,
       ccd = true,
     })
   end
 
-  return run(world, 6)
+  local contacts, stopped = 0, 0
+
+  for _ = 1, 6 do
+    contacts += world:step(1 / 60)
+    stopped += world:stats().ccdHits
+  end
+
+  return `{stopped} stopped, {outcome(world, contacts)}`
+end
+
+workload('step: 200 swept spheres fired at walls, spheres, compounds and terrain, swept and pruned, 6 steps', function(): string
+  return barrage({ broadphase = 'sap' }, true)
+end)
+
+workload('step: 200 swept spheres fired at walls, spheres and compounds in the grid, 6 steps', function(): string
+  return barrage({ broadphaseCellSize = 8 }, false)
 end)
 
 -- A crowd for the queries: 4,096 small bodies of every primitive in a block, over one floor.
