@@ -1757,7 +1757,7 @@ local function tryPair(self, first: number, second: number)
   if self.contactCount > before then self.manifoldCount += 1 end
 end
 
-World._tryPair = tryPair
+
 
 function World:_collideSap()
   self:_sortOrder()
@@ -2088,44 +2088,50 @@ function World:_buildIslands()
     self.islandCount=count
 end
 
-function World:_matchCachedContact(c,t1,t2)
-    if not self.warmStarting or self.cbias[c] > 0 then return end
-    local a,b=self.ca[c],self.cb[c]
-    local e=self.contactCache[pairKey(a,b)]
-    if e==nil or e[CACHE_EPOCH]~=self.cacheEpoch-1 or e[CACHE_GA]~=self.generation[a] or e[CACHE_GB]~=self.generation[b] then return end
-    local p=self.cp[c]
-    local la=qInvRotate(self.qv[a],self.qw[a],p-self.pos[a])
-    local lb=qInvRotate(self.qv[b],self.qw[b],p-self.pos[b])
-    self.cla[c],self.clb[c]=la,lb
-    if e[CACHE_MATCH_EPOCH]~=self.cacheEpoch then
-        e[CACHE_MATCH_EPOCH]=self.cacheEpoch
-        e[CACHE_USED_MASK]=0
+--- Seeds a contact with the impulses of the cached contact nearest its anchors, if the pair
+--- touched last step and one of its cached contacts faces the same way.
+local function matchCachedContact(self, contact: number, firstAnchor: vector, secondAnchor: vector, tangent1: vector, tangent2: vector)
+  if not self.warmStarting or self.cbias[contact] > 0 then return end
+
+  local first, second = self.ca[contact], self.cb[contact]
+  local entry = self.contactCache[pairKey(first, second)]
+  local epoch = self.cacheEpoch
+  if not entry or entry[CACHE_EPOCH] ~= epoch - 1 then return end
+  if entry[CACHE_GA] ~= self.generation[first] or entry[CACHE_GB] ~= self.generation[second] then return end
+
+  if entry[CACHE_MATCH_EPOCH] ~= epoch then
+    entry[CACHE_MATCH_EPOCH] = epoch
+    entry[CACHE_USED_MASK] = 0
+  end
+
+  local best, nearest = 0, self.manifoldMatchDistance * self.manifoldMatchDistance * 2
+  local normal = self.cn[contact]
+  local used = entry[CACHE_USED_MASK] or 0
+
+  for slot = 1, entry[CACHE_COUNT] or 0 do
+    local record = CACHE_HEADER + (slot - 1) * CACHE_STRIDE
+    if bit32.band(used, bit32.lshift(1, slot - 1)) ~= 0 or not (vector.dot(entry[record + 3], normal) > 0.85) then continue end
+
+    local firstOffset, secondOffset = firstAnchor - entry[record + 1], secondAnchor - entry[record + 2]
+    local distance = vector.dot(firstOffset, firstOffset) + vector.dot(secondOffset, secondOffset)
+
+    if distance < nearest then
+      nearest = distance
+      best = slot
     end
-    local best,bestD=0,self.manifoldMatchDistance*self.manifoldMatchDistance*2
-    local n=self.cn[c]
-    local used=e[CACHE_USED_MASK] or 0
-    local count=e[CACHE_COUNT] or 0
-    for j=1,count do
-        local bit=bit32.lshift(1,j-1)
-        local k=CACHE_HEADER+(j-1)*CACHE_STRIDE
-        if bit32.band(used,bit)==0 and vector.dot(e[k+3],n)>0.85 then
-            local da=la-e[k+1]
-            local db=lb-e[k+2]
-            local d=vector.dot(da,da)+vector.dot(db,db)
-            if d<bestD then bestD=d;best=j end
-        end
-    end
-    if best~=0 then
-        local bit=bit32.lshift(1,best-1)
-        e[CACHE_USED_MASK]=bit32.bor(used,bit)
-        local k=CACHE_HEADER+(best-1)*CACHE_STRIDE
-        local factor=self.warmStartFactor
-        self.cnormalImpulse[c]=e[k+4]*factor
-        local tangent=e[k+5]*factor
-        self.ctangentImpulse1[c]=vector.dot(tangent,t1)
-        self.ctangentImpulse2[c]=vector.dot(tangent,t2)
-        self.warmStartedCount+=1
-    end
+  end
+
+  if best == 0 then return end
+
+  local record = CACHE_HEADER + (best - 1) * CACHE_STRIDE
+  local factor = self.warmStartFactor
+  local tangent = entry[record + 5] * factor
+
+  entry[CACHE_USED_MASK] = bit32.bor(used, bit32.lshift(1, best - 1))
+  self.cnormalImpulse[contact] = entry[record + 4] * factor
+  self.ctangentImpulse1[contact] = vector.dot(tangent, tangent1)
+  self.ctangentImpulse2[contact] = vector.dot(tangent, tangent2)
+  self.warmStartedCount += 1
 end
 
 function World:_storeContactCache()
@@ -2241,71 +2247,103 @@ function World:_wakeContacts()
 end
 
 function World:_prepareContacts(dt)
-    self.warmStartedCount=0
-    local activeList=self.activeContacts
-    local activeCount=0
-    for c=1,self.contactCount do
-        local a,b=self.ca[c],self.cb[c]
-        local active=not (self.sensor[a] or self.sensor[b]) and ((self.invMass[a]>0 and not self.sleeping[a]) or (self.invMass[b]>0 and not self.sleeping[b]))
-        self.cactive[c]=active
-        if active then
-            activeCount+=1
-            activeList[activeCount]=c
-        end
-        if not active then
-            self.cnormalMass[c]=0
-            self.ctangentMass1[c]=0
-            self.ctangentMass2[c]=0
-            continue
-        end
-        local p,n=self.cp[c],self.cn[c]
-        local ra,rb=p-self.pos[a],p-self.pos[b]
-        self.cra[c],self.crb[c]=ra,rb
-        self.cla[c]=qInvRotate(self.qv[a],self.qw[a],ra)
-        self.clb[c]=qInvRotate(self.qv[b],self.qw[b],rb)
-        local da,naA=contactAxisResponse(self,a,ra,n)
-        local db,naB=contactAxisResponse(self,b,rb,n)
-        local d=da+db
-        self.cnormalMass[c]=if d>EPS then 1/d else 0
-        self.cnormalAngA[c],self.cnormalAngB[c]=naA,naB
-        local t1,t2=contactTangents(n)
-        self.ctangent1[c],self.ctangent2[c]=t1,t2
-        local d1a,t1a=contactAxisResponse(self,a,ra,t1)
-        local d1b,t1b=contactAxisResponse(self,b,rb,t1)
-        local d2a,t2a=contactAxisResponse(self,a,ra,t2)
-        local d2b,t2b=contactAxisResponse(self,b,rb,t2)
-        self.ctangentMass1[c]=if d1a+d1b>EPS then 1/(d1a+d1b) else 0
-        self.ctangentMass2[c]=if d2a+d2b>EPS then 1/(d2a+d2b) else 0
-        self.ctangentAng1A[c],self.ctangentAng1B[c]=t1a,t1b
-        self.ctangentAng2A[c],self.ctangentAng2B[c]=t2a,t2b
-        self.cfriction[c]=math.sqrt(self.friction[a]*self.friction[b])
-        self.crest[c]=math.max(self.restitution[a],self.restitution[b])
-        local biasSlop=math.max(self.penetrationSlop,self.baumgarteSlop)
-        local depth=math.max(self.cpen[c]-biasSlop,0)
-        self.cbias[c]=math.min(depth*self.baumgarte/math.max(dt,1e-5),self.maxDepenetrationVelocity)
-        self:_matchCachedContact(c,t1,t2)
+  self.warmStartedCount = 0
+  local {sensor, invMass, sleeping, pos, qv, qw, friction, restitution, linVel, angVel} = self
+  local {activeContacts: active, cactive: actives, ca: bodiesA, cb: bodiesB, cp: points, cn: normals, cpen: depths} = self
+  local {cra: firstArms, crb: secondArms, cla: firstAnchors, clb: secondAnchors} = self
+  local {cnormalMass: normalMasses, cnormalAngA: firstNormalTurns, cnormalAngB: secondNormalTurns} = self
+  local {ctangent1: tangents1, ctangent2: tangents2, ctangentMass1: tangentMasses1, ctangentMass2: tangentMasses2} = self
+  local {ctangentAng1A: firstTangentTurns1, ctangentAng1B: secondTangentTurns1} = self
+  local {ctangentAng2A: firstTangentTurns2, ctangentAng2B: secondTangentTurns2} = self
+  local {cfriction: frictions, crest: restitutions, cbias: biases} = self
+  local {cnormalImpulse: normalImpulses, ctangentImpulse1: tangentImpulses1, ctangentImpulse2: tangentImpulses2} = self
+  local {baumgarte, maxDepenetrationVelocity} = self
+  local biasSlop, pace = math.max(self.penetrationSlop, self.baumgarteSlop), math.max(dt, 1e-5)
+  local activeCount = 0
+
+  for contact = 1, self.contactCount do
+    local first, second = bodiesA[contact], bodiesB[contact]
+    local firstMoves, secondMoves = invMass[first] > 0 and not sleeping[first], invMass[second] > 0 and not sleeping[second]
+    local solved = not (sensor[first] or sensor[second]) and (firstMoves or secondMoves)
+    actives[contact] = solved
+
+    if not solved then
+      normalMasses[contact] = 0
+      tangentMasses1[contact] = 0
+      tangentMasses2[contact] = 0
+      continue
     end
-    for i=#activeList,activeCount+1,-1 do activeList[i]=nil end
-    self.activeContactCount=activeCount
-    -- Seed this frame's solve with last frame's accumulated impulses. This is done after
-    -- every contact mass is prepared, so a warm start never changes the effective mass basis.
-    for ci=1,activeCount do
-        local c=activeList[ci]
-        local ni=self.cnormalImpulse[c]
-        local ti1,ti2=self.ctangentImpulse1[c],self.ctangentImpulse2[c]
-        if ni~=0 or ti1~=0 or ti2~=0 then
-            local a,b=self.ca[c],self.cb[c]
-            local linear=self.cn[c]*ni+self.ctangent1[c]*ti1+self.ctangent2[c]*ti2
-            if self.invMass[a]>0 and not self.sleeping[a] then
-                self.linVel[a]-=linear*self.invMass[a]
-                self.angVel[a]-=self.cnormalAngA[c]*ni+self.ctangentAng1A[c]*ti1+self.ctangentAng2A[c]*ti2
-            end
-            if self.invMass[b]>0 and not self.sleeping[b] then
-                self.linVel[b]+=linear*self.invMass[b]
-                self.angVel[b]+=self.cnormalAngB[c]*ni+self.ctangentAng1B[c]*ti1+self.ctangentAng2B[c]*ti2
-            end
-        end
+
+    activeCount += 1
+    active[activeCount] = contact
+
+    local point, normal = points[contact], normals[contact]
+    local firstArm, secondArm = point - pos[first], point - pos[second]
+    local firstAnchor = qInvRotate(qv[first], qw[first], firstArm)
+    local secondAnchor = qInvRotate(qv[second], qw[second], secondArm)
+
+    firstArms[contact], secondArms[contact] = firstArm, secondArm
+    firstAnchors[contact], secondAnchors[contact] = firstAnchor, secondAnchor
+
+    local firstInverse, firstTurn = contactAxisResponse(self, first, firstArm, normal)
+    local secondInverse, secondTurn = contactAxisResponse(self, second, secondArm, normal)
+    local inverse = firstInverse + secondInverse
+
+    normalMasses[contact] = if inverse > EPS then 1 / inverse else 0
+    firstNormalTurns[contact], secondNormalTurns[contact] = firstTurn, secondTurn
+
+    local tangent1, tangent2 = contactTangents(normal)
+    tangents1[contact], tangents2[contact] = tangent1, tangent2
+
+    firstInverse, firstTurn = contactAxisResponse(self, first, firstArm, tangent1)
+    secondInverse, secondTurn = contactAxisResponse(self, second, secondArm, tangent1)
+    inverse = firstInverse + secondInverse
+    tangentMasses1[contact] = if inverse > EPS then 1 / inverse else 0
+    firstTangentTurns1[contact], secondTangentTurns1[contact] = firstTurn, secondTurn
+
+    firstInverse, firstTurn = contactAxisResponse(self, first, firstArm, tangent2)
+    secondInverse, secondTurn = contactAxisResponse(self, second, secondArm, tangent2)
+    inverse = firstInverse + secondInverse
+    tangentMasses2[contact] = if inverse > EPS then 1 / inverse else 0
+    firstTangentTurns2[contact], secondTangentTurns2[contact] = firstTurn, secondTurn
+
+    frictions[contact] = math.sqrt(friction[first] * friction[second])
+    restitutions[contact] = math.max(restitution[first], restitution[second])
+    biases[contact] = math.min(math.max(depths[contact] - biasSlop, 0) * baumgarte / pace, maxDepenetrationVelocity)
+    matchCachedContact(self, contact, firstAnchor, secondAnchor, tangent1, tangent2)
+  end
+
+  for index = #active, activeCount + 1, -1 do
+    active[index] = nil
+  end
+
+  self.activeContactCount = activeCount
+
+  -- Seed this frame's solve with last frame's accumulated impulses. This is done after
+  -- every contact mass is prepared, so a warm start never changes the effective mass basis.
+  for index = 1, activeCount do
+    local contact = active[index]
+    local normalImpulse = normalImpulses[contact]
+    local tangentImpulse1, tangentImpulse2 = tangentImpulses1[contact], tangentImpulses2[contact]
+    if normalImpulse == 0 and tangentImpulse1 == 0 and tangentImpulse2 == 0 then continue end
+
+    local first, second = bodiesA[contact], bodiesB[contact]
+    local linear = normals[contact] * normalImpulse + tangents1[contact] * tangentImpulse1 + tangents2[contact] * tangentImpulse2
+
+    if invMass[first] > 0 and not sleeping[first] then
+      linVel[first] -= linear * invMass[first]
+      angVel[first] -= firstNormalTurns[contact] * normalImpulse
+        + firstTangentTurns1[contact] * tangentImpulse1
+        + firstTangentTurns2[contact] * tangentImpulse2
     end
+
+    if invMass[second] > 0 and not sleeping[second] then
+      linVel[second] += linear * invMass[second]
+      angVel[second] += secondNormalTurns[contact] * normalImpulse
+        + secondTangentTurns1[contact] * tangentImpulse1
+        + secondTangentTurns2[contact] * tangentImpulse2
+    end
+  end
 end
 
 applyPairImpulse = function(self,a,b,ra,rb,impulse)
@@ -2322,69 +2360,87 @@ applyPairImpulse = function(self,a,b,ra,rb,impulse)
 end
 
 function World:_solveContacts(dt)
-    local iterations=self.velocityIterations
-    local active=self.activeContacts
-    for iter=1,iterations do
-        for ci=1,self.activeContactCount do
-            local c=active[ci]
-            local a,b=self.ca[c],self.cb[c]
-            if not self.alive[a] or not self.alive[b] then continue end
-            local n=self.cn[c]
-            local ra,rb=self.cra[c],self.crb[c]
-            local rv=pointVelocity(self,b,rb)-pointVelocity(self,a,ra)
-            local vn=vector.dot(rv,n)
-            local normalMass=self.cnormalMass[c]
-            if normalMass>0 then
-                local restitution=self.crest[c]
-                local bounce=if iter==1 and vn < -self.restitutionThreshold then -restitution*vn else 0
-                local target=math.max(bounce,self.cbias[c])
-                local lambda=(target-vn)*normalMass
-                local old=self.cnormalImpulse[c]
-                local now=math.max(old+lambda,0)
-                lambda=now-old
-                self.cnormalImpulse[c]=now
-                if lambda~=0 then
-                    if self.invMass[a]>0 and not self.sleeping[a] then
-                        self.linVel[a]-=n*(self.invMass[a]*lambda)
-                        self.angVel[a]-=self.cnormalAngA[c]*lambda
-                    end
-                    if self.invMass[b]>0 and not self.sleeping[b] then
-                        self.linVel[b]+=n*(self.invMass[b]*lambda)
-                        self.angVel[b]+=self.cnormalAngB[c]*lambda
-                    end
-                end
-            end
+  local {alive, sleeping, invMass, linVel, angVel, restitutionThreshold, activeContacts: active} = self
+  local {ca: bodiesA, cb: bodiesB, cn: normals, cra: firstArms, crb: secondArms} = self
+  local {cnormalMass: normalMasses, cnormalAngA: firstNormalTurns, cnormalAngB: secondNormalTurns} = self
+  local {ctangent1: tangents1, ctangent2: tangents2, ctangentMass1: tangentMasses1, ctangentMass2: tangentMasses2} = self
+  local {ctangentAng1A: firstTangentTurns1, ctangentAng1B: secondTangentTurns1} = self
+  local {ctangentAng2A: firstTangentTurns2, ctangentAng2B: secondTangentTurns2} = self
+  local {cfriction: frictions, crest: restitutions, cbias: biases} = self
+  local {cnormalImpulse: normalImpulses, ctangentImpulse1: tangentImpulses1, ctangentImpulse2: tangentImpulses2} = self
 
-            rv=pointVelocity(self,b,rb)-pointVelocity(self,a,ra)
-            local t1,t2=self.ctangent1[c],self.ctangent2[c]
-            local m1,m2=self.ctangentMass1[c],self.ctangentMass2[c]
-            if m1>0 or m2>0 then
-                local old1,old2=self.ctangentImpulse1[c],self.ctangentImpulse2[c]
-                local new1=old1-vector.dot(rv,t1)*m1
-                local new2=old2-vector.dot(rv,t2)*m2
-                local limit=self.cfriction[c]*self.cnormalImpulse[c]
-                local mag2=new1*new1+new2*new2
-                if mag2>limit*limit and mag2>EPS then
-                    local scale=limit/math.sqrt(mag2)
-                    new1,new2=new1*scale,new2*scale
-                end
-                local d1,d2=new1-old1,new2-old2
-                self.ctangentImpulse1[c],self.ctangentImpulse2[c]=new1,new2
-                if d1~=0 or d2~=0 then
-                    local linear=t1*d1+t2*d2
-                    if self.invMass[a]>0 and not self.sleeping[a] then
-                        self.linVel[a]-=linear*self.invMass[a]
-                        self.angVel[a]-=self.ctangentAng1A[c]*d1+self.ctangentAng2A[c]*d2
-                    end
-                    if self.invMass[b]>0 and not self.sleeping[b] then
-                        self.linVel[b]+=linear*self.invMass[b]
-                        self.angVel[b]+=self.ctangentAng1B[c]*d1+self.ctangentAng2B[c]*d2
-                    end
-                end
-            end
+  for iteration = 1, self.velocityIterations do
+    for index = 1, self.activeContactCount do
+      local contact = active[index]
+      local first, second = bodiesA[contact], bodiesB[contact]
+      if not alive[first] or not alive[second] then continue end
+
+      local normal = normals[contact]
+      local firstArm, secondArm = firstArms[contact], secondArms[contact]
+      local firstMoves, secondMoves = invMass[first] > 0 and not sleeping[first], invMass[second] > 0 and not sleeping[second]
+      local firstVelocity = if sleeping[first] then ZERO else linVel[first] + vector.cross(angVel[first], firstArm)
+      local secondVelocity = if sleeping[second] then ZERO else linVel[second] + vector.cross(angVel[second], secondArm)
+      local normalMass = normalMasses[contact]
+
+      if normalMass > 0 then
+        local approach = vector.dot(secondVelocity - firstVelocity, normal)
+        local bounce = if iteration == 1 and approach < -restitutionThreshold then -restitutions[contact] * approach else 0
+        local held = normalImpulses[contact]
+        local impulse = math.max(held + (math.max(bounce, biases[contact]) - approach) * normalMass, 0)
+        local change = impulse - held
+
+        normalImpulses[contact] = impulse
+
+        if change ~= 0 then
+          if firstMoves then
+            linVel[first] -= normal * (invMass[first] * change)
+            angVel[first] -= firstNormalTurns[contact] * change
+          end
+
+          if secondMoves then
+            linVel[second] += normal * (invMass[second] * change)
+            angVel[second] += secondNormalTurns[contact] * change
+          end
         end
-        self:_solveJoints(dt)
+      end
+
+      local tangentMass1, tangentMass2 = tangentMasses1[contact], tangentMasses2[contact]
+      if not (tangentMass1 > 0 or tangentMass2 > 0) then continue end
+
+      firstVelocity = if sleeping[first] then ZERO else linVel[first] + vector.cross(angVel[first], firstArm)
+      secondVelocity = if sleeping[second] then ZERO else linVel[second] + vector.cross(angVel[second], secondArm)
+
+      local slip = secondVelocity - firstVelocity
+      local tangent1, tangent2 = tangents1[contact], tangents2[contact]
+      local held1, held2 = tangentImpulses1[contact], tangentImpulses2[contact]
+      local impulse1, impulse2 = held1 - vector.dot(slip, tangent1) * tangentMass1, held2 - vector.dot(slip, tangent2) * tangentMass2
+      local limit = frictions[contact] * normalImpulses[contact]
+      local size = impulse1 * impulse1 + impulse2 * impulse2
+
+      if size > limit * limit and size > EPS then
+        local scale = limit / math.sqrt(size)
+        impulse1, impulse2 = impulse1 * scale, impulse2 * scale
+      end
+
+      local change1, change2 = impulse1 - held1, impulse2 - held2
+      tangentImpulses1[contact], tangentImpulses2[contact] = impulse1, impulse2
+      if change1 == 0 and change2 == 0 then continue end
+
+      local linear = tangent1 * change1 + tangent2 * change2
+
+      if firstMoves then
+        linVel[first] -= linear * invMass[first]
+        angVel[first] -= firstTangentTurns1[contact] * change1 + firstTangentTurns2[contact] * change2
+      end
+
+      if secondMoves then
+        linVel[second] += linear * invMass[second]
+        angVel[second] += secondTangentTurns1[contact] * change1 + secondTangentTurns2[contact] * change2
+      end
     end
+
+    self:_solveJoints(dt)
+  end
 end
 
 local function solvePointAxis(self,a,b,ra,rb,error,axis,stiffness,damping,dt)
