@@ -1783,36 +1783,71 @@ function World:_narrowGeometry(a,b)
 end
 
 
-function World:_testCompoundPrimitive(ashape,ap,aqv,aqw,bshape,bp,bqv,bqw)
-    local ok,n,p,pen=collidePrimitives(ashape,ap,aqv,aqw,bshape,bp,bqv,bqw,self.contactMargin)
-    if ok then self:_pushGeomContact(n,p,pen) end
+--- Places a compound body's pieces in the world, each one's centre and rotation, in the three
+--- lists given. Returns how many pieces there are.
+local function placePieces(self, body: number, centres: { vector }, turns: { vector }, turnWs: { number }): number
+  local centre, turn, turnW = self.pos[body], self.qv[body], self.qw[body]
+  local {positions, qv, qw, count} = self.shape[body]
+
+  for piece = 1, count do
+    turns[piece], turnWs[piece] = qMul(turn, turnW, qv[piece], qw[piece])
+    centres[piece] = centre + qRotate(turn, turnW, positions[piece])
+  end
+
+  return count
 end
 
-function World:_narrowCompound(a,b)
-    local sa,sb=self.shape[a],self.shape[b]
-    local aComp=sa.kind==SHAPE_COMPOUND
-    local bComp=sb.kind==SHAPE_COMPOUND
-    self.geomContactCount=0
-    if aComp and bComp then
-        for i=1,sa.count do
-            local aqv,aqw=qMul(self.qv[a],self.qw[a],sa.qv[i],sa.qw[i]);local ap=self.pos[a]+qRotate(self.qv[a],self.qw[a],sa.positions[i])
-            for j=1,sb.count do
-                local bqv,bqw=qMul(self.qv[b],self.qw[b],sb.qv[j],sb.qw[j]);local bp=self.pos[b]+qRotate(self.qv[b],self.qw[b],sb.positions[j])
-                self:_testCompoundPrimitive(sa.shapes[i],ap,aqv,aqw,sb.shapes[j],bp,bqv,bqw)
-            end
-        end
-    elseif aComp then
-        for i=1,sa.count do
-            local aqv,aqw=qMul(self.qv[a],self.qw[a],sa.qv[i],sa.qw[i]);local ap=self.pos[a]+qRotate(self.qv[a],self.qw[a],sa.positions[i])
-            self:_testCompoundPrimitive(sa.shapes[i],ap,aqv,aqw,sb,self.pos[b],self.qv[b],self.qw[b])
-        end
-    else
-        for j=1,sb.count do
-            local bqv,bqw=qMul(self.qv[b],self.qw[b],sb.qv[j],sb.qw[j]);local bp=self.pos[b]+qRotate(self.qv[b],self.qw[b],sb.positions[j])
-            self:_testCompoundPrimitive(sa,self.pos[a],self.qv[a],self.qw[a],sb.shapes[j],bp,bqv,bqw)
-        end
+--- Narrows a pair of which at least one is a compound: every piece of one against every piece
+--- of the other, a primitive standing as its own one piece. A side's pieces are placed once, not
+--- once for each piece they are tested against.
+function World:_narrowCompound(first, second)
+  local {shape, pos, qv, qw, contactMargin: margin} = self
+  local {firstPieceCentres: firstCentres, firstPieceTurns: firstTurns, firstPieceTurnWs: firstTurnWs} = self
+  local {secondPieceCentres: secondCentres, secondPieceTurns: secondTurns, secondPieceTurnWs: secondTurnWs} = self
+  local firstShape, secondShape = shape[first], shape[second]
+  local firstPieces, secondPieces = firstShape.shapes, secondShape.shapes
+  local firstCount, secondCount = 1, 1
+
+  if firstPieces then
+    firstCount = placePieces(self, first, firstCentres, firstTurns, firstTurnWs)
+  else
+    firstCentres[1], firstTurns[1], firstTurnWs[1] = pos[first], qv[first], qw[first]
+  end
+
+  if secondPieces then
+    secondCount = placePieces(self, second, secondCentres, secondTurns, secondTurnWs)
+  else
+    secondCentres[1], secondTurns[1], secondTurnWs[1] = pos[second], qv[second], qw[second]
+  end
+
+  self.geomContactCount = 0
+
+  for firstPiece = 1, firstCount do
+    local firstPrimitive = if firstPieces then firstPieces[firstPiece] else firstShape
+    local firstCentre, firstTurn, firstTurnW = firstCentres[firstPiece], firstTurns[firstPiece], firstTurnWs[firstPiece]
+
+    for secondPiece = 1, secondCount do
+      local touching, normal, point, depth = collidePrimitives(
+        firstPrimitive,
+        firstCentre,
+        firstTurn,
+        firstTurnW,
+        if secondPieces then secondPieces[secondPiece] else secondShape,
+        secondCentres[secondPiece],
+        secondTurns[secondPiece],
+        secondTurnWs[secondPiece],
+        margin
+      )
+
+      if touching then self:_pushGeomContact(normal, point, depth) end
     end
-    for k=1,self.geomContactCount do self:_addContact(a,b,self.geomNormal[k],self.geomPoint[k],self.geomPen[k]) end
+  end
+
+  local {geomNormal, geomPoint, geomPen} = self
+
+  for index = 1, self.geomContactCount do
+    self:_addContact(first, second, geomNormal[index], geomPoint[index], geomPen[index])
+  end
 end
 function World:_narrow(a,b)
     local sa,sb=self.shape[a],self.shape[b]
@@ -4022,6 +4057,8 @@ function M.newWorld(opts)
     w.eventA={};w.eventB={};w.eventKind={};w.eventSensor={}
     w.clipA={};w.clipB={};w.manifoldPoints={};w.manifoldDepths={}
     w.geomNormal={};w.geomPoint={};w.geomPen={};w.geomContactCount=0
+    w.firstPieceCentres, w.firstPieceTurns, w.firstPieceTurnWs = {}, {}, {}
+    w.secondPieceCentres, w.secondPieceTurns, w.secondPieceTurnWs = {}, {}, {}
     w.meshMarks={};w.meshMarkEpoch=0
     w.islandParent={};w.islandSize={};w.islandAwake={};w.islandRoots={};w.islandCanSleep={};w.islandMinTime={}
     w.joints={};w.jointNoCollide={};w.nextJoint=1;w.jointCount=0
