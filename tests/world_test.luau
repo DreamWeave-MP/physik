@@ -433,6 +433,30 @@ suite.describe('stepping', function()
       expect(world:stats().bodies).toBe(10)
       expect(world:stats().contacts).toBe(5)
     end)
+
+    suite.it(`pairs bodies that share a least X in the order they were added, by {broadphase}`, function()
+      local world = physik.newWorld({ broadphase = broadphase, gravity = vector.create(0, 0, 0), broadphaseCellSize = 2 })
+
+      -- Six columns of twelve spheres, each touching the one above; a column's spheres all
+      -- start at the same X, and the columns are added out of order, in two passes.
+      for pass = 0, 1 do
+        for index = 0, 35 do
+          local column, level = index * 5 % 6, index // 6 * 2 + pass
+
+          world:addBody({
+            shape = physik.sphere(0.5),
+            position = vector.create(column * 3, level * 0.9, 0),
+          })
+        end
+      end
+
+      expect(world:step(1 / 60)).toBe(66)
+
+      local contacts = world:contacts()
+      local order = sum[for index, contact in enumerate(contacts) => index * (contact.a % Generation * 100 + contact.b % Generation)]
+
+      expect(order).toBe(if broadphase == 'sap' then 4678762 else 5070681)
+    end)
   end
 
   suite.it('collides every pair of primitives', function()
