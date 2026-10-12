@@ -4,68 +4,68 @@ The move onto l3i 2.0, measured as an A/B with `bench/bench.luau`. The numbers i
 
 ## On l3i 2.0
 
-Measured on 2026-10-12, at the end of the run started on 2026-10-11, on an Intel(R) Core(TM) i7-10870H CPU @ 2.20GHz (16 threads), with Jess 0.1.0 on l3i 2.0.1, a verified release build, by
+Measured on 2026-10-12, at the end of the run started on 2026-10-11, on an Intel(R) Core(TM) i7-10870H CPU @ 2.20GHz (16 threads), with Jess 0.1.0 on l3i 2.0.2, a verified release build, by
 
 ```sh
 jess run --package jpk/physik --package-path jpk jpk/physik/bench/bench.luau '!gets wrong'
 ```
 
-Base is commit `472f61b`: 0.3.2 as it was, with the suite and the bench added and nothing else changed. Head is `819f278`. Same binary, four rounds inside one hold of the machine's bench lock, base first in the odd rounds and head first in the even ones; the figures are the median of the four, each of which is the bench's own median of seven batches. Every workload checks its result against what 0.3.2 computes, to the bit: the contacts every step returned, the candidates, manifolds, warm starts, sleepers and islands of the last one, and a checksum of every body's position, rotation and velocities; for a query, the hits and a checksum of what was hit and where. Base and head pass the same checks, so the table compares two ways of doing the same arithmetic in the same order.
+Base is commit `472f61b`: 0.3.2 as it was, with the suite and the bench added and nothing else changed. Head is `c975c9f`, the last change to the code. Same binary, four rounds inside one hold of the machine's bench lock, base first in the odd rounds and head first in the even ones; the figures are the middle of the four (the mean of the two in the middle), each of which is the bench's own median of seven batches. This is the second such A/B: the first, on `819f278` an hour earlier with more else running, read up to a tenth higher on the rows that moved, and 1.01 to 1.08 on the rows nothing touched. Every workload checks its result against what 0.3.2 computes, to the bit: the contacts every step returned, the candidates, manifolds, warm starts, sleepers and islands of the last one, and a checksum of every body's position, rotation and velocities; for a query, the hits and a checksum of what was hit and where. Base and head pass the same checks, so the table compares two ways of doing the same arithmetic in the same order.
 
 Microseconds per call. A call is what the name says: a world built and stepped that many times, one batch of queries, one drain, one shape built.
 
 | Workload | Base | Head | Base / head |
 | --- | ---: | ---: | ---: |
-| step: 1,000 spheres piled in the grid, 60 steps | 558,011.8 | 386,126.6 | 1.45 |
-| step: 1,000 spheres piled in the grid with contact events, 60 steps | 590,409.5 | 396,842.8 | 1.49 |
-| step: 250 boxes tumbling wider than a cell, 30 steps | 252,279.7 | 192,168.1 | 1.31 |
-| step: 250 boxes tumbling in the grid, 30 steps | 249,657.9 | 182,937.0 | 1.36 |
-| step: 600 spheres, capsules and boxes swept and pruned, 30 steps | 254,141.8 | 163,127.3 | 1.56 |
-| step: 2,000 spheres swept and pruned from scattered, 1 step | 24,010.8 | 3,730.0 | 6.44 |
-| step: 256 compounds of three pieces, 30 steps | 372,364.9 | 296,567.6 | 1.26 |
-| step: 600 capsules and boxes on a heightfield 65 by 65, 30 steps | 230,857.1 | 195,699.1 | 1.18 |
-| step: 600 capsules and boxes on a mesh of 8,192 triangles, 30 steps | 399,774.0 | 347,341.1 | 1.15 |
-| step: 600 spheres, capsules and boxes on a heightfield 65 by 65, swept and pruned, 30 steps | 222,217.3 | 177,467.3 | 1.25 |
-| step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, swept and pruned, 30 steps | 356,982.0 | 305,231.5 | 1.17 |
-| step: 5,000 spheres drifting far apart with contact events, drained, 30 steps | 117,715.4 | 90,540.9 | 1.30 |
-| step: 1,000 spheres asleep on the floor, 1 step | 1,689.4 | 1,241.2 | 1.36 |
-| step: 60 chains of 8 links on distance, ball and hinge joints, 30 steps | 208,366.5 | 175,390.4 | 1.19 |
-| step: 200 swept spheres fired at walls, spheres, compounds and terrain, swept and pruned, 6 steps | 131,362.8 | 124,125.4 | 1.06 |
-| step: 200 swept spheres fired at walls, spheres and compounds in the grid, 6 steps | 71,724.5 | 61,023.7 | 1.18 |
-| query: 2,048 rays in a batch, as columns | 58,853.1 | 39,985.3 | 1.47 |
-| query: 2,048 rays in a batch, as columns, unbounded and downward | 45,144.6 | 32,774.6 | 1.38 |
-| query: 2,048 rays in a batch, as records | 56,696.8 | 37,858.8 | 1.50 |
-| query: 512 rays one by one | 14,572.8 | 9,616.3 | 1.52 |
-| query: 1,024 sphere casts in a batch, as columns | 19,071.9 | 13,541.2 | 1.41 |
-| query: 2,048 boxes of a few cells | 28,116.1 | 17,824.2 | 1.58 |
-| query: 64 boxes of more cells than the grid is walked for | 39,415.8 | 22,473.7 | 1.75 |
-| drain: transforms of 1,001 bodies | 60.8 | 40.9 | 1.48 |
-| drain: linear state of 1,000 dynamic bodies, with user data and without handles | 74.2 | 61.6 | 1.20 |
-| drain: contacts of the pile, as columns | 94.8 | 90.1 | 1.05 |
-| drain: contacts of the pile, as records | 193.9 | 191.9 | 1.01 |
-| drain: contact events of the pile, without the ones that stay | 66.0 | 63.5 | 1.04 |
-| drain: stats of the pile | 33.6 | 19.0 | 1.77 |
-| build: a mesh of 8,192 triangles from tables | 2,835.6 | 2,702.9 | 1.05 |
-| build: a mesh of 8,192 triangles from buffers | 2,346.8 | 2,231.3 | 1.05 |
-| build: a mesh of 1,408 triangles without indices | 612.7 | 548.7 | 1.12 |
-| build: a heightfield 65 by 65 from a table | 55.8 | 39.2 | 1.42 |
-| build: a heightfield 65 by 65 from a buffer | 18.1 | 10.0 | 1.80 |
-| build: add 5,000 bodies of every primitive, then remove every other one | 9,485.2 | 8,946.3 | 1.06 |
-| sync: move the origin under 5,000 bodies, and back | 832.6 | 617.1 | 1.35 |
-| sync: apply the transforms of 5,000 bodies | 2,488.0 | 2,296.4 | 1.08 |
+| step: 1,000 spheres piled in the grid, 60 steps | 525,324.6 | 370,996.2 | 1.42 |
+| step: 1,000 spheres piled in the grid with contact events, 60 steps | 552,291.2 | 394,141.5 | 1.40 |
+| step: 250 boxes tumbling wider than a cell, 30 steps | 236,699.2 | 190,371.4 | 1.24 |
+| step: 250 boxes tumbling in the grid, 30 steps | 237,108.2 | 183,837.4 | 1.29 |
+| step: 600 spheres, capsules and boxes swept and pruned, 30 steps | 243,119.9 | 164,327.3 | 1.48 |
+| step: 2,000 spheres swept and pruned from scattered, 1 step | 23,133.3 | 3,642.5 | 6.35 |
+| step: 256 compounds of three pieces, 30 steps | 366,707.6 | 287,730.4 | 1.27 |
+| step: 600 capsules and boxes on a heightfield 65 by 65, 30 steps | 222,219.0 | 190,772.8 | 1.16 |
+| step: 600 capsules and boxes on a mesh of 8,192 triangles, 30 steps | 384,805.0 | 335,729.8 | 1.15 |
+| step: 600 spheres, capsules and boxes on a heightfield 65 by 65, swept and pruned, 30 steps | 215,458.6 | 175,702.7 | 1.23 |
+| step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, swept and pruned, 30 steps | 349,392.0 | 295,507.7 | 1.18 |
+| step: 5,000 spheres drifting far apart with contact events, drained, 30 steps | 113,293.9 | 86,923.8 | 1.30 |
+| step: 1,000 spheres asleep on the floor, 1 step | 1,634.0 | 1,174.4 | 1.39 |
+| step: 60 chains of 8 links on distance, ball and hinge joints, 30 steps | 199,899.8 | 175,957.9 | 1.14 |
+| step: 200 swept spheres fired at walls, spheres, compounds and terrain, swept and pruned, 6 steps | 125,664.9 | 120,418.2 | 1.04 |
+| step: 200 swept spheres fired at walls, spheres and compounds in the grid, 6 steps | 69,665.8 | 60,804.8 | 1.15 |
+| query: 2,048 rays in a batch, as columns | 56,227.1 | 38,679.4 | 1.45 |
+| query: 2,048 rays in a batch, as columns, unbounded and downward | 42,851.1 | 31,648.6 | 1.35 |
+| query: 2,048 rays in a batch, as records | 54,694.5 | 37,480.0 | 1.46 |
+| query: 512 rays one by one | 14,005.9 | 9,501.6 | 1.47 |
+| query: 1,024 sphere casts in a batch, as columns | 17,938.5 | 13,300.6 | 1.35 |
+| query: 2,048 boxes of a few cells | 26,992.7 | 17,772.3 | 1.52 |
+| query: 64 boxes of more cells than the grid is walked for | 37,604.3 | 22,717.2 | 1.66 |
+| drain: transforms of 1,001 bodies | 56.8 | 42.2 | 1.35 |
+| drain: linear state of 1,000 dynamic bodies, with user data and without handles | 70.4 | 62.6 | 1.12 |
+| drain: contacts of the pile, as columns | 88.6 | 89.5 | 0.99 |
+| drain: contacts of the pile, as records | 184.5 | 188.9 | 0.98 |
+| drain: contact events of the pile, without the ones that stay | 61.5 | 62.5 | 0.98 |
+| drain: stats of the pile | 31.5 | 19.2 | 1.64 |
+| build: a mesh of 8,192 triangles from tables | 2,726.3 | 2,743.3 | 0.99 |
+| build: a mesh of 8,192 triangles from buffers | 2,266.0 | 2,267.9 | 1.00 |
+| build: a mesh of 1,408 triangles without indices | 584.5 | 549.5 | 1.06 |
+| build: a heightfield 65 by 65 from a table | 54.4 | 39.2 | 1.39 |
+| build: a heightfield 65 by 65 from a buffer | 17.6 | 10.1 | 1.73 |
+| build: add 5,000 bodies of every primitive, then remove every other one | 8,695.3 | 8,806.2 | 0.99 |
+| sync: move the origin under 5,000 bodies, and back | 784.8 | 623.3 | 1.26 |
+| sync: apply the transforms of 5,000 bodies | 2,404.9 | 2,313.5 | 1.04 |
 
-**Read the floor first.** The rows nothing touched (contacts drained as columns and as records, contact events, adding and removing bodies, applying transforms) read 1.01 to 1.08 in this run, and 0.98 to 1.03 in the same A/B run half an hour earlier on the commit before the last. That is the noise: four other agents' tests were running on the machine. A row inside it is "no change": those, the swept spheres against terrain (1.06 here, 1.01 before), and the three mesh builds (1.05, 1.05 and 1.12 here; 1.00, 0.98 and 1.02 before).
+**Read the floor first.** The rows nothing touched (contacts drained as columns and as records, contact events, adding and removing bodies, applying transforms) read 0.98 to 1.04 in this run, and a row's four rounds spread up to about a tenth either side of its figure. That is the noise: other agents' tests were running on the machine. A row inside it is "no change": those, the swept spheres against terrain (1.04), and the three mesh builds (0.99, 1.00 and 1.06).
 
 **What moved, and why.** In the order the commits were made; the ratios in passing are from three-round A/Bs taken as each landed.
 
 - *Piles and sweeps, 1.09x to 1.38x at once: the pair filter (`b1e983d`).* A broadphase offers a pair, and most pairs it offers are apart: 21,000 offers a step for the 1,000 spheres, of which 3,500 go on to the narrow phase. 0.3.2 checked liveness, a joint table, body types and masks, and read both shapes, before it compared any bounds. It now compares the bounds first, from a column of sphere radii the world keeps beside its shapes, and reads nothing else for a pair that is apart. The pairs that survive are the same ones in the same order.
 - *Piles, another tenth or so (`071ce44`).* Contact preparation and the solver read forty-odd columns from the world for every contact in every iteration. They now bind each column once, with record patterns, and the cache match takes the anchors preparation has just made in place of making them again.
-- *The 5,000 drifting spheres, 1.03x to 1.18x (`34c32e9`), then to 1.3x (`ba063aa`).* A body crossing a cell rebuilds the grid's occupied-neighbour pairs: thirteen lookups a cell, nearly all of them misses. A byte for each residue of a packed cell now says a cell is empty without the lookup. The rest is the same binding of columns in the integrator, the island builder, the sleep passes, the contact cache and the drains, which is also where the transform and linear-state drains (1.48x, 1.2x), the origin shift (1.35x) and the sleeping floor (1.36x) come from.
-- *Rays, sphere casts and box queries, 1.38x to 1.75x (`52e2bb1`).* A ray walked the grid by probing all twenty-seven cells around each cell it entered, eighteen of which it had probed from the cell before. It now probes the whole neighbourhood once and after that only the cells a step brings in; a body is still tested once, at the same point in the walk, against the same best distance. Box queries pack a row's cell keys by adding one, ask the filter before a lookup, and drop a set of marks that could never fire, a body being in one cell.
-- *A sweep that starts disordered, 6.4x (`640ec2e`).* The sweep-and-prune order is insertion-sorted, which is right when motion is coherent and quadratic when 2,000 bodies have just been added. Once the sort has moved more than eight times the bodies there are, what is left is handed to `data.argsort` over a buffer of keys, filled by a buffer sink and applied by a comprehension over a typed slice of the permutation. Both sorts are stable, so they end in the same order; keys that are not numbers, which the two would place differently, keep the insertion sort.
-- *Compounds, 1.17x to 1.26x (`ba0c230`).* Two three-piece compounds are nine piece pairs, and each pair placed both its pieces in the world again. A side's pieces are now placed once.
-- *Heightfields, 1.4x from a table and 1.8x from a buffer (`c32b927`, `819f278`).* The least and greatest sample are one `min` and one `max` on a typed receiver. That took two tries: see below.
-- *`stats`, 1.77x (`99d9002`).* Two `#[...]` counts over columns bound once, where two loops read the world for every body and contact.
+- *The 5,000 drifting spheres, 1.03x to 1.18x (`34c32e9`), then to 1.3x (`ba063aa`).* A body crossing a cell rebuilds the grid's occupied-neighbour pairs: thirteen lookups a cell, nearly all of them misses. A byte for each residue of a packed cell now says a cell is empty without the lookup. The rest is the same binding of columns in the integrator, the island builder, the sleep passes, the contact cache and the drains, which is also where the transform and linear-state drains (1.35x, 1.12x), the origin shift (1.26x) and the sleeping floor (1.39x) come from.
+- *Rays, sphere casts and box queries, 1.35x to 1.66x (`52e2bb1`).* A ray walked the grid by probing all twenty-seven cells around each cell it entered, eighteen of which it had probed from the cell before. It now probes the whole neighbourhood once and after that only the cells a step brings in; a body is still tested once, at the same point in the walk, against the same best distance. Box queries pack a row's cell keys by adding one, ask the filter before a lookup, and drop a set of marks that could never fire, a body being in one cell.
+- *A sweep that starts disordered, 6.3x (`640ec2e`).* The sweep-and-prune order is insertion-sorted, which is right when motion is coherent and quadratic when 2,000 bodies have just been added. Once the sort has moved more than eight times the bodies there are, what is left is handed to `data.argsort` over a buffer of keys, filled by a buffer sink and applied by a comprehension over a typed slice of the permutation. Both sorts are stable, so they end in the same order; keys that are not numbers, which the two would place differently, keep the insertion sort.
+- *Compounds, 1.17x to 1.27x (`ba0c230`).* Two three-piece compounds are nine piece pairs, and each pair placed both its pieces in the world again. A side's pieces are now placed once.
+- *Heightfields, 1.4x from a table and 1.7x from a buffer (`c32b927`, `819f278`).* The least and greatest sample are one `min` and one `max` on a typed receiver. That took two tries: see below.
+- *`stats`, 1.64x (`99d9002`).* Two `#[...]` counts over columns bound once, where two loops read the world for every body and contact.
 
 **What the dialect and the data plane were good for here, and what they were not.** physik keeps its hot state as Luau vectors in tables, on purpose, and exposes two of those tables to trusted callers, so there is no buffer for the data plane to run over in a step, and none of the step rows above is a data-plane row. They moved because of what is done, not how it is spelled: record patterns made binding a world's columns once a line instead of a paragraph, and that is the dialect's whole share of them. Where there was a buffer, the results are mixed and worth knowing:
 
@@ -88,9 +88,9 @@ Each is fixed where the bounds are read, with a test that fails on 0.3.2. None o
 
 | Workload | Head |
 | --- | ---: |
-| step: 600 spheres, capsules and boxes on a heightfield 65 by 65, 30 steps, which 0.3.2 gets wrong | 177,894.5 |
-| step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, 30 steps, which 0.3.2 gets wrong | 296,480.4 |
-| step: 200 swept spheres fired at walls, spheres, compounds and terrain, 6 steps, which 0.3.2 gets wrong | 124,222.1 |
+| step: 600 spheres, capsules and boxes on a heightfield 65 by 65, 30 steps, which 0.3.2 gets wrong | 170,828.0 |
+| step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, 30 steps, which 0.3.2 gets wrong | 289,618.3 |
+| step: 200 swept spheres fired at walls, spheres, compounds and terrain, 6 steps, which 0.3.2 gets wrong | 120,569.3 |
 
 The swept spheres compute, under the grid, exactly what they compute swept and pruned: the same contacts and the same checksum.
 
