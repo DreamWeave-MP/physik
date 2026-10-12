@@ -276,11 +276,14 @@ suite.describe('bodies', function()
       world:addBody({ shape = {} })
     end).toThrow('physik.addBody: invalid shape')
 
-    expect(world:stats().bodies).toBe(0)
-
     expect(function()
       world:addBody({ rotation = vector.create(0, 0, 1) })
     end).toThrow('physik.addBody: rotation must come from physik.quat/axisAngle')
+
+    -- A body that is refused leaves nothing behind, and the world goes on stepping.
+    expect(world:stats().bodies).toBe(0)
+    expect(world:step(1 / 60)).toBe(0)
+    expect(world:addBody({})).toBe(Generation + 1)
   end)
 end)
 

@@ -1268,6 +1268,19 @@ function World:addBody(desc)
     assert(not ((shape.kind==SHAPE_MESH or shape.kind==SHAPE_HEIGHTFIELD) and kind==BODY_DYNAMIC), "physik.addBody: triangle meshes and heightfields must be static or kinematic")
     local mass = if kind == BODY_DYNAMIC then (desc.mass or 1) else 0
     assert(mass >= 0, "physik.addBody: mass must be >= 0")
+
+    -- Checked before a slot is taken, so a body that is refused leaves nothing behind.
+    local rotation = desc.rotation
+    local turn, turnW = ZERO, 1
+
+    if rotation ~= nil then
+        if type(rotation) ~= 'table' or typeof(rotation.v) ~= 'vector' or type(rotation.w) ~= 'number' then
+            error('physik.addBody: rotation must come from physik.quat/axisAngle', 2)
+        end
+
+        turn, turnW = qNormalize(rotation.v, rotation.w)
+    end
+
     local i = self:_allocSlot()
     self.bodyType[i] = kind
     self.shape[i] = shape
@@ -1277,14 +1290,7 @@ function World:addBody(desc)
     self.angVel[i] = desc.angularVelocity or ZERO
     self.force[i] = ZERO
     self.torque[i] = ZERO
-    local r = desc.rotation
-    if r == nil then
-        self.qv[i], self.qw[i] = ZERO, 1
-    elseif type(r) == "table" and typeof(r.v) == "vector" and type(r.w) == "number" then
-        self.qv[i], self.qw[i] = qNormalize(r.v, r.w)
-    else
-        error("physik.addBody: rotation must come from physik.quat/axisAngle", 2)
-    end
+    self.qv[i], self.qw[i] = turn, turnW
     self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.qv[i],self.qw[i])
     self.invMass[i] = if kind == BODY_DYNAMIC and mass > EPS then 1/mass else 0
     self.invInertia[i] = if kind == BODY_DYNAMIC then inertiaFor(shape,mass) else ZERO
