@@ -5,7 +5,7 @@ id = "org.dreamweave.physik"
 version = "0.3.2"
 jess_api = "1"
 include = ["src", "docs", "tests"]
-tests = ["tests/physik_test.luau"]
+tests = ["tests/physik_test.luau", "tests/world_test.luau"]
 
 [modules]
 "@dream/physik" = "src/physik.luau"
