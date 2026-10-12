@@ -1302,18 +1302,25 @@ function World:driveKinematic(handle,targetPosition,targetRotation,dt)
 end
 
 function World:shiftOrigin(delta)
-    assert(typeof(delta)=="vector","physik.shiftOrigin: delta must be a vector")
-    for i=1,self.high do
-        if self.alive[i] then
-            self.pos[i]-=delta
-            self.prevPos[i]-=delta
-            self.aabbMin[i]-=delta
-            self.aabbMax[i]-=delta
-        end
-    end
-    for c=1,self.contactCount do self.cp[c]-=delta end
-    self.gridValid=false
-    return self
+  assert(typeof(delta) == 'vector', 'physik.shiftOrigin: delta must be a vector')
+  local {alive, pos, prevPos, aabbMin, aabbMax, cp: points} = self
+
+  for body = 1, self.high do
+    if not alive[body] then continue end
+
+    pos[body] -= delta
+    prevPos[body] -= delta
+    aabbMin[body] -= delta
+    aabbMax[body] -= delta
+  end
+
+  for contact = 1, self.contactCount do
+    points[contact] -= delta
+  end
+
+  self.gridValid = false
+
+  return self
 end
 
 function World:setVelocity(handle, v)
@@ -2095,55 +2102,65 @@ local function unionBodies(parent,size,a,b)
 end
 
 function World:_buildIslands()
-    local parent,size=self.islandParent,self.islandSize
-    for i=1,self.high do
-        if self.alive[i] and self.bodyType[i]==BODY_DYNAMIC then
-            parent[i]=i
-            size[i]=1
-        else
-            parent[i]=0
-            size[i]=0
-        end
-    end
-    for c=1,self.contactCount do
-        local a,b=self.ca[c],self.cb[c]
-        if not self.sensor[a] and not self.sensor[b] and self.bodyType[a]==BODY_DYNAMIC and self.bodyType[b]==BODY_DYNAMIC then
-            unionBodies(parent,size,a,b)
-        end
-    end
-    for id=1,self.nextJoint-1 do
-        local j=self.joints[id]
-        if j then
-            local a,b=j.a,j.b
-            if self.alive[a] and self.alive[b] and self.generation[a]==j.ga and self.generation[b]==j.gb
-                and self.bodyType[a]==BODY_DYNAMIC and self.bodyType[b]==BODY_DYNAMIC then
-                unionBodies(parent,size,a,b)
-            end
-        end
+  local {islandParent: parent, islandSize: size, islandAwake: awake, islandRoots: roots} = self
+  local {alive, bodyType, sensor, sleeping, generation, joints, high, ca: bodiesA, cb: bodiesB} = self
+
+  for body = 1, high do
+    local dynamic = alive[body] and bodyType[body] == BODY_DYNAMIC
+
+    parent[body] = if dynamic then body else 0
+    size[body] = if dynamic then 1 else 0
+  end
+
+  for contact = 1, self.contactCount do
+    local first, second = bodiesA[contact], bodiesB[contact]
+    if sensor[first] or sensor[second] then continue end
+    if bodyType[first] ~= BODY_DYNAMIC or bodyType[second] ~= BODY_DYNAMIC then continue end
+
+    unionBodies(parent, size, first, second)
+  end
+
+  for id = 1, self.nextJoint - 1 do
+    local joint = joints[id]
+    if not joint then continue end
+
+    local first, second = joint.a, joint.b
+    if not alive[first] or not alive[second] then continue end
+    if generation[first] ~= joint.ga or generation[second] ~= joint.gb then continue end
+    if bodyType[first] ~= BODY_DYNAMIC or bodyType[second] ~= BODY_DYNAMIC then continue end
+
+    unionBodies(parent, size, first, second)
+  end
+
+  table.clear(roots)
+  local count = 0
+
+  for body = 1, high do
+    awake[body] = false
+  end
+
+  for body = 1, high do
+    if parent[body] == 0 then continue end
+
+    local root = unionRoot(parent, body)
+    parent[body] = root
+
+    if root == body then
+      count += 1
+      roots[count] = root
     end
 
-    local awake=self.islandAwake
-    local roots=self.islandRoots
-    for k=#roots,1,-1 do roots[k]=nil end
-    for i=1,self.high do awake[i]=false end
-    local count=0
-    for i=1,self.high do
-        if parent[i]~=0 then
-            local r=unionRoot(parent,i)
-            parent[i]=r
-            if r==i then count+=1; roots[count]=r end
-            if not self.sleeping[i] then awake[r]=true end
-        end
-    end
-    -- Wake is an island property: an explicit impulse or meaningful impact on one member
-    -- wakes every dynamically-connected member before solving.
-    for i=1,self.high do
-        local r=parent[i]
-        if r~=0 and awake[r] then
-            self.sleeping[i]=false
-        end
-    end
-    self.islandCount=count
+    if not sleeping[body] then awake[root] = true end
+  end
+
+  -- Wake is an island property: an explicit impulse or meaningful impact on one member
+  -- wakes every dynamically-connected member before solving.
+  for body = 1, high do
+    local root = parent[body]
+    if root ~= 0 and awake[root] then sleeping[body] = false end
+  end
+
+  self.islandCount = count
 end
 
 --- Seeds a contact with the impulses of the cached contact nearest its anchors, if the pair
@@ -2193,42 +2210,50 @@ local function matchCachedContact(self, contact: number, firstAnchor: vector, se
 end
 
 function World:_storeContactCache()
-    local epoch=self.cacheEpoch
-    local active=self.activeContacts
-    for ci=1,self.activeContactCount do
-        local c=active[ci]
-        local a,b=self.ca[c],self.cb[c]
-        local key=pairKey(a,b)
-        local e=self.contactCache[key]
-        if e==nil then
-            e=table.create(CACHE_HEADER+4*CACHE_STRIDE)
-            e[CACHE_COUNT]=0;e[CACHE_EPOCH]=0;e[CACHE_GA]=0;e[CACHE_GB]=0;e[CACHE_MATCH_EPOCH]=0;e[CACHE_USED_MASK]=0
-            self.contactCache[key]=e
-        end
-        if e[CACHE_EPOCH]~=epoch then
-            e[CACHE_EPOCH]=epoch
-            e[CACHE_COUNT]=0
-            e[CACHE_GA]=self.generation[a]
-            e[CACHE_GB]=self.generation[b]
-        end
-        local count=e[CACHE_COUNT]
-        if count<4 then
-            local j=count+1
-            e[CACHE_COUNT]=j
-            local k=CACHE_HEADER+(j-1)*CACHE_STRIDE
-            local p=self.cp[c]
-            e[k+1]=self.cla[c] or qInvRotate(self.qv[a],self.qw[a],p-self.pos[a])
-            e[k+2]=self.clb[c] or qInvRotate(self.qv[b],self.qw[b],p-self.pos[b])
-            e[k+3]=self.cn[c]
-            e[k+4]=self.cnormalImpulse[c]
-            e[k+5]=self.ctangent1[c]*self.ctangentImpulse1[c]+self.ctangent2[c]*self.ctangentImpulse2[c]
-        end
+  local {contactCache: cache, activeContacts: active, cacheEpoch: epoch, generation, pos, qv, qw} = self
+  local {ca: bodiesA, cb: bodiesB, cp: points, cn: normals, cla: firstAnchors, clb: secondAnchors} = self
+  local {ctangent1: tangents1, ctangent2: tangents2} = self
+  local {cnormalImpulse: normalImpulses, ctangentImpulse1: tangentImpulses1, ctangentImpulse2: tangentImpulses2} = self
+
+  for index = 1, self.activeContactCount do
+    local contact = active[index]
+    local first, second = bodiesA[contact], bodiesB[contact]
+    local key = pairKey(first, second)
+    local entry = cache[key]
+
+    if not entry then
+      entry = table.create(CACHE_HEADER + 4 * CACHE_STRIDE)
+      entry[CACHE_COUNT], entry[CACHE_EPOCH], entry[CACHE_GA] = 0, 0, 0
+      entry[CACHE_GB], entry[CACHE_MATCH_EPOCH], entry[CACHE_USED_MASK] = 0, 0, 0
+      cache[key] = entry
     end
-    if epoch%64==0 then
-        for key,e in self.contactCache do
-            if epoch-e[CACHE_EPOCH]>2 then self.contactCache[key]=nil end
-        end
+
+    if entry[CACHE_EPOCH] ~= epoch then
+      entry[CACHE_EPOCH] = epoch
+      entry[CACHE_COUNT] = 0
+      entry[CACHE_GA] = generation[first]
+      entry[CACHE_GB] = generation[second]
     end
+
+    local count = entry[CACHE_COUNT]
+    if count >= 4 then continue end
+
+    local record = CACHE_HEADER + count * CACHE_STRIDE
+    local point = points[contact]
+
+    entry[CACHE_COUNT] = count + 1
+    entry[record + 1] = firstAnchors[contact] or qInvRotate(qv[first], qw[first], point - pos[first])
+    entry[record + 2] = secondAnchors[contact] or qInvRotate(qv[second], qw[second], point - pos[second])
+    entry[record + 3] = normals[contact]
+    entry[record + 4] = normalImpulses[contact]
+    entry[record + 5] = tangents1[contact] * tangentImpulses1[contact] + tangents2[contact] * tangentImpulses2[contact]
+  end
+
+  if epoch % 64 ~= 0 then return end
+
+  for key, entry in cache do
+    if epoch - entry[CACHE_EPOCH] > 2 then cache[key] = nil end
+  end
 end
 
 local function contactTangents(n)
@@ -2242,66 +2267,76 @@ local function contactTangents(n)
 end
 
 function World:_buildContactEvents()
-    self.contactEventEpoch+=1
-    local epoch=self.contactEventEpoch
-    local seen=self.contactPairSeen
-    local active=self.contactPairActive
-    local pairA,pairB,pairSensor=self.contactPairA,self.contactPairB,self.contactPairSensor
-    local prev,nextKeys=self.contactPairPrev,self.contactPairNext
-    for k=#nextKeys,1,-1 do nextKeys[k]=nil end
-    local eventCount=0
-    for c=1,self.contactCount do
-        local a,b=self.ca[c],self.cb[c]
-        local key=bodyPairKey(a,b)
-        if seen[key]~=epoch then
-            seen[key]=epoch
-            nextKeys[#nextKeys+1]=key
-            pairA[key],pairB[key]=a,b
-            local sensor=self.sensor[a] or self.sensor[b]
-            pairSensor[key]=sensor
-            eventCount+=1
-            self.eventA[eventCount],self.eventB[eventCount]=a,b
-            self.eventKind[eventCount]=if active[key] then EVENT_STAY else EVENT_ENTER
-            self.eventSensor[eventCount]=sensor
-            active[key]=true
-        end
+  local epoch = self.contactEventEpoch + 1
+  self.contactEventEpoch = epoch
+
+  local {contactPairSeen: seen, contactPairActive: touching, contactPairPrev: previous, contactPairNext: current} = self
+  local {contactPairA: pairA, contactPairB: pairB, contactPairSensor: pairSensor} = self
+  local {sensor, eventA, eventB, eventKind, eventSensor, ca: bodiesA, cb: bodiesB} = self
+  local eventCount = 0
+
+  table.clear(current)
+
+  for contact = 1, self.contactCount do
+    local first, second = bodiesA[contact], bodiesB[contact]
+    local key = bodyPairKey(first, second)
+    if seen[key] == epoch then continue end
+
+    local sensed = sensor[first] or sensor[second]
+
+    -- Every pair first seen this step is an event, so the events so far count the pairs too.
+    seen[key] = epoch
+    eventCount += 1
+    current[eventCount] = key
+    pairA[key], pairB[key], pairSensor[key] = first, second, sensed
+    eventA[eventCount], eventB[eventCount], eventSensor[eventCount] = first, second, sensed
+    eventKind[eventCount] = if touching[key] then EVENT_STAY else EVENT_ENTER
+    touching[key] = true
+  end
+
+  for index = 1, #previous do
+    local key = previous[index]
+    previous[index] = nil
+    if seen[key] == epoch or not touching[key] then continue end
+
+    local first, second = pairA[key], pairB[key]
+
+    if first and second then
+      eventCount += 1
+      eventA[eventCount], eventB[eventCount] = first, second
+      eventKind[eventCount] = EVENT_EXIT
+      eventSensor[eventCount] = pairSensor[key] == true
     end
-    for k=1,#prev do
-        local key=prev[k]
-        if seen[key]~=epoch and active[key] then
-            local a,b=pairA[key],pairB[key]
-            if a and b then
-                eventCount+=1
-                self.eventA[eventCount],self.eventB[eventCount]=a,b
-                self.eventKind[eventCount]=EVENT_EXIT
-                self.eventSensor[eventCount]=pairSensor[key]==true
-            end
-            active[key]=nil;pairA[key]=nil;pairB[key]=nil;pairSensor[key]=nil
-        end
-        prev[k]=nil
-    end
-    self.contactPairPrev,self.contactPairNext=nextKeys,prev
-    self.contactEventCount=eventCount
+
+    touching[key], pairA[key], pairB[key], pairSensor[key] = nil, nil, nil, nil
+  end
+
+  self.contactPairPrev, self.contactPairNext = current, previous
+  self.contactEventCount = eventCount
 end
 
 function World:_wakeContacts()
-    local speed2=self.wakeSpeed*self.wakeSpeed
-    local wakePen=self.wakePenetration
-    for c=1,self.contactCount do
-        local a,b=self.ca[c],self.cb[c]
-        if self.sensor[a] or self.sensor[b] then continue end
-        local sa,sb=self.sleeping[a],self.sleeping[b]
-        if sa==sb then continue end
-        local sleeper=if sa then a else b
-        local mover=if sa then b else a
-        if self.bodyType[sleeper]~=BODY_DYNAMIC then continue end
-        local v=self.linVel[mover]
-        local av=self.angVel[mover]
-        if vector.dot(v,v)>speed2 or vector.dot(av,av)>speed2 or self.cpen[c]>wakePen then
-            self.sleeping[sleeper]=false
-            self.sleepTime[sleeper]=0
-        end
+  local {sensor, sleeping, bodyType, linVel, angVel, sleepTime, ca: bodiesA, cb: bodiesB, cpen: depths} = self
+  local speed, depth = self.wakeSpeed * self.wakeSpeed, self.wakePenetration
+
+  for contact = 1, self.contactCount do
+    local first, second = bodiesA[contact], bodiesB[contact]
+    if sensor[first] or sensor[second] then continue end
+
+    local firstAsleep = sleeping[first]
+    if firstAsleep == sleeping[second] then continue end
+
+    local sleeper, mover = second, first
+    if firstAsleep then sleeper, mover = first, second end
+    if bodyType[sleeper] ~= BODY_DYNAMIC then continue end
+
+    local velocity, spin = linVel[mover], angVel[mover]
+
+    if vector.dot(velocity, velocity) > speed or vector.dot(spin, spin) > speed or depths[contact] > depth then
+      sleeping[sleeper] = false
+      sleepTime[sleeper] = 0
     end
+  end
 end
 
 function World:_prepareContacts(dt)
@@ -2592,54 +2627,66 @@ function World:_solveJoints(dt)
 end
 
 function World:_correctPositions()
-    local slop=self.penetrationSlop
-    local iterations=self.positionIterations
-    local percent=self.positionCorrection/iterations
-    local active=self.activeContacts
-    for _=1,iterations do
-        for ci=1,self.activeContactCount do
-            local c=active[ci]
-            local a,b=self.ca[c],self.cb[c]
-            local imA=if self.sleeping[a] then 0 else self.invMass[a]
-            local imB=if self.sleeping[b] then 0 else self.invMass[b]
-            local sum=imA+imB
-            if sum<=EPS then continue end
-            local depth=math.max(self.cpen[c]-slop,0)
-            if depth<=0 then continue end
-            local correction=self.cn[c]*(depth*percent/sum)
-            if imA>0 then self.pos[a]-=correction*imA end
-            if imB>0 then self.pos[b]+=correction*imB end
-        end
+  local {sleeping, invMass, pos, positionIterations: iterations, penetrationSlop: slop, activeContacts: active} = self
+  local {ca: bodiesA, cb: bodiesB, cn: normals, cpen: depths} = self
+  local percent = self.positionCorrection / iterations
+
+  for _ = 1, iterations do
+    for index = 1, self.activeContactCount do
+      local contact = active[index]
+      local first, second = bodiesA[contact], bodiesB[contact]
+      local firstInverse = if sleeping[first] then 0 else invMass[first]
+      local secondInverse = if sleeping[second] then 0 else invMass[second]
+      local inverse = firstInverse + secondInverse
+      if inverse <= EPS then continue end
+
+      local depth = math.max(depths[contact] - slop, 0)
+      if depth <= 0 then continue end
+
+      local correction = normals[contact] * (depth * percent / inverse)
+      if firstInverse > 0 then pos[first] -= correction * firstInverse end
+      if secondInverse > 0 then pos[second] += correction * secondInverse end
     end
+  end
 end
 
 function World:_integrate(dt)
-    local g=self.gravity
-    for i=1,self.high do
-        if not self.alive[i] then continue end
-        local typ=self.bodyType[i]
-        if typ==BODY_DYNAMIC then
-            if self.sleeping[i] then
-                self.force[i],self.torque[i]=ZERO,ZERO
-                continue
-            end
-            local im=self.invMass[i]
-            if self.ccd[i] then self.prevPos[i]=self.pos[i] end
-            self.linVel[i]+=(g+self.force[i]*im)*dt
-            local tq=self.torque[i]
-            if vector.dot(tq,tq)>EPS then self.angVel[i]+=applyInvInertia(self,i,tq)*dt end
-            self.linVel[i]*=1/(1+self.linearDamping[i]*dt)
-            self.angVel[i]*=1/(1+self.angularDamping[i]*dt)
-            self.pos[i]+=self.linVel[i]*dt
-            local av=self.angVel[i]
-            if vector.dot(av,av)>EPS then self.qv[i],self.qw[i]=qIntegrate(self.qv[i],self.qw[i],av,dt) end
-            self.force[i],self.torque[i]=ZERO,ZERO
-        elseif typ==BODY_KINEMATIC then
-            self.pos[i]+=self.linVel[i]*dt
-            local av=self.angVel[i]
-            if vector.dot(av,av)>EPS then self.qv[i],self.qw[i]=qIntegrate(self.qv[i],self.qw[i],av,dt) end
-        end
+  local {alive, bodyType, sleeping, invMass, ccd, pos, prevPos, linVel, angVel, force, torque, qv, qw} = self
+  local {gravity, linearDamping, angularDamping} = self
+
+  for body = 1, self.high do
+    if not alive[body] then continue end
+
+    local kind = bodyType[body]
+
+    if kind == BODY_KINEMATIC then
+      local spin = angVel[body]
+
+      pos[body] += linVel[body] * dt
+      if vector.dot(spin, spin) > EPS then qv[body], qw[body] = qIntegrate(qv[body], qw[body], spin, dt) end
     end
+
+    if kind ~= BODY_DYNAMIC then continue end
+
+    if sleeping[body] then
+      force[body], torque[body] = ZERO, ZERO
+      continue
+    end
+
+    if ccd[body] then prevPos[body] = pos[body] end
+
+    local velocity = (linVel[body] + (gravity + force[body] * invMass[body]) * dt) * (1 / (1 + linearDamping[body] * dt))
+    local twist = torque[body]
+    if vector.dot(twist, twist) > EPS then angVel[body] += applyInvInertia(self, body, twist) * dt end
+
+    local spin = angVel[body] * (1 / (1 + angularDamping[body] * dt))
+
+    linVel[body], angVel[body] = velocity, spin
+    pos[body] += velocity * dt
+    if vector.dot(spin, spin) > EPS then qv[body], qw[body] = qIntegrate(qv[body], qw[body], spin, dt) end
+
+    force[body], torque[body] = ZERO, ZERO
+  end
 end
 
 
@@ -2792,66 +2839,80 @@ end
 
 
 function World:_sleepIndependent(dt)
-    if not self.allowSleep then return end
-    local lin2=self.sleepLinear*self.sleepLinear
-    local ang2=self.sleepAngular*self.sleepAngular
-    local count=0
-    for i=1,self.high do
-        if not self.alive[i] or self.bodyType[i]~=BODY_DYNAMIC then continue end
-        count+=1
-        if self.sleeping[i] then continue end
-        if vector.dot(self.linVel[i],self.linVel[i])>=lin2 or vector.dot(self.angVel[i],self.angVel[i])>=ang2 then
-            self.sleepTime[i]=0
-        else
-            local t=self.sleepTime[i]+dt
-            self.sleepTime[i]=t
-            if t>=self.sleepDelay then
-                self.sleeping[i]=true
-                self.linVel[i],self.angVel[i]=ZERO,ZERO
-            end
-        end
+  if not self.allowSleep then return end
+
+  local {alive, bodyType, sleeping, linVel, angVel, sleepTime, sleepDelay} = self
+  local linear, angular = self.sleepLinear * self.sleepLinear, self.sleepAngular * self.sleepAngular
+  local count = 0
+
+  for body = 1, self.high do
+    if not alive[body] or bodyType[body] ~= BODY_DYNAMIC then continue end
+
+    count += 1
+    if sleeping[body] then continue end
+
+    local velocity, spin = linVel[body], angVel[body]
+
+    if vector.dot(velocity, velocity) >= linear or vector.dot(spin, spin) >= angular then
+      sleepTime[body] = 0
+      continue
     end
-    self.islandCount=count
+
+    local rested = sleepTime[body] + dt
+    sleepTime[body] = rested
+
+    if rested >= sleepDelay then
+      sleeping[body] = true
+      linVel[body], angVel[body] = ZERO, ZERO
+    end
+  end
+
+  self.islandCount = count
 end
 
 function World:_sleep(dt)
-    if not self.allowSleep then return end
-    local parent=self.islandParent
-    local canSleep,minTime=self.islandCanSleep,self.islandMinTime
-    local lin2=self.sleepLinear*self.sleepLinear
-    local ang2=self.sleepAngular*self.sleepAngular
-    for k=1,#self.islandRoots do
-        local r=self.islandRoots[k]
-        canSleep[r]=true
-        minTime[r]=math.huge
+  if not self.allowSleep then return end
+
+  local {islandParent: parent, islandCanSleep: canSleep, islandMinTime: leastRest, islandRoots: roots} = self
+  local {linVel, angVel, sleepTime, sleeping, sleepDelay, high} = self
+  local linear, angular = self.sleepLinear * self.sleepLinear, self.sleepAngular * self.sleepAngular
+
+  for _, root in roots do
+    canSleep[root] = true
+    leastRest[root] = math.huge
+  end
+
+  for body = 1, high do
+    local root = parent[body]
+    if root == 0 then continue end
+
+    local velocity, spin = linVel[body], angVel[body]
+    if vector.dot(velocity, velocity) >= linear or vector.dot(spin, spin) >= angular then canSleep[root] = false end
+  end
+
+  for body = 1, high do
+    local root = parent[body]
+    if root == 0 then continue end
+
+    if not canSleep[root] then
+      sleepTime[body] = 0
+      sleeping[body] = false
+      continue
     end
-    for i=1,self.high do
-        local r=parent[i]
-        if r~=0 then
-            if vector.dot(self.linVel[i],self.linVel[i])>=lin2 or vector.dot(self.angVel[i],self.angVel[i])>=ang2 then
-                canSleep[r]=false
-            end
-        end
+
+    local rested = sleepTime[body] + dt
+    sleepTime[body] = rested
+    if rested < leastRest[root] then leastRest[root] = rested end
+  end
+
+  for body = 1, high do
+    local root = parent[body]
+
+    if root ~= 0 and canSleep[root] and leastRest[root] >= sleepDelay then
+      sleeping[body] = true
+      linVel[body], angVel[body] = ZERO, ZERO
     end
-    for i=1,self.high do
-        local r=parent[i]
-        if r~=0 then
-            if canSleep[r] then
-                self.sleepTime[i]+=dt
-                if self.sleepTime[i]<minTime[r] then minTime[r]=self.sleepTime[i] end
-            else
-                self.sleepTime[i]=0
-                self.sleeping[i]=false
-            end
-        end
-    end
-    for i=1,self.high do
-        local r=parent[i]
-        if r~=0 and canSleep[r] and minTime[r]>=self.sleepDelay then
-            self.sleeping[i]=true
-            self.linVel[i],self.angVel[i]=ZERO,ZERO
-        end
-    end
+  end
 end
 
 function World:step(dt,substeps)
@@ -3404,63 +3465,84 @@ function World:linearStateView()
     return view
 end
 
-function World:writeLinearState(out,opts)
-    out=out or {}
-    opts=opts or {}
-    local includeHandles=opts.handles~=false
-    local includeUserData=opts.userData==true
-    local handles=if includeHandles then (out.handles or {}) else nil
-    local userData=if includeUserData then (out.userData or {}) else nil
-    local positions=out.positions or {}
-    local velocities=out.velocities or {}
-    out.handles=handles;out.userData=userData;out.positions=positions;out.velocities=velocities
-    local n=0
-    local awakeOnly=opts.awakeOnly==true
-    local dynamicOnly=opts.dynamicOnly==true
-    for i=1,self.high do
-        if not self.alive[i] then continue end
-        if awakeOnly and self.sleeping[i] then continue end
-        if dynamicOnly and self.bodyType[i]~=BODY_DYNAMIC then continue end
-        n+=1
-        if handles then handles[n]=makeHandle(i,self.generation[i]) end
-        if userData then userData[n]=self.userData[i] end
-        positions[n]=self.pos[i]
-        velocities[n]=self.linVel[i]
+function World:writeLinearState(out, opts)
+  out = out or {}
+  opts = opts or {}
+
+  local handles = if opts.handles ~= false then out.handles or {} else nil
+  local userData = if opts.userData == true then out.userData or {} else nil
+  local positions, velocities = out.positions or {}, out.velocities or {}
+  local awakeOnly, dynamicOnly = opts.awakeOnly == true, opts.dynamicOnly == true
+  local {alive, sleeping, bodyType, generation, pos, linVel, userData: bodyData} = self
+  local count = 0
+
+  out.handles, out.userData, out.positions, out.velocities = handles, userData, positions, velocities
+
+  for body = 1, self.high do
+    if not alive[body] then continue end
+    if awakeOnly and sleeping[body] then continue end
+    if dynamicOnly and bodyType[body] ~= BODY_DYNAMIC then continue end
+
+    count += 1
+    if handles then handles[count] = makeHandle(body, generation[body]) end
+    if userData then userData[count] = bodyData[body] end
+
+    positions[count], velocities[count] = pos[body], linVel[body]
+  end
+
+  if handles then
+    for index = #handles, count + 1, -1 do
+      handles[index] = nil
     end
-    if handles then for i=#handles,n+1,-1 do handles[i]=nil end end
-    if userData then for i=#userData,n+1,-1 do userData[i]=nil end end
-    for i=#positions,n+1,-1 do positions[i]=nil;velocities[i]=nil end
-    out.count=n
-    return out,n
+  end
+
+  if userData then
+    for index = #userData, count + 1, -1 do
+      userData[index] = nil
+    end
+  end
+
+  for index = #positions, count + 1, -1 do
+    positions[index], velocities[index] = nil, nil
+  end
+
+  out.count = count
+
+  return out, count
 end
 
-function World:writeTransforms(out,opts)
-    out=out or {}
-    opts=opts or {}
-    local handles=out.handles or {};out.handles=handles
-    local positions=out.positions or {};out.positions=positions
-    local rotations=out.rotations or {};out.rotations=rotations
-    local rotationW=out.rotationW or {};out.rotationW=rotationW
-    local velocities=out.velocities or {};out.velocities=velocities
-    local angularVelocities=out.angularVelocities or {};out.angularVelocities=angularVelocities
-    local n=0
-    local awakeOnly=opts.awakeOnly==true
-    local dynamicOnly=opts.dynamicOnly==true
-    for i=1,self.high do
-        if not self.alive[i] then continue end
-        if awakeOnly and self.sleeping[i] then continue end
-        if dynamicOnly and self.bodyType[i]~=BODY_DYNAMIC then continue end
-        n+=1
-        handles[n]=makeHandle(i,self.generation[i])
-        positions[n]=self.pos[i]
-        rotations[n]=self.qv[i]
-        rotationW[n]=self.qw[i]
-        velocities[n]=self.linVel[i]
-        angularVelocities[n]=self.angVel[i]
-    end
-    for i=#handles,n+1,-1 do handles[i]=nil;positions[i]=nil;rotations[i]=nil;rotationW[i]=nil;velocities[i]=nil;angularVelocities[i]=nil end
-    out.count=n
-    return out,n
+function World:writeTransforms(out, opts)
+  out = out or {}
+  opts = opts or {}
+
+  local handles, positions, rotations = out.handles or {}, out.positions or {}, out.rotations or {}
+  local rotationW, velocities, angularVelocities = out.rotationW or {}, out.velocities or {}, out.angularVelocities or {}
+  local awakeOnly, dynamicOnly = opts.awakeOnly == true, opts.dynamicOnly == true
+  local {alive, sleeping, bodyType, generation, pos, qv, qw, linVel, angVel} = self
+  local count = 0
+
+  out.handles, out.positions, out.rotations = handles, positions, rotations
+  out.rotationW, out.velocities, out.angularVelocities = rotationW, velocities, angularVelocities
+
+  for body = 1, self.high do
+    if not alive[body] then continue end
+    if awakeOnly and sleeping[body] then continue end
+    if dynamicOnly and bodyType[body] ~= BODY_DYNAMIC then continue end
+
+    count += 1
+    handles[count] = makeHandle(body, generation[body])
+    positions[count], rotations[count], rotationW[count] = pos[body], qv[body], qw[body]
+    velocities[count], angularVelocities[count] = linVel[body], angVel[body]
+  end
+
+  for index = #handles, count + 1, -1 do
+    handles[index], positions[index], rotations[index] = nil, nil, nil
+    rotationW[index], velocities[index], angularVelocities[index] = nil, nil, nil
+  end
+
+  out.count = count
+
+  return out, count
 end
 
 
