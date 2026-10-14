@@ -5,10 +5,10 @@ id = "org.dreamweave.physik"
 version = "0.3.2"
 jess_api = "1"
 include = ["src", "docs", "tests"]
-tests = ["tests/physik_test.luau", "tests/world_test.luau"]
+tests = ["tests/physik_test.jsl", "tests/world_test.jsl"]
 
 [modules]
-"@dream/physik" = "src/physik.luau"
+"@dream/physik" = "src/physik.jsl"
 
 [[layer]]
 id = "dream.physik"

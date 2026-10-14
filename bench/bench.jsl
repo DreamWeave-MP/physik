@@ -1,7 +1,7 @@
 --!strict
 -- physik, timed from Luau: steps of piles, tumbles, compounds, terrain, chains and fast movers
 -- through each broadphase, the spatial queries, the drains, and building shapes and worlds. Run
--- by `jess run --package . bench/bench.luau [filter] [results]` on a release build. Prints one
+-- by `jess run --package . bench/bench.jsl [filter] [results]` on a release build. Prints one
 -- line per workload: its name, a tab, and the seconds one call takes, a call being what the name
 -- says. Every workload's result is checked against what 0.3.2 computes, to the bit, so a path
 -- that stopped doing the work, or does different work, fails here instead of posting a time.

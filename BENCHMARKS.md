@@ -1,13 +1,13 @@
 # physik 0.3.2 benchmarks
 
-The move onto l3i 2.0, measured as an A/B with `bench/bench.luau`. The numbers in `docs/README.md` and `docs/PROFILE.md` are older, from another machine and another Jess, and are not comparable with these.
+The move onto l3i 2.0, measured as an A/B with `bench/bench.jsl`. The numbers in `docs/README.md` and `docs/PROFILE.md` are older, from another machine and another Jess, and are not comparable with these.
 
 ## On l3i 2.0
 
 Measured on 2026-10-12, at the end of the run started on 2026-10-11, on an Intel(R) Core(TM) i7-10870H CPU @ 2.20GHz (16 threads), with Jess 0.1.0 on l3i 2.0.2, a verified release build, by
 
 ```sh
-jess run --package jpk/physik --package-path jpk jpk/physik/bench/bench.luau '!gets wrong'
+jess run --package jpk/physik --package-path jpk jpk/physik/bench/bench.jsl '!gets wrong'
 ```
 
 Base is commit `472f61b`: 0.3.2 as it was, with the suite and the bench added and nothing else changed. Head is `c975c9f`, the last change to the code. Same binary, four rounds inside one hold of the machine's bench lock, base first in the odd rounds and head first in the even ones; the figures are the middle of the four (the mean of the two in the middle), each of which is the bench's own median of seven batches. This is the second such A/B: the first, on `819f278` an hour earlier with more else running, read up to a tenth higher on the rows that moved, and 1.01 to 1.08 on the rows nothing touched. Every workload checks its result against what 0.3.2 computes, to the bit: the contacts every step returned, the candidates, manifolds, warm starts, sleepers and islands of the last one, and a checksum of every body's position, rotation and velocities; for a query, the hits and a checksum of what was hit and where. Base and head pass the same checks, so the table compares two ways of doing the same arithmetic in the same order.
