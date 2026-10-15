@@ -95,3 +95,77 @@ Each is fixed where the bounds are read, with a test that fails on 0.3.2. None o
 The swept spheres compute, under the grid, exactly what they compute swept and pruned: the same contacts and the same checksum.
 
 A fourth defect was fixed on the way (`c62e8c7`): a body refused for its rotation had already taken a slot, and left a live body with no rotation behind for the next step to trip over.
+
+## Which modules are native, and why
+
+Jess compiles to machine code only what is marked (`--!native` on a module, `@native` on one
+function), and every load pays for what is marked. A module carries `--!native` when a row below
+spends its time there and the module is small (12 KB or less); a larger module carries `@native`
+on the functions the row spends its time in, and nothing else.
+
+Measured 2026-10-15 with `jess 0.1.0`, the verified release build of jess `07c38cb` on l3i
+2.0.3, on the i7-10870H, the one-minute load 1.24 and 1.40 at the start of the two
+sessions. In each session the bench ran alternately on this package and on a copy of it with
+every module marked, three fresh runs of `bench/bench.jsl` each, every run's row the median of
+its batches; a column is the median of the three, and a ratio is against the all-marked runs of
+the same session. Which functions a row spends its time in comes from `jess run --profile` of
+that row alone, unmarked. The load cost is a fresh `jess run --package <this package>
+--package-path jpk` of a script that only requires `@dream/physik`, the two sides alternating, the
+median of five each after one warm-up.
+
+| Requiring `@dream/physik` | All marked | This state |
+| --- | ---: | ---: |
+| Unmarked | 0.117 s | 0.058 s |
+| Final | 0.124 s | 0.082 s |
+
+| Row | All marked (ms) | Unmarked / all marked | Final (ms) | Final / all marked |
+| --- | ---: | ---: | ---: | ---: |
+| step: 1,000 spheres piled in the grid, 60 steps | 342.0 | **2.266×** | 470.8 | **1.377×** |
+| step: 1,000 spheres piled in the grid with contact events, 60 steps | 362.3 | **2.286×** | 506.4 | **1.398×** |
+| step: 250 boxes tumbling wider than a cell, 30 steps | 175.1 | **2.243×** | 222.5 | **1.271×** |
+| step: 250 boxes tumbling in the grid, 30 steps | 167.7 | **2.424×** | 209.1 | **1.247×** |
+| step: 600 spheres, capsules and boxes swept and pruned, 30 steps | 149.7 | **1.915×** | 178.8 | **1.194×** |
+| step: 2,000 spheres swept and pruned from scattered, 1 step | 4.203 | **1.779×** | 5.289 | **1.258×** |
+| step: 256 compounds of three pieces, 30 steps | 265.6 | **2.234×** | 380.2 | **1.431×** |
+| step: 600 capsules and boxes on a heightfield 65 by 65, 30 steps | 176.5 | **2.628×** | 264.6 | **1.500×** |
+| step: 600 capsules and boxes on a mesh of 8,192 triangles, 30 steps | 326.1 | **2.494×** | 393.1 | **1.205×** |
+| step: 600 spheres, capsules and boxes on a heightfield 65 by 65, swept and pruned, 30 steps | 169.7 | **2.342×** | 233.1 | **1.373×** |
+| step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, swept and pruned, 30 steps | 283.0 | **2.452×** | 349.0 | **1.233×** |
+| step: 600 spheres, capsules and boxes on a heightfield 65 by 65, 30 steps, which 0.3.2 gets wrong | 178.0 | **2.336×** | 230.6 | **1.295×** |
+| step: 600 spheres, capsules and boxes on a mesh of 8,192 triangles, 30 steps, which 0.3.2 gets wrong | 281.4 | **2.422×** | 344.0 | **1.222×** |
+| step: 5,000 spheres drifting far apart with contact events, drained, 30 steps | 83.35 | **2.158×** | 86.90 | 1.043× |
+| step: 1,000 spheres asleep on the floor, 1 step | 1.301 | **2.228×** | 1.629 | **1.252×** |
+| step: 60 chains of 8 links on distance, ball and hinge joints, 30 steps | 168.3 | **2.186×** | 222.9 | **1.324×** |
+| step: 200 swept spheres fired at walls, spheres, compounds and terrain, swept and pruned, 6 steps | 113.3 | **2.024×** | 125.1 | **1.104×** |
+| step: 200 swept spheres fired at walls, spheres and compounds in the grid, 6 steps | 56.79 | **2.022×** | 62.92 | **1.108×** |
+| step: 200 swept spheres fired at walls, spheres, compounds and terrain, 6 steps, which 0.3.2 gets wrong | 114.5 | **2.032×** | 137.3 | **1.199×** |
+| query: 2,048 rays in a batch, as columns | 36.45 | **2.618×** | 37.42 | 1.027× |
+| query: 2,048 rays in a batch, as columns, unbounded and downward | 29.93 | **2.498×** | 31.49 | **1.052×** |
+| query: 2,048 rays in a batch, as records | 35.35 | **2.689×** | 35.96 | 1.017× |
+| query: 512 rays one by one | 9.167 | **2.708×** | 9.136 | 0.997× |
+| query: 1,024 sphere casts in a batch, as columns | 12.68 | **1.972×** | 13.95 | **1.100×** |
+| query: 2,048 boxes of a few cells | 17.90 | **2.053×** | 17.86 | 0.997× |
+| query: 64 boxes of more cells than the grid is walked for | 24.76 | **2.220×** | 24.53 | 0.991× |
+| drain: transforms of 1,001 bodies | 0.2059 | **1.227×** | 0.1988 | 0.965× |
+| drain: linear state of 1,000 dynamic bodies, with user data and without handles | 0.1303 | **1.279×** | 0.1282 | 0.984× |
+| drain: contacts of the pile, as columns | 0.2156 | **1.565×** | 0.2246 | 1.042× |
+| drain: contacts of the pile, as records | 0.2520 | **1.575×** | 0.2330 | 0.925× |
+| drain: contact events of the pile, without the ones that stay | 0.05996 | **3.096×** | 0.05926 | 0.988× |
+| drain: stats of the pile | 0.01843 | **2.309×** | 0.01804 | 0.979× |
+| build: a mesh of 8,192 triangles from tables | 3.126 | **3.397×** | 3.022 | 0.967× |
+| build: a mesh of 8,192 triangles from buffers | 2.759 | **3.059×** | 2.656 | 0.963× |
+| build: a mesh of 1,408 triangles without indices | 0.6091 | **3.166×** | 0.5870 | 0.964× |
+| build: a heightfield 65 by 65 from a table | 0.03816 | **4.891×** | 0.03725 | 0.976× |
+| build: a heightfield 65 by 65 from a buffer | 0.01000 | **1.467×** | 0.00980 | 0.981× |
+| build: add 5,000 bodies of every primitive, then remove every other one | 12.46 | **1.495×** | 12.67 | 1.017× |
+| sync: move the origin under 5,000 bodies, and back | 1.381 | **1.317×** | 1.349 | 0.977× |
+| sync: apply the transforms of 5,000 bodies | 3.073 | **1.964×** | 2.951 | 0.960× |
+
+What carries the directive: `physik`, whole, the package's only module, as before this pass.
+
+Marking only the functions the rows' profiles named (the narrow phase, the solvers, the
+integrator, the grid and sweep-and-prune, the casts) saved 0.041 s a load and left the steps
+1.10x to 1.50x slower than all marked: 1,000 spheres piled in the grid went from 0.34 s to 0.47 s
+for 60 steps. A world steps every frame and loads once, so the module stays marked whole. The
+table's final column is that function-marked session, kept as the record of what was tried; the
+package ships as all marked.
