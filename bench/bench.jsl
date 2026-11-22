@@ -9,6 +9,7 @@
 -- which is how the table of expectations is made. A filter that starts with `!` leaves out the
 -- workloads it names instead: the three marked "which 0.3.2 gets wrong" compute what a world
 -- should, and 0.3.2, which lets a sphere's bounds go stale under the grid, cannot be held to them.
+local character = require '@dream/physik/character'
 local physik = require '@dream/physik'
 
 -- A build without the verified toolchain runs Luau slower than a release does, so a number from
@@ -67,6 +68,15 @@ local Expected: { [string]: string } = {
   ['build: add 5,000 bodies of every primitive, then remove every other one'] = '2500 left, checksum 31543.379452276655',
   ['sync: move the origin under 5,000 bodies, and back'] = '3934695.0420065979',
   ['sync: apply the transforms of 5,000 bodies'] = '5000 applied, checksum 3934695.0424996582',
+
+  -- The level, which 0.3.2 has no character for, and steps differently every time bodies have
+  -- been taken out of it: these are as 0.4.0 computes them.
+  ['level: 1,024 static boxes and nothing moving, 60 steps'] = '0 contacts, 0 candidates, 0 manifolds, 0 warm, 0 asleep, 0 islands, 0 swept, checksum 37482.222238540649',
+  ['level: 48 boxes thrown among 1,024 static ones and taken out again, 60 steps'] = '2539 contacts, 64 candidates, 55 manifolds, 144 warm, 0 asleep, 45 islands, 0 swept, checksum 37672.436927226612',
+  ['level: 256 rays among 1,024 static boxes'] = '192 struck, 1575.0599460284282 far',
+  ['level: 256 capsules swept among 1,024 static boxes'] = '142 met, 930.984696956682 far',
+  ['level: a character run 240 steps among 1,024 static boxes'] = '240 grounded, at 29.093298554420471',
+  ['level: 48 boxes asleep among 1,024 static ones, 60 steps'] = '10260 contacts, 62 candidates, 62 manifolds, 0 warm, 48 asleep, 45 islands, 0 swept, checksum 36474.9623625776',
 }
 
 local function median(samples: { number }): number
@@ -821,5 +831,131 @@ do
 
   workload('sync: apply the transforms of 5,000 bodies', function(): string
     return `{world:applyTransforms(written, false)} applied, checksum {pin(checksum(world))}`
+  end)
+end
+
+-- A level: what a game's world mostly is. 1,024 static boxes, a floor of 256 slabs with three
+-- more on each, pillars and crates everywhere but a room in the middle, which has beams over it.
+local function level(options): World
+  local world = physik.newWorld(options)
+  local random = generator(77)
+
+  for index = 0, 255 do
+    local column, row = index % 16, index // 16
+    local centre = vector.create(column * 4 - 30, 0, row * 4 - 30)
+    local room = column >= 6 and column <= 9 and row >= 6 and row <= 9
+
+    world:addBody({ type = 'static', shape = physik.box(vector.create(2, 0.5, 2)), position = centre - vector.create(0, 0.5, 0) })
+
+    for _ = 1, 3 do
+      local half = vector.create(random(0.2, 1.2), random(0.5, 2), random(0.2, 1.2))
+      local rise = if room then 6 else half.Y
+
+      world:addBody({
+        type = 'static',
+        shape = physik.box(half),
+        position = centre + vector.create(random(-1.5, 1.5), rise, random(-1.5, 1.5)),
+      })
+    end
+  end
+
+  return world
+end
+
+--- Throws `count` small boxes into the room, as a breached door's pieces are thrown.
+local function throw(world: World, count: number): { number }
+  local random = generator(4242)
+
+  return [
+    for _ in range(1, count) =>
+      world:addBody({
+        shape = physik.box(vector.create(random(0.07, 0.19), random(0.05, 0.19), random(0.03, 0.07))),
+        position = vector.create(random(-2, 2), random(0.5, 2.5), random(-2, 2)),
+        rotation = rotation(random),
+        velocity = vector.create(random(-4, 4), random(0, 3), random(-4, 4)),
+        angularVelocity = vector.create(random(-8, 8), random(-8, 8), random(-8, 8)),
+        mass = 1,
+      })
+  ]
+end
+
+do
+  local world = level()
+
+  workload('level: 1,024 static boxes and nothing moving, 60 steps', function(): string
+    return run(world, 60)
+  end)
+
+  -- The same world every time: what is thrown is taken out again, and a world that has had
+  -- bodies in it and out of it has to step as a new one does.
+  workload('level: 48 boxes thrown among 1,024 static ones and taken out again, 60 steps', function(): string
+    local thrown = throw(world, 48)
+    local result = run(world, 60)
+
+    for _, handle in thrown do
+      world:removeBody(handle)
+    end
+
+    return result
+  end)
+
+  local random = generator(99)
+  local origins = [for _ in range(1, 256) => vector.create(random(-7, 7), random(0.5, 3), random(-7, 7))]
+  local directions = [for _ in range(1, 256) => vector.create(random(-1, 1), random(-0.3, 0.3), random(-1, 1))]
+  local reaches = table.create(256, 40)
+  local rays = {}
+
+  workload('level: 256 rays among 1,024 static boxes', function(): string
+    local out = world:raycastBatchSoA(origins, directions, reaches, nil, rays)
+    local hits = [for index in range(1, 256) if out.hit[index] => out.distances[index]]
+
+    return `{#hits} struck, {pin(sum[for distance in hits => distance])} far`
+  end)
+
+  workload('level: 256 capsules swept among 1,024 static boxes', function(): string
+    local met, far = 0, 0
+
+    for index = 1, 256 do
+      local direction = directions[index]
+      local start = vector.create(origins[index].X, 0.95, origins[index].Z)
+      local hit = world:capsuleCast(start, start + vector.create(direction.X, 0, direction.Z) * 12, 0.4, 0.5)
+
+      if hit then
+        met += 1
+        far += hit.distance
+      end
+    end
+
+    return `{met} met, {pin(far)} far`
+  end)
+
+  workload('level: a character run 240 steps among 1,024 static boxes', function(): string
+    local who = character.new(world, { radius = 0.4, height = 1.8, position = vector.create(0, 0.01, 0) })
+    local grounded = 0
+
+    -- Round the room and out of it, among the pillars.
+    for step = 1, 240 do
+      local heading = vector.create(step % 97 / 97 - 0.3, 0, step % 61 / 61 - 0.2)
+
+      character.move(who, heading * 0.12 + vector.create(0, -0.03, 0))
+      if who.grounded then grounded += 1 end
+    end
+
+    return `{grounded} grounded, at {pin(weigh(who.position))}`
+  end)
+end
+
+do
+  -- Looser than the defaults, which are tight for pieces this small: a heap of them never rests.
+  local world = level({ sleepLinear = 0.3, sleepAngular = 0.6, sleepDelay = 0.4 })
+
+  throw(world, 48)
+
+  for _ = 1, 600 do
+    world:step(1 / 60)
+  end
+
+  workload('level: 48 boxes asleep among 1,024 static ones, 60 steps', function(): string
+    return run(world, 60)
   end)
 end
