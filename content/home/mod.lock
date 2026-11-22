@@ -1,5 +1,5 @@
 {
-  "schema_version": "3",
+  "schema_version": "4",
   "document": "lock",
   "project": "3059e0aa-40e6-42d1-8db4-ef7832aec8a0",
   "note": "Written by CI when a release tag is pushed: what each published release's archive contains. Do not edit.",
@@ -21,6 +21,47 @@
             "package": "org.dreamweave.physik",
             "jess_api": "1",
             "content_digest": "0e1d0a9171dcc13122ab8f9ebbc88ebdf84371e28b31e53e551feff23de57162",
+            "dependencies": {}
+          }
+        }
+      ],
+      "runtimes": {},
+      "platforms": [],
+      "provides": [],
+      "relationships": [],
+      "components": [
+        {
+          "id": "main",
+          "name": "physik",
+          "path": ".",
+          "required": true,
+          "default": true,
+          "requires": [],
+          "conflicts": [],
+          "suggested_with": []
+        }
+      ],
+      "groups": [],
+      "extensions": {},
+      "critical_extensions": []
+    },
+    {
+      "version": "0.5.0",
+      "locked_from": "4400e3af1b17323441b46756775dc543c12264f7",
+      "artifacts": [
+        {
+          "id": "jpk",
+          "format": "jpk",
+          "filename": "org.dreamweave.physik-0.5.0.jpk",
+          "media_type": "application/vnd.jess.jpk",
+          "size": 147472,
+          "digests": {
+            "sha256": "62345ac41653c4f20888631d65d99a959c1a9d4c7852ea66e023d6c69f65f639"
+          },
+          "jess": {
+            "package": "org.dreamweave.physik",
+            "jess_api": "1",
+            "content_digest": "1ebff4eeca1796a847a297192965d7ca9e8a8962301d8068e2ebe101456d6028",
             "dependencies": {}
           }
         }
