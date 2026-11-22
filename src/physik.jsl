@@ -1266,7 +1266,12 @@ function World:_allocSlot()
     end
     self.alive[i] = true
     self.aliveCount += 1
-    self.order[#self.order+1] = i
+    -- A slot that is taken again before the sweep's order was compacted is still listed in it,
+    -- and listing it twice would offer each of its pairs twice.
+    if not self.inOrder[i] then
+        self.inOrder[i] = true
+        self.order[#self.order+1] = i
+    end
     return i
 end
 
@@ -1623,7 +1628,7 @@ local function sortOrderByKeys(self, order: { number }, count: number): boolean
 end
 
 function World:_sortOrder()
-  local {order, alive, aabbMin} = self
+  local {order, alive, aabbMin, inOrder} = self
   local count = #order
 
   -- Compact dead slots opportunistically.
@@ -1632,7 +1637,11 @@ function World:_sortOrder()
 
     for index = 1, count do
       local body = order[index]
-      if not alive[body] then continue end
+
+      if not alive[body] then
+        inOrder[body] = nil
+        continue
+      end
 
       kept += 1
       order[kept] = body
@@ -4023,6 +4032,7 @@ function M.newWorld(opts)
     w.aliveCount=0
     w.free={}
     w.order={}
+    w.inOrder={}
     w.generation={}
     w.alive={}
     w.bodyType={}
