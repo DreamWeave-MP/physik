@@ -1,0 +1,825 @@
+--!strict
+--!native
+-- The broad phase: which pairs of bodies may touch. Nearly every pair in a world is nowhere
+-- near touching, and this is what offers the narrow phase the few that are.
+--
+-- The bodies that can move are in a grid, each in the cell its centre is in, and a pair is
+-- offered when two share a cell or are in neighbouring ones. A body wider than a cell is kept
+-- out of the grid and paired by a sweep along X. The static bodies are in a tree, which is
+-- built when one of them changes and not otherwise, and what moves looks itself up in it: a
+-- level is mostly static bodies, and a step is not charged for them.
+--
+-- Bodies at rest are passed over. A body asleep exactly where it was asleep at the last step,
+-- or static and not moved, touches as it did, so a pair of them is not offered again: its
+-- contacts are kept from the step before.
+local cells = require './cells'
+local data = require '@dream/data'
+local narrowphase = require './narrowphase'
+local worlds = require './world'
+
+local broadphase = {}
+
+type State = worlds.State
+
+-- A column, row or layer from here out has no cell.
+local Furthest = cells.Offset
+
+-- A cell, then the thirteen of its twenty-six neighbours it is paired with: half of them, so that
+-- a pair of neighbouring cells is found from one side only. A packed cell is affine in its
+-- coordinates, so inside the packed range a neighbour's key is the cell's plus a constant.
+local GridStepX = { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }
+local GridStepY = { 0, -1, -1, -1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0 }
+local GridStepZ = { 0, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, 1 }
+
+local GridKeyStep = [
+  for stepX, stepY, stepZ in zipStrict(GridStepX, GridStepY, GridStepZ) =>
+    stepX * cells.Base2 + stepY * cells.Base + stepZ
+]
+
+-- A byte for each residue of a packed cell: set while a cell with that residue is occupied, so
+-- a clear byte says a cell is empty without a lookup in the table of cells.
+local GridFilterSize = worlds.GridFilterSize
+
+
+
+
+
+
+
+--- Sorts `order` by each body's least X from scratch: the keys go into a buffer, the data plane
+--- orders them, and the bodies follow. It is stable, as the insertion sort it stands in for is, so
+--- it ends where that would have. Returns false, having moved nothing, when a key is not a number,
+--- which the two sorts place differently.
+local function sortOrderByKeys(state: State, order: { number }, count: number): boolean
+  local boundsLow = state.boundsLow
+  local keys, permutation = buffer.create(count * 4), buffer.create(count * 4)
+
+  into(keys, 'f32')[for body in order => boundsLow[body].x]
+
+  -- A sum is not a number when a key is not, or when both infinities are among the keys.
+  local total = data.sum(keys, 'f32', 0, count)
+  if total ~= total then return false end
+
+  data.argsort(keys, 'f32', 0, count, permutation)
+  table.move([for slot in permutation[1:count, 'u32'] => order[slot + 1]], 1, count, 1, order)
+
+  return true
+end
+
+local function sortOrder(state: State)
+  local {order, alive, boundsLow, inOrder} = state
+  local count = #order
+
+  -- Compact dead slots opportunistically.
+  if count > state.aliveCount + 64 then
+    local kept = 0
+
+    for index = 1, count do
+      local body = order[index]
+
+      if not alive[body] then
+        inOrder[body] = nil
+        continue
+      end
+
+      kept += 1
+      order[kept] = body
+    end
+
+    for index = count, kept + 1, -1 do
+      order[index] = nil
+    end
+
+    count = kept
+  end
+
+  -- Insertion sort on min X. Physics motion is coherent, so after the first frame this is normally
+  -- close to O(n). When it is not, with bodies just added or scattered, its moves soon outnumber
+  -- what sorting from scratch costs, and what is left is handed to that.
+  local allowance = count * 8
+
+  for position = 2, count do
+    local body = order[position]
+    local key = boundsLow[body].x
+    local slot = position - 1
+
+    while slot >= 1 and boundsLow[order[slot]].x > key do
+      order[slot + 1] = order[slot]
+      slot -= 1
+    end
+
+    order[slot + 1] = body
+    allowance -= position - 1 - slot
+
+    if allowance < 0 then
+      if sortOrderByKeys(state, order, count) then return end
+
+      allowance = math.huge
+    end
+  end
+end
+
+local impulseDenom
+local applyPairImpulse
+
+
+
+--- Offers a pair from a broadphase to the narrow phase, unless the pair is filtered out or its
+--- bounds are apart. Most pairs a broadphase offers are apart, and nothing else is read for those:
+--- a sphere is bounded by its centre and radius, anything else by its box.
+local function tryPair(state: State, first: number, second: number)
+  -- Two bodies at rest touch as they did, and their contacts have been kept.
+  local rest = state.rest
+  if rest[first] and rest[second] then return end
+
+  local sphereRadius, position = state.sphereRadius, state.position
+  local firstRadius, secondRadius = sphereRadius[first], sphereRadius[second]
+
+  if firstRadius and secondRadius then
+    local reach = firstRadius + secondRadius + state.contactMargin * 2
+    local between = position[second] - position[first]
+    if math.abs(between.x) > reach or math.abs(between.y) > reach or math.abs(between.z) > reach then return end
+  elseif firstRadius or secondRadius then
+    local sphere, other = first, second
+    if secondRadius then
+      sphere, other = second, first
+    end
+
+    local centre, reach = position[sphere], (firstRadius or secondRadius or 0) + state.contactMargin
+    local low, high = state.boundsLow[other], state.boundsHigh[other]
+    if centre.x + reach < low.x or centre.x - reach > high.x then return end
+    if centre.y + reach < low.y or centre.y - reach > high.y then return end
+    if centre.z + reach < low.z or centre.z - reach > high.z then return end
+  else
+    local low, high = state.boundsLow[first], state.boundsHigh[first]
+    local otherLow, otherHigh = state.boundsLow[second], state.boundsHigh[second]
+    if otherLow.x > high.x or otherHigh.x < low.x then return end
+    if otherLow.y > high.y or otherHigh.y < low.y then return end
+    if otherLow.z > high.z or otherHigh.z < low.z then return end
+  end
+
+  if first == second or not state.alive[first] or not state.alive[second] then return end
+
+  -- A pair is always narrowed lower slot first, so a contact matches the one cached for it.
+  if second < first then
+    first, second = second, first
+  end
+
+  -- Every entry in the table is a joint's, so with no joint there is nothing to look up.
+  if state.jointCount > 0 and state.jointNoCollide[worlds.pairKey(first, second)] then return end
+  if state.bodyType[first] == 'static' and state.bodyType[second] == 'static' then return end
+
+  local mask, group = state.mask, state.group
+  if bit32.band(mask[first], group[second]) == 0 or bit32.band(mask[second], group[first]) == 0 then return end
+
+  state.candidateCount += 1
+  local before = state.contactCount
+  narrowphase.pair(state, first, second)
+  if state.contactCount > before then state.manifoldCount += 1 end
+end
+
+local function collideSap(state: State)
+  sortOrder(state)
+  local {order, alive, boundsLow, boundsHigh} = state
+  local count = #order
+
+  for position = 1, count do
+    local first = order[position]
+    if not alive[first] then continue end
+
+    local reach = boundsHigh[first].x
+
+    for after = position + 1, count do
+      local second = order[after]
+      if not alive[second] then continue end
+      if boundsLow[second].x > reach then break end
+
+      tryPair(state, first, second)
+    end
+  end
+end
+
+--- Lists the cells holding more than one body, and every pair of occupied neighbouring cells, in
+--- the order the cells were first occupied.
+local function rebuildGridPairs(state: State)
+  local {gridHeads: heads, gridKeys: keys, gridNext: nextIn, gridOccupied: occupied} = state
+  local {gridDenseKeys: dense, gridPairFirst: pairA, gridPairSecond: pairB} = state
+  local {gridKeyColumn: columns, gridKeyRow: rows, gridKeyLayer: layers} = state
+  local denseCount, pairCount = 0, 0
+
+  for index = 1, #keys do
+    local cell = keys[index]
+    local head = heads[cell] or 0
+
+    if head ~= 0 and (nextIn[head] or 0) ~= 0 then
+      denseCount += 1
+      dense[denseCount] = cell
+    end
+
+    local column, row, layer = columns[index], rows[index], layers[index]
+    local interior = column < Furthest - 1
+      and row > -Furthest
+      and row < Furthest - 1
+      and layer > -Furthest
+      and layer < Furthest - 1
+
+    for neighbour = 2, 14 do
+      local key = if interior
+        then cell + GridKeyStep[neighbour]
+        else cells.pack(column + GridStepX[neighbour], row + GridStepY[neighbour], layer + GridStepZ[neighbour])
+
+      -- Most neighbours are empty, and the filter says so without a lookup.
+      if not key or buffer.readu8(occupied, key % GridFilterSize) == 0 or not heads[key] then continue end
+
+      pairCount += 1
+      pairA[pairCount], pairB[pairCount] = cell, key
+    end
+  end
+
+  for index = #dense, denseCount + 1, -1 do
+    dense[index] = nil
+  end
+
+  for index = #pairA, pairCount + 1, -1 do
+    pairA[index], pairB[index] = nil, nil
+  end
+
+  state.gridDenseCount = denseCount
+  state.gridPairCount = pairCount
+end
+
+--- Makes a tree of the boxes round `members`, which are bodies, and returns its root: a node,
+--- or the one body there is, negated. A node halves its bodies along the axis their centres are
+--- spread furthest on.
+local function buildStill(state: State, members: { number }): number
+  if #members == 1 then return -members[1] end
+
+  local {boundsLow, boundsHigh} = state
+  local low, high = boundsLow[members[1]], boundsHigh[members[1]]
+  local least, most = low + high, low + high
+
+  for _, body in members do
+    local bodyLow, bodyHigh = boundsLow[body], boundsHigh[body]
+    local centre = bodyLow + bodyHigh
+
+    low, high = vector.min(low, bodyLow), vector.max(high, bodyHigh)
+    least, most = vector.min(least, centre), vector.max(most, centre)
+  end
+
+  local spread = most - least
+
+  -- Along whichever axis the centres are spread furthest: all but one of these is nothing.
+  local along = if spread.x >= spread.y and spread.x >= spread.z
+    then vector.create(1, 0, 0)
+    elseif spread.y >= spread.z then vector.create(0, 1, 0)
+    else vector.create(0, 0, 1)
+
+  -- Bodies whose centres are level, or are not numbers, stay in the order of their slots.
+  table.sort(members, function(first: number, second: number)
+    local firstCentre = vector.dot(boundsLow[first] + boundsHigh[first], along)
+    local secondCentre = vector.dot(boundsLow[second] + boundsHigh[second], along)
+    if firstCentre < secondCentre then return true end
+    if secondCentre < firstCentre then return false end
+
+    return first < second
+  end)
+
+  local node = state.stillNodeCount + 1
+  local half = #members // 2
+
+  state.stillNodeCount = node
+  state.stillLow[node], state.stillHigh[node] = low, high
+  state.stillLeft[node] = buildStill(state, table.move(members, 1, half, 1, {}))
+  state.stillRight[node] = buildStill(state, table.move(members, half + 1, #members, 1, {}))
+
+  return node
+end
+
+-- How much bigger than a body the box is that the tree of static bodies is asked about for it.
+local NearPad = vector.create(0.3, 0.3, 0.3)
+
+--- The bodies that are not static, in the order of their slots: what a step has to visit. A
+--- level is mostly static bodies, and a step that asked each of them whether it moves would
+--- spend its time on that.
+local function listMovers(state: State): { number }
+  local movers = state.movers
+  if not state.moversDirty then return movers end
+
+  local {alive, bodyType} = state
+  local count = 0
+
+  for body = 1, state.high do
+    if not alive[body] or bodyType[body] == 'static' then continue end
+
+    count += 1
+    movers[count] = body
+  end
+
+  for index = #movers, count + 1, -1 do
+    movers[index] = nil
+  end
+
+  state.moversDirty = false
+
+  return movers
+end
+
+--- Builds the tree of the static bodies. They neither move nor touch each other, so they are
+--- kept out of the grid and of every step's sweep, and found by what does move.
+local function rebuildStill(state: State)
+  local {alive, bodyType} = state
+  local members = {}
+
+  for body = 1, state.high do
+    if not alive[body] or bodyType[body] ~= 'static' then continue end
+
+    worlds.refreshBounds(state, body)
+    table.insert(members, body)
+  end
+
+  state.stillNodeCount = 0
+  state.stillRoot = if #members == 0 then 0 else buildStill(state, members)
+  state.stillDirty = false
+  state.stillEpoch += 1
+end
+
+local function buildGridIndex(state: State, refresh: boolean, resting: boolean?)
+  local {gridHeads: heads, gridKeys: keys, gridNext: nextIn, gridLarge: large, gridOccupied: occupied} = state
+  local {sphereRadius, position, boundsLow, boundsHigh, gridKey, gridColumn: gridX, gridRow: gridY, gridLayer: gridZ} = state
+  local cellSize, margin = state.broadphaseCellSize, state.contactMargin
+  local movers = listMovers(state)
+
+  if state.stillDirty then rebuildStill(state) end
+
+  -- Most coherent worlds keep bodies in the same broad-phase cells for many frames. Validate
+  -- membership first; when topology is unchanged, retain bucket chains and occupied-neighbor
+  -- pairs instead of rebuilding Lua hash tables and probing thirteen empty neighbors per cell.
+  if state.gridTopologyReady and not state.gridTopologyDirty then
+    local same = true
+
+    -- In a step, a body at rest is where it was and as it was. Outside one nothing has said
+    -- which bodies are at rest since they last moved.
+    local rest = if resting then state.rest else nil
+
+    for _, body in movers do
+      if rest and rest[body] then continue end
+
+      local radius = sphereRadius[body]
+      local width, height, depth
+
+      if radius then
+        width = (radius + margin) * 2
+        height, depth = width, width
+      else
+        if refresh then worlds.refreshBounds(state, body) end
+
+        local low, high = boundsLow[body], boundsHigh[body]
+        width, height, depth = high.x - low.x, high.y - low.y, high.z - low.z
+      end
+
+      if gridKey[body] then
+        if width > cellSize or height > cellSize or depth > cellSize then
+          same = false
+          continue
+        end
+
+        local centre = position[body]
+
+        if
+          math.floor(centre.x / cellSize) ~= gridX[body]
+          or math.floor(centre.y / cellSize) ~= gridY[body]
+          or math.floor(centre.z / cellSize) ~= gridZ[body]
+        then
+          same = false
+        end
+      elseif width <= cellSize and height <= cellSize and depth <= cellSize then
+        local centre = position[body]
+        local column, row, layer = math.floor(centre.x / cellSize), math.floor(centre.y / cellSize), math.floor(centre.z / cellSize)
+        if cells.pack(column, row, layer) then same = false end
+      end
+    end
+
+    if same then
+      state.gridValid = true
+      return false
+    end
+  end
+
+  if refresh and (not state.gridTopologyReady or state.gridTopologyDirty) then
+    for _, body in movers do
+      if not sphereRadius[body] then worlds.refreshBounds(state, body) end
+    end
+  end
+
+  -- Every head belongs to a key, so emptying both tables forgets every cell.
+  table.clear(heads)
+  table.clear(keys)
+  table.clear(large)
+  buffer.fill(occupied, 0, 0)
+
+  local {gridKeyColumn: columns, gridKeyRow: rows, gridKeyLayer: layers} = state
+  local smallCount, keyCount = 0, 0
+
+  for _, body in movers do
+    local radius = sphereRadius[body]
+    local width, height, depth
+
+    if radius then
+      width = (radius + margin) * 2
+      height, depth = width, width
+    else
+      local low, high = boundsLow[body], boundsHigh[body]
+      width, height, depth = high.x - low.x, high.y - low.y, high.z - low.z
+    end
+
+    local centre = position[body]
+    local column, row, layer = math.floor(centre.x / cellSize), math.floor(centre.y / cellSize), math.floor(centre.z / cellSize)
+    local key = width <= cellSize and height <= cellSize and depth <= cellSize and cells.pack(column, row, layer)
+
+    if not key then
+      gridKey[body] = nil
+      table.insert(large, body)
+      continue
+    end
+
+    smallCount += 1
+    gridX[body], gridY[body], gridZ[body] = column, row, layer
+    gridKey[body] = key
+
+    local head = heads[key]
+
+    -- The table of cells is written before the filter is, so a cell that is not a number, which
+    -- a body whose position is not a number is in, is refused by the table, as it always was.
+    nextIn[body] = head or 0
+    heads[key] = body
+
+    if not head then
+      keyCount += 1
+      keys[keyCount] = key
+      columns[keyCount], rows[keyCount], layers[keyCount] = column, row, layer
+      buffer.writeu8(occupied, key % GridFilterSize, 1)
+    end
+  end
+
+  state.gridSmallCount = smallCount
+  state.gridTopologyReady = true
+  state.gridTopologyDirty = false
+  rebuildGridPairs(state)
+  state.gridValid = true
+
+  return true
+end
+
+local function ensureQueryGrid(state: State)
+    if state.gridValid then return end
+    buildGridIndex(state, true)
+end
+
+local function collideGrid(state: State)
+  buildGridIndex(state, true, true)
+  local {gridHeads: heads, gridNext: nextIn, gridDenseKeys: dense, gridPairFirst: pairA, gridPairSecond: pairB} = state
+  local {sphereRadius, boundsLow: lows, boundsHigh: highs} = state
+
+  -- In a heap most of the pairs a cell offers are apart, and two bodies that are not spheres are
+  -- told apart here by their boxes, without the call: a sphere's box is not kept as it moves.
+
+  -- Same-cell pairs only exist in cells cached as non-singleton during the most recent topology
+  -- rebuild. Their body membership is stable until a center crosses a cell boundary.
+  for index = 1, state.gridDenseCount do
+    local first = heads[dense[index]] or 0
+
+    while first ~= 0 do
+      local second = nextIn[first] or 0
+
+      if sphereRadius[first] then
+        while second ~= 0 do
+          tryPair(state, first, second)
+          second = nextIn[second] or 0
+        end
+      else
+        local low, high = lows[first], highs[first]
+
+        while second ~= 0 do
+          local other = second
+          second = nextIn[second] or 0
+
+          if not sphereRadius[other] then
+            local otherLow, otherHigh = lows[other], highs[other]
+            if otherLow.x > high.x or otherHigh.x < low.x then continue end
+            if otherLow.y > high.y or otherHigh.y < low.y then continue end
+            if otherLow.z > high.z or otherHigh.z < low.z then continue end
+          end
+
+          tryPair(state, first, other)
+        end
+      end
+
+      first = nextIn[first] or 0
+    end
+  end
+
+  -- Cross-cell work walks only occupied neighboring cell pairs. Empty-neighbor hash probes are
+  -- paid once per topology change rather than every simulation tick.
+  for index = 1, state.gridPairCount do
+    local first = heads[pairA[index]] or 0
+    local head = heads[pairB[index]] or 0
+
+    while first ~= 0 do
+      local second = head
+
+      if sphereRadius[first] then
+        while second ~= 0 do
+          tryPair(state, first, second)
+          second = nextIn[second] or 0
+        end
+      else
+        local low, high = lows[first], highs[first]
+
+        while second ~= 0 do
+          local other = second
+          second = nextIn[second] or 0
+
+          if not sphereRadius[other] then
+            local otherLow, otherHigh = lows[other], highs[other]
+            if otherLow.x > high.x or otherHigh.x < low.x then continue end
+            if otherLow.y > high.y or otherHigh.y < low.y then continue end
+            if otherLow.z > high.z or otherHigh.z < low.z then continue end
+          end
+
+          tryPair(state, first, other)
+        end
+      end
+
+      first = nextIn[first] or 0
+    end
+  end
+
+  local {gridLarge: large, alive, gridKey, bodyType, movers} = state
+  local root = state.stillRoot
+
+  -- The static bodies are in a tree, and everything else looks itself up in it.
+  if root ~= 0 then
+    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = state
+    local {sphereRadius, position, boundsLow, boundsHigh} = state
+    local margin = state.contactMargin
+    local rest, stillSettled = state.rest, #state.unsettled == 0
+    local {nearStill, nearLows, nearHighs, nearEpochs, stillEpoch: epoch} = state
+
+    for _, body in movers do
+      -- A body at rest touches the static bodies it did, unless one of those has been moved.
+      if stillSettled and rest[body] then continue end
+
+      -- One body is no tree, and the pair is tested on its own bounds.
+      if root < 0 then
+        tryPair(state, -root, body)
+        continue
+      end
+
+      local low, high
+      local radius = sphereRadius[body]
+
+      if radius then
+        local reach = radius + margin
+        local centre = position[body]
+        low, high = centre - vector.create(reach, reach, reach), centre + vector.create(reach, reach, reach)
+      else
+        low, high = boundsLow[body], boundsHigh[body]
+      end
+
+      -- The tree is asked about a box a little bigger than the body's, and the answer is kept
+      -- until the body leaves that box or the tree changes: most steps a body is offered the
+      -- few static bodies it was near last step, in the order the tree gave them.
+      local near = nearStill[body]
+      local nearLow, nearHigh = nearLows[body], nearHighs[body]
+
+      if
+        nearEpochs[body] ~= epoch
+        or low.x < nearLow.x
+        or low.y < nearLow.y
+        or low.z < nearLow.z
+        or high.x > nearHigh.x
+        or high.y > nearHigh.y
+        or high.z > nearHigh.z
+      then
+        if not near then
+          near = {}
+          nearStill[body] = near
+        end
+
+        low, high = low - NearPad, high + NearPad
+        nearLows[body], nearHighs[body], nearEpochs[body] = low, high, epoch
+
+        local entry, top, count = root, 0, 0
+
+        while true do
+          if entry < 0 then
+            count += 1
+            near[count] = -entry
+          else
+            local nodeLow, nodeHigh = lows[entry], highs[entry]
+
+            if
+              not (
+                low.x > nodeHigh.x
+                or high.x < nodeLow.x
+                or low.y > nodeHigh.y
+                or high.y < nodeLow.y
+                or low.z > nodeHigh.z
+                or high.z < nodeLow.z
+              )
+            then
+              top += 1
+              stack[top] = rights[entry]
+              entry = lefts[entry]
+              continue
+            end
+          end
+
+          if top == 0 then break end
+
+          entry = stack[top]
+          top -= 1
+        end
+
+        for index = #near, count + 1, -1 do
+          near[index] = nil
+        end
+      end
+
+      for _, still in near do
+        tryPair(state, still, body)
+      end
+    end
+  end
+
+  -- Bodies wider than one grid cell stay out of the hash grid. Pair anything involving them
+  -- directly while they are few, and with a coherent X sweep when they are not. Small-small pairs
+  -- are skipped here because the grid already emitted them.
+  local largeCount = #large
+  if largeCount == 0 then return end
+
+  if largeCount <= state.directLargeThreshold then
+    for index = 1, largeCount do
+      local first = large[index]
+
+      for _, second in movers do
+        if second ~= first and (gridKey[second] or second > first) then tryPair(state, first, second) end
+      end
+    end
+
+    return
+  end
+
+  -- The sweep orders and prunes on every body's box, and a sphere's is not kept current as it
+  -- moves: the grid asks no more of a sphere than its centre.
+  local sphereRadius = state.sphereRadius
+
+  for _, body in movers do
+    if sphereRadius[body] then worlds.refreshBounds(state, body) end
+  end
+
+  sortOrder(state)
+  local {order, boundsLow, boundsHigh} = state
+  local count = #order
+
+  for position = 1, count do
+    local first = order[position]
+    if not alive[first] or bodyType[first] == 'static' then continue end
+
+    local reach = boundsHigh[first].x
+    local firstLarge = not gridKey[first]
+
+    for after = position + 1, count do
+      local second = order[after]
+      if not alive[second] or bodyType[second] == 'static' then continue end
+      if boundsLow[second].x > reach then break end
+      if firstLarge or not gridKey[second] then tryPair(state, first, second) end
+    end
+  end
+end
+
+--- Says which bodies are at rest, and keeps the contacts between two of them from the step
+--- before, where everything else's are found again. A body is at rest when it is static and has
+--- not been moved, or is asleep exactly where it was asleep at the last step: two such bodies
+--- touch as they did, so the pair is neither offered nor tested, however long a pile lies there.
+local function carryContacts(state: State, movers: { number })
+  local {rest, sleeping, position, turn: qv, turnW: qw, seenPosition: seenPos, seenTurn, seenTurnW} = state
+
+  local unseen = state.unseen
+  local stirring, unseenCount = 0, 0
+
+  for _, body in movers do
+    -- Awake: not at rest, and where it last slept is no longer where it sleeps.
+    if not sleeping[body] then
+      stirring += 1
+      if rest[body] then rest[body] = false end
+      if seenPos[body] then seenPos[body] = nil end
+
+      continue
+    end
+
+    local still = position[body] == seenPos[body] and qv[body] == seenTurn[body] and qw[body] == seenTurnW[body]
+
+    rest[body] = still
+
+    -- Asleep somewhere new: where is noted once what it touches there has been found.
+    if not still then
+      stirring += 1
+      unseenCount += 1
+      unseen[unseenCount] = body
+    end
+  end
+
+  for index = #unseen, unseenCount + 1, -1 do
+    unseen[index] = nil
+  end
+
+  state.stirring = stirring
+
+  -- Nothing stirred last step either, and nothing has been added, removed or moved since: the
+  -- contacts are last step's, all of them, as they lie.
+  if stirring == 0 and state.quiet and not state.changed then return true end
+
+  local {contactFirst: bodiesA, contactSecond: bodiesB, contactNormal: normals, contactPoint: points, contactDepth: depths} = state
+  local {normalImpulse: normalImpulses, tangentImpulse1: tangentImpulses1, tangentImpulse2: tangentImpulses2} = state
+  local kept, pairs, lastFirst, lastSecond = 0, 0, 0, 0
+
+  for contact = 1, state.contactCount do
+    local first, second = bodiesA[contact], bodiesB[contact]
+    if not (rest[first] and rest[second]) then continue end
+
+    kept += 1
+    bodiesA[kept], bodiesB[kept] = first, second
+    normals[kept], points[kept], depths[kept] = normals[contact], points[contact], depths[contact]
+    normalImpulses[kept], tangentImpulses1[kept], tangentImpulses2[kept] = 0, 0, 0
+
+    -- A pair's contacts are together, so a change of pair is one more pair.
+    if first ~= lastFirst or second ~= lastSecond then
+      pairs += 1
+      lastFirst, lastSecond = first, second
+    end
+  end
+
+  state.contactCount = kept
+  state.candidateCount = pairs
+  state.manifoldCount = pairs
+
+  return false
+end
+
+--- Notes where each sleeping body is, now that what it touches there is known, and takes the
+--- static bodies that had been moved to be at rest again.
+local function settle(state: State, movers: { number })
+  local {rest, position, turn: qv, turnW: qw, seenPosition: seenPos, seenTurn, seenTurnW, unsettled, alive, bodyType} = state
+
+  for _, body in state.unseen do
+    seenPos[body], seenTurn[body], seenTurnW[body] = position[body], qv[body], qw[body]
+  end
+
+  state.stillWasMoved = #unsettled > 0
+  if #unsettled == 0 then return end
+
+  for _, body in unsettled do
+    rest[body] = alive[body] and bodyType[body] == 'static'
+  end
+
+  table.clear(unsettled)
+end
+
+--- Finds every pair of bodies that touch, and what each pair touches: the world's contacts for
+--- this step.
+local function collide(state: State)
+  local movers = listMovers(state)
+
+  state.cacheEpoch += 1
+
+  if carryContacts(state, movers) then
+    state.stillWasMoved = false
+
+    return
+  end
+
+  if state.broadphase == 'sap' then
+    if state.stillDirty then rebuildStill(state) end
+
+    local rest = state.rest
+
+    for _, body in movers do
+      if not rest[body] then worlds.refreshBounds(state, body) end
+    end
+
+    collideSap(state)
+  else
+    collideGrid(state)
+  end
+
+  settle(state, movers)
+  state.quiet = state.stirring == 0
+  state.changed = false
+end
+
+broadphase.collide = collide
+broadphase.movers = listMovers
+broadphase.ensureQueryGrid = ensureQueryGrid
+
+return broadphase
