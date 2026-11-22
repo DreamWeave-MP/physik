@@ -22,8 +22,8 @@ local filter: string?, mode: string? = ...
 local only = if filter and filter ~= '' then filter else nil
 local printing = mode == 'results'
 
-type World = typeof(physik.newWorld())
-type Shape = typeof(physik.sphere(1))
+type World = physik.World
+type Shape = physik.Shape
 type Random = (low: number, high: number) -> number
 
 -- What every workload computes, as 0.3.2 computes it.
@@ -73,11 +73,19 @@ local Expected: { [string]: string } = {
   -- been taken out of it: these are as 0.4.0 computes them.
   ['level: 1,024 static boxes and nothing moving, 60 steps'] = '0 contacts, 0 candidates, 0 manifolds, 0 warm, 0 asleep, 0 islands, 0 swept, checksum 37482.222238540649',
   ['level: 48 boxes thrown among 1,024 static ones and taken out again, 60 steps'] = '2539 contacts, 64 candidates, 55 manifolds, 144 warm, 0 asleep, 45 islands, 0 swept, checksum 37672.436927226612',
+  ['level: 200 boxes thrown among 1,024 static ones and taken out again, 60 steps'] = '13451 contacts, 424 candidates, 292 manifolds, 602 warm, 0 asleep, 123 islands, 0 swept, checksum 35935.988151607206',
   ['level: 256 rays among 1,024 static boxes'] = '192 struck, 1575.0599460284282 far',
   ['level: 256 capsules swept among 1,024 static boxes'] = '142 met, 930.984696956682 far',
   ['level: a character run 240 steps among 1,024 static boxes'] = '240 grounded, at 29.093298554420471',
   ['level: 48 boxes asleep among 1,024 static ones, 60 steps'] = '10260 contacts, 62 candidates, 62 manifolds, 0 warm, 48 asleep, 45 islands, 0 swept, checksum 36474.9623625776',
 }
+
+--- What a ray or a sweep met, where a case expects it to have met something.
+local function met<Hit>(hit: Hit?): Hit
+  if not hit then error('expected to meet something, and met nothing', 2) end
+
+  return hit :: Hit
+end
 
 local function median(samples: { number }): number
   table.sort(samples)
@@ -153,7 +161,7 @@ local function rotation(random: Random)
 end
 
 local function weigh(value: vector): number
-  return value.X + 2 * value.Y + 3 * value.Z
+  return value.x + 2 * value.y + 3 * value.z
 end
 
 local transforms = {}
@@ -362,7 +370,7 @@ local function prisms(random: Random): (index: number) -> Shape
   end
 end
 
-local function overTerrain(terrain: Shape, broadphase: string, shapes: (random: Random) -> (index: number) -> Shape): World
+local function overTerrain(terrain: Shape, broadphase: 'grid' | 'sap', shapes: (random: Random) -> (index: number) -> Shape): World
   local random = generator(52)
   local world = physik.newWorld({ broadphase = broadphase, broadphaseCellSize = 1.5 })
   world:addBody({ type = 'static', shape = terrain })
@@ -486,7 +494,7 @@ workload('step: 60 chains of 8 links on distance, ball and hinge joints, 30 step
 end)
 
 --- 200 fast spheres, each swept from where it was, fired at what a discrete step would cross.
-local function barrage(options: { [string]: string | number }, terrain: boolean): string
+local function barrage(options: physik.WorldOptions, terrain: boolean): string
   local random = generator(81)
   local world = physik.newWorld(options)
 
@@ -595,23 +603,26 @@ end
 local rays = {}
 
 --- The hits of a batch of rays, drained as columns: how many, and what they hit and where.
-local function struck(count: number): string
-  local hits = #[for index in range(1, count) if rays.hit[index] => index]
+local function struck(columns: physik.RayColumns, count: number): string
+  local hits = #[for index in range(1, count) if columns.hit[index] => index]
 
   local total = sum[
-    for index in range(1, count) if rays.hit[index] =>
-      rays.distances[index] + weigh(rays.points[index]) + weigh(rays.normals[index]) * 3 + rays.userData[index] % 97
+    for index in range(1, count) if columns.hit[index] =>
+      columns.distances[index]
+        + weigh(columns.points[index])
+        + weigh(columns.normals[index]) * 3
+        + (columns.userData[index] :: number) % 97
   ]
 
   return `{hits} hits, checksum {pin(total)}`
 end
 
 workload('query: 2,048 rays in a batch, as columns', function(): string
-  return struck(select(2, crowd:raycastBatchSoA(origins, directions, reaches, nil, rays)))
+  return struck(crowd:raycastBatchSoA(origins, directions, reaches, nil, rays))
 end)
 
 workload('query: 2,048 rays in a batch, as columns, unbounded and downward', function(): string
-  return struck(select(2, crowd:raycastBatchSoA(origins, downward, nil, nil, rays)))
+  return struck(crowd:raycastBatchSoA(origins, downward, nil, nil, rays))
 end)
 
 local records = {}
@@ -619,7 +630,7 @@ local records = {}
 workload('query: 2,048 rays in a batch, as records', function(): string
   local batch = crowd:raycastBatch(origins, directions, reaches, nil, records)
   local hits = #[for index in range(1, batch.count) if batch[index] => index]
-  local total = sum[for index in range(1, batch.count) if batch[index] => batch[index].distance + weigh(batch[index].point)]
+  local total = sum[for index in range(1, batch.count) if batch[index] => met(batch[index]).distance + weigh(met(batch[index]).point)]
 
   return `{hits} hits, checksum {pin(total)}`
 end)
@@ -717,7 +728,7 @@ workload('drain: contacts of the pile, as columns', function(): string
 
   local total = sum[
     for index in range(1, count) =>
-      state.a[index] % 1048576 + state.b[index] % 1048576 * 3 + weigh(state.normals[index]) + weigh(state.points[index]) + state.penetration[index] + state.normalImpulse[index]
+      state.first[index] % 1048576 + state.second[index] % 1048576 * 3 + weigh(state.normals[index]) + weigh(state.points[index]) + state.penetration[index] + state.normalImpulse[index]
   ]
 
   return `{count} contacts, checksum {pin(total)}`
@@ -725,7 +736,7 @@ end)
 
 workload('drain: contacts of the pile, as records', function(): string
   local contacts = pile:contacts()
-  local total = sum[for contact in contacts => contact.a % 1048576 + weigh(contact.point) + contact.penetration + contact.normalImpulse]
+  local total = sum[for contact in contacts => contact.first % 1048576 + weigh(contact.point) + contact.penetration + contact.normalImpulse]
 
   return `{#contacts} contacts, checksum {pin(total)}`
 end)
@@ -735,7 +746,7 @@ local happened = {}
 workload('drain: contact events of the pile, without the ones that stay', function(): string
   local every = select(2, pile:writeContactEvents(happened))
   local state, count = pile:writeContactEvents(happened, false)
-  local total = sum[for index in range(1, count) => state.a[index] % 1048576 + state.b[index] % 1048576 * 3 + state.kind[index]]
+  local total = sum[for index in range(1, count) => state.first[index] % 1048576 + state.second[index] % 1048576 * 3 + state.kind[index]]
 
   return `{every} events, {count} that began or ended, checksum {total}`
 end)
@@ -747,20 +758,25 @@ workload('drain: stats of the pile', function(): string
 end)
 
 --- What a shape's accelerator holds, by walking it the way a query does.
-local function measured(shape): string
+local function measured(shape: physik.Mesh | physik.Heightfield): string
   local low, high = shape.localMin, shape.localMax
-  local chained = 0
+  local chained, overflowing = 0, 0
 
-  for _, head in shape.heads or {} do
-    local node = head
+  -- Only a mesh has a grid to walk.
+  if shape.kind == 'mesh' then
+    overflowing = #shape.overflow
 
-    while node ~= 0 do
-      chained += shape.nodeTri[node] + 1
-      node = shape.nextNode[node]
+    for _, head in shape.heads do
+      local node = head
+
+      while node ~= 0 do
+        chained += shape.nodeTriangle[node] + 1
+        node = shape.nextNode[node]
+      end
     end
   end
 
-  return `{pin(weigh(low) + weigh(high) * 3)} bounds, {chained} chained, {#(shape.overflow or {})} overflowing`
+  return `{pin(weigh(low) + weigh(high) * 3)} bounds, {chained} chained, {overflowing} overflowing`
 end
 
 workload('build: a mesh of 8,192 triangles from tables', function(): string
@@ -849,7 +865,7 @@ local function level(options): World
 
     for _ = 1, 3 do
       local half = vector.create(random(0.2, 1.2), random(0.5, 2), random(0.2, 1.2))
-      local rise = if room then 6 else half.Y
+      local rise = if room then 6 else half.y
 
       world:addBody({
         type = 'static',
@@ -899,6 +915,18 @@ do
     return result
   end)
 
+  -- A heap in the air: every piece near enough to most of the others to be offered them.
+  workload('level: 200 boxes thrown among 1,024 static ones and taken out again, 60 steps', function(): string
+    local thrown = throw(world, 200)
+    local result = run(world, 60)
+
+    for _, handle in thrown do
+      world:removeBody(handle)
+    end
+
+    return result
+  end)
+
   local random = generator(99)
   local origins = [for _ in range(1, 256) => vector.create(random(-7, 7), random(0.5, 3), random(-7, 7))]
   local directions = [for _ in range(1, 256) => vector.create(random(-1, 1), random(-0.3, 0.3), random(-1, 1))]
@@ -917,8 +945,8 @@ do
 
     for index = 1, 256 do
       local direction = directions[index]
-      local start = vector.create(origins[index].X, 0.95, origins[index].Z)
-      local hit = world:capsuleCast(start, start + vector.create(direction.X, 0, direction.Z) * 12, 0.4, 0.5)
+      local start = vector.create(origins[index].x, 0.95, origins[index].z)
+      local hit = world:capsuleCast(start, start + vector.create(direction.x, 0, direction.z) * 12, 0.4, 0.5)
 
       if hit then
         met += 1

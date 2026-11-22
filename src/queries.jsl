@@ -1,0 +1,1292 @@
+--!strict
+--!native
+-- Questions asked of a world: what a ray meets, what is in a box, what a sphere or a capsule
+-- swept from one place to another meets first, and what a capsule overlaps where it stands.
+-- Also the one thing a step asks the same way: where a body that is swept, so as to pass through
+-- nothing, is stopped.
+--
+-- The static bodies are asked through their tree, the bodies that can move through their grid,
+-- and a mesh through its own grid of triangles.
+local broadphase = require './broadphase'
+local cells = require './cells'
+local geometry = require './geometry'
+local shapes = require './shape'
+local types = require './types'
+local worlds = require './world'
+
+local queries = {}
+
+type State = worlds.State
+
+local Zero = vector.zero
+local Tiny = 1e-8
+local HandleStride = worlds.HandleStride
+
+-- A column, row or layer from here out has no cell.
+local Furthest = cells.Offset
+
+--- The triangles of a mesh or a heightfield body that a ball round `centre` could touch, in the
+--- world: three corners each, in `out`. Returns how many triangles.
+local function gatherTriangles(state: State, ground: number, centre: vector, reach: number, out: { vector }): number
+  local shape = state.shape[ground]
+  local at, turn, turnW = state.position[ground], state.turn[ground], state.turnW[ground]
+  local inside = geometry.unrotate(turn, turnW, centre - at)
+  local count = 0
+
+  if shape.kind == 'heightfield' then
+    local origin = shape.origin
+    local firstColumn = geometry.clamp(math.floor((inside.x - reach - origin.x) / shape.cellSizeX), 0, shape.width - 2)
+    local lastColumn = geometry.clamp(math.floor((inside.x + reach - origin.x) / shape.cellSizeX), 0, shape.width - 2)
+    local firstRow = geometry.clamp(math.floor((inside.z - reach - origin.z) / shape.cellSizeZ), 0, shape.depth - 2)
+    local lastRow = geometry.clamp(math.floor((inside.z + reach - origin.z) / shape.cellSizeZ), 0, shape.depth - 2)
+
+    for row = firstRow, lastRow do
+      for column = firstColumn, lastColumn do
+        local near, across = shapes.heightVertex(shape, column, row), shapes.heightVertex(shape, column + 1, row + 1)
+
+        out[count + 1], out[count + 2], out[count + 3] =
+          geometry.placeTriangle(at, turn, turnW, near, shapes.heightVertex(shape, column + 1, row), across)
+        out[count + 4], out[count + 5], out[count + 6] =
+          geometry.placeTriangle(at, turn, turnW, near, across, shapes.heightVertex(shape, column, row + 1))
+        count += 6
+      end
+    end
+
+    return count // 3
+  end
+
+  if shape.kind ~= 'mesh' then return 0 end
+
+  local each = vector.create(reach, reach, reach)
+  local listed = state.meshTriangles
+  local epoch = state.meshMarkEpoch + 1
+
+  state.meshMarkEpoch = epoch
+
+  for index = 1, shapes.trianglesIn(shape, inside - each, inside + each, state.meshQueryCellLimit, state.meshMarks, epoch, listed) do
+    local first, second, third = shapes.meshTriangle(shape, listed[index])
+
+    out[count + 1], out[count + 2], out[count + 3] = geometry.placeTriangle(at, turn, turnW, first, second, third)
+    count += 3
+  end
+
+  return count // 3
+end
+
+--- Sweeps a sphere at a mesh body: the fraction of the way at which they touch and the normal
+--- there, or nil and a filler.
+local function sweepSphereMesh(state: State, ground: number, start: vector, finish: vector, radius: number): (number?, vector)
+  local mesh = state.shape[ground] :: types.Mesh
+  local at, turn, turnW = state.position[ground], state.turn[ground], state.turnW[ground]
+  local from, to = geometry.unrotate(turn, turnW, start - at), geometry.unrotate(turn, turnW, finish - at)
+  local each = vector.create(radius, radius, radius)
+  local low = vector.create(math.min(from.x, to.x), math.min(from.y, to.y), math.min(from.z, to.z)) - each
+  local high = vector.create(math.max(from.x, to.x), math.max(from.y, to.y), math.max(from.z, to.z)) + each
+  local listed = state.meshTriangles
+  local epoch = state.meshMarkEpoch + 1
+  local nearest: number, facing: vector? = 1, nil
+
+  state.meshMarkEpoch = epoch
+
+  for index = 1, shapes.trianglesIn(mesh, low, high, state.meshQueryCellLimit, state.meshMarks, epoch, listed) do
+    local first, second, third = shapes.meshTriangle(mesh, listed[index])
+    local fraction, normal = geometry.sweepSphereAtTriangle(from, to, radius, first, second, third)
+
+    if fraction and fraction < nearest then
+      nearest, facing = fraction, normal
+    end
+  end
+
+  if not facing then return nil, Zero end
+
+  return nearest, geometry.rotate(turn, turnW, facing)
+end
+
+--- Sweeps a sphere at a heightfield body.
+local function sweepSphereHeightfield(state: State, ground: number, start: vector, finish: vector, radius: number): (number?, vector)
+  local field = state.shape[ground] :: types.Heightfield
+  local at, turn, turnW = state.position[ground], state.turn[ground], state.turnW[ground]
+  local from, to = geometry.unrotate(turn, turnW, start - at), geometry.unrotate(turn, turnW, finish - at)
+  local origin = field.origin
+  local firstColumn = geometry.clamp(math.floor((math.min(from.x, to.x) - radius - origin.x) / field.cellSizeX), 0, field.width - 2)
+  local lastColumn = geometry.clamp(math.floor((math.max(from.x, to.x) + radius - origin.x) / field.cellSizeX), 0, field.width - 2)
+  local firstRow = geometry.clamp(math.floor((math.min(from.z, to.z) - radius - origin.z) / field.cellSizeZ), 0, field.depth - 2)
+  local lastRow = geometry.clamp(math.floor((math.max(from.z, to.z) + radius - origin.z) / field.cellSizeZ), 0, field.depth - 2)
+  local nearest: number, facing: vector? = 1, nil
+
+  for row = firstRow, lastRow do
+    for column = firstColumn, lastColumn do
+      local near, across = shapes.heightVertex(field, column, row), shapes.heightVertex(field, column + 1, row + 1)
+      local fraction, normal = geometry.sweepSphereAtTriangle(from, to, radius, near, shapes.heightVertex(field, column + 1, row), across)
+
+      if fraction and fraction < nearest then
+        nearest, facing = fraction, normal
+      end
+
+      fraction, normal = geometry.sweepSphereAtTriangle(from, to, radius, near, across, shapes.heightVertex(field, column, row + 1))
+
+      if fraction and fraction < nearest then
+        nearest, facing = fraction, normal
+      end
+    end
+  end
+
+  if not facing then return nil, Zero end
+
+  return nearest, geometry.rotate(turn, turnW, facing)
+end
+
+--- Sweeps a sphere at a compound body: at each of its pieces.
+local function sweepSphereCompound(state: State, body: number, start: vector, finish: vector, radius: number): (number?, vector)
+  local compound = state.shape[body] :: types.Compound
+  local at, turn, turnW = state.position[body], state.turn[body], state.turnW[body]
+  local nearest: number, facing: vector? = 1, nil
+
+  for piece = 1, compound.count do
+    local pieceAt, pieceTurn, pieceTurnW =
+      geometry.placePiece(at, turn, turnW, compound.positions[piece], compound.turns[piece], compound.turnWs[piece])
+    local primitive = compound.shapes[piece]
+    local fraction, normal
+
+    if primitive.kind == 'sphere' then
+      fraction, normal = geometry.sweepSphereAtSphere(start, finish, radius, pieceAt, primitive.radius)
+    elseif primitive.kind == 'box' then
+      fraction, normal = geometry.sweepSphereAtBox(start, finish, radius, pieceAt, pieceTurn, pieceTurnW, primitive.halfExtents)
+    else
+      local from, to = geometry.capsuleEnds(pieceAt, pieceTurn, pieceTurnW, primitive.halfHeight)
+
+      fraction, normal = geometry.sweepSphereAtSegment(start, finish, radius + primitive.radius, from, to)
+    end
+
+    if fraction and fraction < nearest then
+      nearest, facing = fraction, normal
+    end
+  end
+
+  if not facing then return nil, Zero end
+
+  return nearest, facing
+end
+
+--- Where a ray meets a mesh body: how far along, the normal there and the point; or nil and
+--- fillers. The ray is taken into the mesh's own space, and only the triangles in the cells it
+--- passes are tried.
+local function rayMesh(state: State, ground: number, origin: vector, direction: vector, reach: number): (number?, vector, vector)
+  local mesh = state.shape[ground] :: types.Mesh
+  local turn, turnW = state.turn[ground], state.turnW[ground]
+  local from, along = geometry.unrotate(turn, turnW, origin - state.position[ground]), geometry.unrotate(turn, turnW, direction)
+  local enter, leave = geometry.rayThroughBox(from, along, reach, mesh.localMin, mesh.localMax)
+  if not enter then return nil, Zero, Zero end
+
+  local near, far = from + along * math.max(enter, 0), from + along * leave
+  local low = vector.create(math.min(near.x, far.x), math.min(near.y, far.y), math.min(near.z, far.z))
+  local high = vector.create(math.max(near.x, far.x), math.max(near.y, far.y), math.max(near.z, far.z))
+  local listed = state.meshTriangles
+  local epoch = state.meshMarkEpoch + 1
+  local nearest: number, struck: number? = reach, nil
+
+  state.meshMarkEpoch = epoch
+
+  for index = 1, shapes.trianglesIn(mesh, low, high, state.meshQueryCellLimit, state.meshMarks, epoch, listed) do
+    local triangle = listed[index]
+    local first, second, third = shapes.meshTriangle(mesh, triangle)
+    local distance = geometry.rayToTriangle(from, along, nearest, first, second, third)
+
+    if distance and distance < nearest then
+      nearest, struck = distance, triangle
+    end
+  end
+
+  if not struck then return nil, Zero, Zero end
+
+  local first, second, third = shapes.meshTriangle(mesh, struck)
+
+  return nearest, geometry.rotate(turn, turnW, geometry.triangleFacing(first, second, third, along)), origin + direction * nearest
+end
+
+--- Where a ray meets a heightfield body.
+local function rayHeightfield(state: State, ground: number, origin: vector, direction: vector, reach: number): (number?, vector, vector)
+  local field = state.shape[ground] :: types.Heightfield
+  local turn, turnW = state.turn[ground], state.turnW[ground]
+  local from, along = geometry.unrotate(turn, turnW, origin - state.position[ground]), geometry.unrotate(turn, turnW, direction)
+  local enter, leave = geometry.rayThroughBox(from, along, reach, field.localMin, field.localMax)
+  if not enter then return nil, Zero, Zero end
+
+  local near, far = from + along * math.max(enter, 0), from + along * leave
+  local base = field.origin
+  local firstColumn = geometry.clamp(math.floor((math.min(near.x, far.x) - base.x) / field.cellSizeX), 0, field.width - 2)
+  local lastColumn = geometry.clamp(math.floor((math.max(near.x, far.x) - base.x) / field.cellSizeX), 0, field.width - 2)
+  local firstRow = geometry.clamp(math.floor((math.min(near.z, far.z) - base.z) / field.cellSizeZ), 0, field.depth - 2)
+  local lastRow = geometry.clamp(math.floor((math.max(near.z, far.z) - base.z) / field.cellSizeZ), 0, field.depth - 2)
+  local nearest = reach
+  local struckFirst: vector?, struckSecond, struckThird = nil, Zero, Zero
+
+  for row = firstRow, lastRow do
+    for column = firstColumn, lastColumn do
+      local corner, across = shapes.heightVertex(field, column, row), shapes.heightVertex(field, column + 1, row + 1)
+      local beside = shapes.heightVertex(field, column + 1, row)
+      local distance = geometry.rayToTriangle(from, along, nearest, corner, beside, across)
+
+      if distance and distance < nearest then
+        nearest, struckFirst, struckSecond, struckThird = distance, corner, beside, across
+      end
+
+      local beyond = shapes.heightVertex(field, column, row + 1)
+
+      distance = geometry.rayToTriangle(from, along, nearest, corner, across, beyond)
+
+      if distance and distance < nearest then
+        nearest, struckFirst, struckSecond, struckThird = distance, corner, across, beyond
+      end
+    end
+  end
+
+  if not struckFirst then return nil, Zero, Zero end
+
+  local facing = geometry.triangleFacing(struckFirst, struckSecond, struckThird, along)
+
+  return nearest, geometry.rotate(turn, turnW, facing), origin + direction * nearest
+end
+
+--- Where a ray meets a compound body: the nearest of its pieces.
+local function rayCompound(state: State, body: number, origin: vector, direction: vector, reach: number): (number?, vector, vector)
+  local compound = state.shape[body] :: types.Compound
+  local at, turn, turnW = state.position[body], state.turn[body], state.turnW[body]
+  local nearest: number, facing: vector?, struck = reach, nil, Zero
+
+  for piece = 1, compound.count do
+    local pieceAt, pieceTurn, pieceTurnW =
+      geometry.placePiece(at, turn, turnW, compound.positions[piece], compound.turns[piece], compound.turnWs[piece])
+    local distance, normal, point = geometry.rayToPrimitive(compound.shapes[piece], pieceAt, pieceTurn, pieceTurnW, origin, direction, nearest)
+
+    if distance and distance < nearest then
+      nearest, facing, struck = distance, normal, point
+    end
+  end
+
+  if not facing then return nil, Zero, Zero end
+
+  return nearest, facing, struck
+end
+
+
+--- Whether a body's bounds reach into a box: a sphere's from its centre and radius, anything
+--- else's from the box last written for it.
+local function bodyOverlapsAabb(state: State, body: number, low: vector, high: vector): boolean
+  local radius = state.sphereRadius[body]
+
+  if radius then
+    local centre, reach = state.position[body], radius + state.contactMargin
+    if centre.x + reach < low.x or centre.x - reach > high.x then return false end
+    if centre.y + reach < low.y or centre.y - reach > high.y then return false end
+
+    return not (centre.z + reach < low.z or centre.z - reach > high.z)
+  end
+
+  local bodyLow, bodyHigh = state.boundsLow[body], state.boundsHigh[body]
+  if bodyHigh.x < low.x or bodyLow.x > high.x then return false end
+  if bodyHigh.y < low.y or bodyLow.y > high.y then return false end
+
+  return not (bodyHigh.z < low.z or bodyLow.z > high.z)
+end
+
+--- Writes the handle of every body that overlaps a box, each tested in turn. Returns how many.
+local function queryAabbScan(state: State, low: vector, high: vector, mask: number, out: { number }): number
+  local {alive, group, generation} = state
+  local count = 0
+
+  for body = 1, state.high do
+    if not alive[body] or bit32.band(mask, group[body]) == 0 then continue end
+    if not bodyOverlapsAabb(state, body, low, high) then continue end
+
+    count += 1
+    out[count] = generation[body] * HandleStride + body
+  end
+
+  return count
+end
+
+--- Writes the handle of every body that overlaps a box: the oversized ones, then the ones in a
+--- block of cells. Returns how many.
+local function queryAabbGrid(
+  state: State,
+  low: vector,
+  high: vector,
+  mask: number,
+  out: { number },
+  firstColumn: number,
+  lastColumn: number,
+  firstRow: number,
+  lastRow: number,
+  firstLayer: number,
+  lastLayer: number
+): number
+  local {alive, group, generation, gridHeads: heads, gridNext: nextIn, gridOccupied: occupied} = state
+  local count = 0
+
+  -- Oversized bodies are outside the grid and are normally few.
+  for _, body in state.gridLarge do
+    if alive[body] and bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(state, body, low, high) then
+      count += 1
+      out[count] = generation[body] * HandleStride + body
+    end
+  end
+
+  -- The static ones, through their tree.
+  local entry = state.stillRoot
+
+  if entry ~= 0 then
+    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = state
+    local top = 0
+
+    while true do
+      if entry < 0 then
+        local body = -entry
+
+        if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(state, body, low, high) then
+          count += 1
+          out[count] = generation[body] * HandleStride + body
+        end
+      else
+        local nodeLow, nodeHigh = lows[entry], highs[entry]
+
+        if
+          not (
+            low.x > nodeHigh.x
+            or high.x < nodeLow.x
+            or low.y > nodeHigh.y
+            or high.y < nodeLow.y
+            or low.z > nodeHigh.z
+            or high.z < nodeLow.z
+          )
+        then
+          top += 1
+          stack[top] = rights[entry]
+          entry = lefts[entry]
+          continue
+        end
+      end
+
+      if top == 0 then break end
+
+      entry = stack[top]
+      top -= 1
+    end
+  end
+
+  -- A grid with nothing in it has no cells to walk.
+  if state.gridSmallCount == 0 then return count end
+
+  -- Where every cell of the range can be packed, a cell's key is one more than the key before it.
+  local packable = firstColumn >= -Furthest
+    and lastColumn < Furthest
+    and firstRow >= -Furthest
+    and lastRow < Furthest
+    and firstLayer >= -Furthest
+    and lastLayer < Furthest
+
+  for column = firstColumn, lastColumn do
+    for row = firstRow, lastRow do
+      local start = if packable then cells.pack(column, row, firstLayer) else nil
+
+      for layer = firstLayer, lastLayer do
+        local key = if start then start + (layer - firstLayer) else cells.pack(column, row, layer)
+        if not key or buffer.readu8(occupied, key % worlds.GridFilterSize) == 0 then continue end
+
+        local body = heads[key] or 0
+
+        while body ~= 0 do
+          if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(state, body, low, high) then
+            count += 1
+            out[count] = generation[body] * HandleStride + body
+          end
+
+          body = nextIn[body] or 0
+        end
+      end
+    end
+  end
+
+  return count
+end
+
+function queries.queryAabb(state: State, low: vector, high: vector, groups: number?, into: { number }?): ({ number }, number)
+  assert(typeof(low) == 'vector' and typeof(high) == 'vector', 'physik.queryAabb: bounds must be vectors')
+
+  local mask = groups or 0xffffffff
+  local out: { number } = into or {}
+
+  broadphase.ensureQueryGrid(state)
+
+  -- Small bodies live in their center cell, but may extend into the immediately adjacent cell.
+  local cellSize = state.broadphaseCellSize
+  local firstColumn, lastColumn = math.floor(low.x / cellSize) - 1, math.floor(high.x / cellSize) + 1
+  local firstRow, lastRow = math.floor(low.y / cellSize) - 1, math.floor(high.y / cellSize) + 1
+  local firstLayer, lastLayer = math.floor(low.z / cellSize) - 1, math.floor(high.z / cellSize) + 1
+  local cells = (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1)
+  local count
+
+  if cells > state.queryAabbCellLimit then
+    count = queryAabbScan(state, low, high, mask, out)
+  else
+    count = queryAabbGrid(state, low, high, mask, out, firstColumn, lastColumn, firstRow, lastRow, firstLayer, lastLayer)
+  end
+
+  for index = #out, count + 1, -1 do
+    out[index] = nil
+  end
+
+  return out, count
+end
+
+--- Where a ray first meets one body, if it does within `reach` and the body's group is in `mask`.
+local function raycastBody(state: State, body: number, origin: vector, dir: vector, reach: number, mask: number): (number?, vector, vector)
+  if not state.alive[body] or bit32.band(mask, state.group[body]) == 0 then return nil, Zero, Zero end
+
+  -- A sphere's box is not kept current as it moves, and the sphere is as quick to test as a box.
+  local shape = state.shape[body]
+  if shape.kind == 'sphere' then return geometry.rayToSphere(origin, dir, reach, state.position[body], shape.radius) end
+  if not geometry.rayThroughBox(origin, dir, reach, state.boundsLow[body], state.boundsHigh[body]) then return nil, Zero, Zero end
+
+  local kind = shape.kind
+  if kind == 'mesh' then return rayMesh(state, body, origin, dir, reach) end
+  if kind == 'heightfield' then return rayHeightfield(state, body, origin, dir, reach) end
+  if kind == 'compound' then return rayCompound(state, body, origin, dir, reach) end
+
+  return geometry.rayToPrimitive(shape :: types.Primitive, state.position[body], state.turn[body], state.turnW[body], origin, dir, reach)
+end
+
+local function raycastRawScan(state: State, origin: vector, dir: vector, maxDistance: number, mask: number): (number?, number, vector?, vector?)
+  local bestDistance = maxDistance
+  local bestBody, bestNormal, bestPoint
+
+  for body = 1, state.high do
+    local distance, normal, point = raycastBody(state, body, origin, dir, bestDistance, mask)
+
+    if distance and distance < bestDistance then
+      bestDistance, bestBody, bestNormal, bestPoint = distance, body, normal, point
+    end
+  end
+
+  return bestBody, bestDistance, bestPoint, bestNormal
+end
+
+local function raycastRaw(state: State, origin: vector, direction: vector, reach: number?, groups: number?): (number?, number, vector?, vector?)
+  local maxDistance = reach or math.huge
+  local mask = groups or 0xffffffff
+  local lengthSquared = vector.dot(direction, direction)
+  if lengthSquared <= Tiny then return nil, 0, nil, nil end
+
+  local dir = direction / math.sqrt(lengthSquared)
+  broadphase.ensureQueryGrid(state)
+
+  -- Oversized bodies (world meshes, terrain, large compounds) are normally few. Test them first;
+  -- a world hit gives the grid walk a finite early-out distance even for an unbounded ray.
+  local bestDistance = maxDistance
+  local bestBody, bestNormal, bestPoint
+
+  for _, body in state.gridLarge do
+    local distance, normal, point = raycastBody(state, body, origin, dir, bestDistance, mask)
+
+    if distance and distance < bestDistance then
+      bestDistance, bestBody, bestNormal, bestPoint = distance, body, normal, point
+    end
+  end
+
+  -- The static ones, through their tree. Of two struck at one distance the lower slot is the
+  -- hit, as it was when they were tested in the order of their slots.
+  local entry = state.stillRoot
+
+  if entry ~= 0 then
+    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack, stillNear: nears} = state
+    local {boundsLow, boundsHigh} = state
+    local top = 0
+
+    -- The nearer half of a node first, so that what is struck there rules out the further half
+    -- before it is entered. A half no nearer than what has been struck is still entered when it
+    -- is exactly as near, for the body of a lower slot that may be in it.
+    while true do
+      if entry < 0 then
+        local distance, normal, point = raycastBody(state, -entry, origin, dir, bestDistance, mask)
+
+        if distance and (distance < bestDistance or (distance == bestDistance and bestBody and -entry < bestBody)) then
+          bestDistance, bestBody, bestNormal, bestPoint = distance, -entry, normal, point
+        end
+      else
+        local left, right = lefts[entry], rights[entry]
+        local leftAt = if left < 0
+          then geometry.rayThroughBox(origin, dir, bestDistance, boundsLow[-left], boundsHigh[-left])
+          else geometry.rayThroughBox(origin, dir, bestDistance, lows[left], highs[left])
+        local rightAt = if right < 0
+          then geometry.rayThroughBox(origin, dir, bestDistance, boundsLow[-right], boundsHigh[-right])
+          else geometry.rayThroughBox(origin, dir, bestDistance, lows[right], highs[right])
+
+        if leftAt and rightAt then
+          if rightAt < leftAt then
+            left, right, leftAt, rightAt = right, left, rightAt, leftAt
+          end
+
+          top += 1
+          stack[top], nears[top] = right, rightAt
+          entry = left
+          continue
+        elseif leftAt or rightAt then
+          entry = if leftAt then left else right
+          continue
+        end
+      end
+
+      while top > 0 and nears[top] > bestDistance do
+        top -= 1
+      end
+
+      if top == 0 then break end
+
+      entry = stack[top]
+      top -= 1
+    end
+  end
+
+  if state.gridSmallCount == 0 then return bestBody, bestDistance, bestPoint, bestNormal end
+
+  -- If the ray is effectively unbounded and oversized geometry did not cap it, a DDA could walk
+  -- forever. Fall back to the linear scan in that unusual case.
+  if bestDistance == math.huge then return raycastRawScan(state, origin, dir, maxDistance, mask) end
+
+  local cellSize = state.broadphaseCellSize
+  local estimated = (math.abs(dir.x) + math.abs(dir.y) + math.abs(dir.z)) * bestDistance / cellSize + 3
+  if estimated > state.queryRayCellLimit then return raycastRawScan(state, origin, dir, maxDistance, mask) end
+
+  local epoch = state.queryMarkEpoch + 1
+  state.queryMarkEpoch = epoch
+
+  local {queryMarks: marks, gridHeads: heads, gridNext: nextIn, gridOccupied: occupied} = state
+  local column, row, layer = math.floor(origin.x / cellSize), math.floor(origin.y / cellSize), math.floor(origin.z / cellSize)
+
+  -- An origin that is not a number is in no cell, so nothing in the grid is in the ray's way, and
+  -- a cell that is not a number has no byte in the filter to ask for.
+  if column ~= column or row ~= row or layer ~= layer then return bestBody, bestDistance, bestPoint, bestNormal end
+
+  local stepX = if dir.x > Tiny then 1 elseif dir.x < -Tiny then -1 else 0
+  local stepY = if dir.y > Tiny then 1 elseif dir.y < -Tiny then -1 else 0
+  local stepZ = if dir.z > Tiny then 1 elseif dir.z < -Tiny then -1 else 0
+  local spanX = if stepX ~= 0 then cellSize / math.abs(dir.x) else math.huge
+  local spanY = if stepY ~= 0 then cellSize / math.abs(dir.y) else math.huge
+  local spanZ = if stepZ ~= 0 then cellSize / math.abs(dir.z) else math.huge
+  local wallX = if stepX > 0 then (column + 1) * cellSize else column * cellSize
+  local wallY = if stepY > 0 then (row + 1) * cellSize else row * cellSize
+  local wallZ = if stepZ > 0 then (layer + 1) * cellSize else layer * cellSize
+  local nextX = if stepX ~= 0 then (wallX - origin.x) / dir.x else math.huge
+  local nextY = if stepY ~= 0 then (wallY - origin.y) / dir.y else math.huge
+  local nextZ = if stepZ ~= 0 then (wallZ - origin.z) / dir.z else math.huge
+  if nextX < 0 then nextX = 0 end
+  if nextY < 0 then nextY = 0 end
+  if nextZ < 0 then nextZ = 0 end
+
+  -- How far the neighbourhood moved along each axis since it was last scanned. Three is further
+  -- than a step moves it, so the first scan leaves nothing out.
+  local movedX, movedY, movedZ = 3, 3, 3
+  local travelled = 0
+
+  while travelled <= bestDistance do
+    -- Small bodies are stored by center cell while their AABB may touch an adjacent cell, so the
+    -- 3x3x3 neighbourhood is probed. A cell that was in the neighbourhood probed before this one
+    -- holds only bodies already tested, and is left out.
+    for offsetX = -1, 1 do
+      local seenX = math.abs(offsetX + movedX) <= 1
+
+      for offsetY = -1, 1 do
+        local seenXY = seenX and math.abs(offsetY + movedY) <= 1
+        if seenXY and movedZ == 0 then continue end
+
+        for offsetZ = -1, 1 do
+          if seenXY and math.abs(offsetZ + movedZ) <= 1 then continue end
+
+          local key = cells.pack(column + offsetX, row + offsetY, layer + offsetZ)
+          if not key or buffer.readu8(occupied, key % worlds.GridFilterSize) == 0 then continue end
+
+          local body = heads[key] or 0
+
+          while body ~= 0 do
+            if marks[body] ~= epoch then
+              marks[body] = epoch
+              local distance, normal, point = raycastBody(state, body, origin, dir, bestDistance, mask)
+
+              if distance and distance < bestDistance then
+                bestDistance, bestBody, bestNormal, bestPoint = distance, body, normal, point
+              end
+            end
+
+            body = nextIn[body] or 0
+          end
+        end
+      end
+    end
+
+    local nextDistance = math.min(nextX, nextY, nextZ)
+    if nextDistance > bestDistance or nextDistance == math.huge then break end
+
+    local edge = nextDistance + 1e-12
+    movedX, movedY, movedZ = 0, 0, 0
+
+    if nextX <= edge then
+      column += stepX
+      nextX += spanX
+      movedX = stepX
+    end
+
+    if nextY <= edge then
+      row += stepY
+      nextY += spanY
+      movedY = stepY
+    end
+
+    if nextZ <= edge then
+      layer += stepZ
+      nextZ += spanZ
+      movedZ = stepZ
+    end
+
+    travelled = nextDistance
+  end
+
+  return bestBody, bestDistance, bestPoint, bestNormal
+end
+
+--- Sweeps a sphere from one place to another. Returns the slot of what it met first, the
+--- fraction of the way it got, the normal there and where its centre then is; or nil and fillers.
+local function sphereCastRaw(
+  state: State,
+  start: vector,
+  finish: vector,
+  radius: number,
+  groups: number?,
+  ignoreHandle: number?
+): (number?, number, vector, vector)
+  assert(
+    typeof(start) == 'vector' and typeof(finish) == 'vector' and type(radius) == 'number' and radius > 0,
+    'physik.sphereCast: expected start/end vectors and radius > 0'
+  )
+
+  local ignored = if ignoreHandle then worlds.slotOf(state, ignoreHandle) else nil
+  local each = vector.create(radius, radius, radius)
+  local low = vector.create(math.min(start.x, finish.x), math.min(start.y, finish.y), math.min(start.z, finish.z)) - each
+  local high = vector.create(math.max(start.x, finish.x), math.max(start.y, finish.y), math.max(start.z, finish.z)) + each
+  local handles, count = queries.queryAabb(state, low, high, groups, state.castCandidates)
+  local {shape, position, turn, turnW} = state
+  local nearest: number, facing, met: number? = 1, Zero, nil
+
+  state.castCandidates = handles
+
+  for index = 1, count do
+    -- A handle the query has just written is current, and its low bits are the body's slot.
+    local body = handles[index] % HandleStride
+    if body == ignored then continue end
+
+    local target = shape[body]
+    local fraction, normal
+
+    if target.kind == 'sphere' then
+      fraction, normal = geometry.sweepSphereAtSphere(start, finish, radius, position[body], target.radius)
+    elseif target.kind == 'box' then
+      fraction, normal = geometry.sweepSphereAtBox(start, finish, radius, position[body], turn[body], turnW[body], target.halfExtents)
+    elseif target.kind == 'capsule' then
+      local from, to = geometry.capsuleEnds(position[body], turn[body], turnW[body], target.halfHeight)
+
+      fraction, normal = geometry.sweepSphereAtSegment(start, finish, radius + target.radius, from, to)
+    elseif target.kind == 'mesh' then
+      fraction, normal = sweepSphereMesh(state, body, start, finish, radius)
+    elseif target.kind == 'heightfield' then
+      fraction, normal = sweepSphereHeightfield(state, body, start, finish, radius)
+    else
+      fraction, normal = sweepSphereCompound(state, body, start, finish, radius)
+    end
+
+    if fraction and fraction < nearest then
+      nearest, facing, met = fraction, normal, body
+    end
+  end
+
+  if not met then return nil, 1, Zero, Zero end
+
+  return met, nearest, facing, start + (finish - start) * nearest
+end
+
+export type CastHit = {
+  handle: number,
+  fraction: number,
+  distance: number,
+  center: vector,
+  point: vector,
+  normal: vector,
+  userData: unknown,
+}
+
+--- Sweeps a sphere from one place to another. Returns nil when nothing is in the way, and
+--- otherwise what was met first: where the sphere's centre is when they touch, the point on what
+--- was met, and the normal there, which points at the sphere. A sphere that starts touching
+--- something is not stopped by it.
+function queries.sphereCast(state: State, start: vector, finish: vector, radius: number, mask: number?, ignoreHandle: number?): CastHit?
+  local body, fraction, normal, centre = sphereCastRaw(state, start, finish, radius, mask, ignoreHandle)
+  if not body then return nil end
+
+  return {
+    handle = worlds.handleOf(state, body),
+    fraction = fraction,
+    distance = vector.magnitude(finish - start) * fraction,
+    center = centre,
+    point = centre - normal * radius,
+    normal = normal,
+    userData = state.userData[body],
+  }
+end
+
+--- Many sweeps answered as columns, a row to each: `hit` says whether a row met anything, and
+--- the other columns are empty where it did not.
+export type CastColumns = {
+  hit: { boolean },
+  handles: { number },
+  fractions: { number },
+  distances: { number },
+  centers: { vector },
+  points: { vector },
+  normals: { vector },
+  userData: { [number]: unknown },
+  count: number,
+}
+
+--- The columns a caller hands back to be filled again, or new ones. A caller may hand in any
+--- table, its own empty one included, so what it holds is not known until it is looked at.
+local function castColumns(into: unknown): CastColumns
+  local given = (if type(into) == 'table' then into else {}) :: { [string]: unknown }
+
+  given.hit = given.hit or {}
+  given.handles = given.handles or {}
+  given.fractions = given.fractions or {}
+  given.distances = given.distances or {}
+  given.centers = given.centers or {}
+  given.points = given.points or {}
+  given.normals = given.normals or {}
+  given.userData = given.userData or {}
+  given.count = given.count or 0
+
+  return (given :: unknown) :: CastColumns
+end
+
+--- Sweeps many spheres, into columns that are kept between calls. `radii` is one radius for all
+--- or a list; `masks` and `ignoreHandles` are lists or nothing.
+function queries.sphereCastBatchSoA(
+  state: State,
+  starts: { vector },
+  finishes: { vector },
+  radii: number | { number },
+  masks: { number }?,
+  ignoreHandles: { number }?,
+  into: unknown
+): (CastColumns, number)
+  assert(
+    type(starts) == 'table' and type(finishes) == 'table' and #starts == #finishes,
+    'physik.sphereCastBatchSoA: starts and ends must be equal-length arrays'
+  )
+
+  local out = castColumns(into)
+  local {hit, handles, fractions, distances, centers, points, normals, userData} = out
+  local count = #starts
+
+  for row = 1, count do
+    local radius = if type(radii) == 'table' then radii[row] else radii
+    local start, finish = starts[row], finishes[row]
+    local body, fraction, normal, centre = sphereCastRaw(
+      state, start, finish, radius, if masks then masks[row] else nil, if ignoreHandles then ignoreHandles[row] else nil
+    )
+
+    if body then
+      hit[row], handles[row], fractions[row] = true, worlds.handleOf(state, body), fraction
+      distances[row], centers[row] = vector.magnitude(finish - start) * fraction, centre
+      points[row], normals[row], userData[row] = centre - normal * radius, normal, state.userData[body]
+    else
+      hit[row], handles[row], fractions[row], distances[row] = false, nil, nil, nil
+      centers[row], points[row], normals[row], userData[row] = nil, nil, nil, nil
+    end
+  end
+
+  for row = count + 1, out.count do
+    hit[row], handles[row], fractions[row], distances[row] = nil, nil, nil, nil
+    centers[row], points[row], normals[row], userData[row] = nil, nil, nil, nil
+  end
+
+  out.count = count
+
+  return out, count
+end
+
+--- Sweeps an upright capsule at the bodies a box query has just answered with, which is how
+--- something that sweeps several times in one place, as a character does, asks the world once.
+--- `ignored` is a slot, not a handle. Returns as a sphere's sweep does, but the last is the point
+--- on what was met.
+function queries.capsuleCastAmong(
+  state: State,
+  handles: { number },
+  count: number,
+  start: vector,
+  motion: vector,
+  length: number,
+  radius: number,
+  halfHeight: number,
+  ignored: number?
+): (number?, number, vector, vector)
+  local {shape, position, turn, turnW, boundsLow, boundsHigh, castTriangles: triangles} = state
+  local reach = vector.create(radius, halfHeight + radius, radius)
+  local heading = motion / length
+  local nearest: number, facing, struck, met: number? = 1, Zero, Zero, nil
+
+  for index = 1, count do
+    -- A handle the query has just written is current, and its low bits are the body's slot.
+    local body = handles[index] % HandleStride
+    if body == ignored then continue end
+
+    local target = shape[body]
+    local fraction: number?, normal, point = nil, Zero, Zero
+
+    -- The capsule's centre has to come within the capsule's own reach of a body's box, and
+    -- sooner than what has been met already. A sphere's box is not kept as it moves.
+    if
+      target.kind ~= 'sphere'
+      and not geometry.rayThroughBox(start, heading, length * nearest, boundsLow[body] - reach, boundsHigh[body] + reach)
+    then
+      continue
+    end
+
+    if target.kind == 'mesh' or target.kind == 'heightfield' then
+      local gathered = gatherTriangles(state, body, start + motion * 0.5, length * 0.5 + halfHeight + radius, triangles)
+
+      for corner = 1, gathered * 3, 3 do
+        local nearer, normalThere, pointThere = geometry.sweepCapsule(
+          radius,
+          halfHeight,
+          start,
+          motion,
+          length,
+          fraction or nearest,
+          nil,
+          Zero,
+          Zero,
+          1,
+          triangles[corner],
+          triangles[corner + 1],
+          triangles[corner + 2]
+        )
+
+        if nearer then
+          fraction, normal, point = nearer, normalThere, pointThere
+        end
+      end
+    elseif target.kind == 'compound' then
+      local at, bodyTurn, bodyTurnW = position[body], turn[body], turnW[body]
+
+      for piece = 1, target.count do
+        local pieceAt, pieceTurn, pieceTurnW =
+          geometry.placePiece(at, bodyTurn, bodyTurnW, target.positions[piece], target.turns[piece], target.turnWs[piece])
+        local nearer, normalThere, pointThere = geometry.sweepCapsule(
+          radius, halfHeight, start, motion, length, fraction or nearest, target.shapes[piece], pieceAt, pieceTurn, pieceTurnW, Zero, Zero, Zero
+        )
+
+        if nearer then
+          fraction, normal, point = nearer, normalThere, pointThere
+        end
+      end
+    else
+      fraction, normal, point = geometry.sweepCapsule(
+        radius, halfHeight, start, motion, length, nearest, target, position[body], turn[body], turnW[body], Zero, Zero, Zero
+      )
+    end
+
+    if fraction and fraction < nearest then
+      nearest, facing, struck, met = fraction, normal, point, body
+    end
+  end
+
+  if not met then return nil, 1, Zero, Zero end
+
+  return met, nearest, facing, struck
+end
+
+--- Sweeps an upright capsule from one place to another. Returns as `capsuleCastAmong` does.
+local function capsuleCastRaw(
+  state: State,
+  start: vector,
+  finish: vector,
+  radius: number,
+  halfHeight: number,
+  groups: number?,
+  ignoreHandle: number?
+): (number?, number, vector, vector)
+  assert(
+    typeof(start) == 'vector'
+      and typeof(finish) == 'vector'
+      and type(radius) == 'number'
+      and radius > 0
+      and type(halfHeight) == 'number'
+      and halfHeight >= 0,
+    'physik.capsuleCast: expected start/end vectors, radius > 0 and half height >= 0'
+  )
+
+  local motion = finish - start
+  local length = vector.magnitude(motion)
+  if not (length > Tiny) then return nil, 1, Zero, Zero end
+
+  local ignored = if ignoreHandle then worlds.slotOf(state, ignoreHandle) else nil
+  local reach = vector.create(radius, halfHeight + radius, radius)
+  local handles, count =
+    queries.queryAabb(state, vector.min(start, finish) - reach, vector.max(start, finish) + reach, groups, state.castCandidates)
+
+  state.castCandidates = handles
+
+  return queries.capsuleCastAmong(state, handles, count, start, motion, length, radius, halfHeight, ignored)
+end
+
+--- Sweeps an upright capsule, its axis along Y, from one place to another. `radius` is the
+--- capsule's and `halfHeight` is half the length of its axis, as `physik.capsule` takes them.
+--- Returns nil when nothing is in the way, and otherwise what was met first: where the capsule's
+--- centre is when they touch, the point on what was met, and the normal there, which points at the
+--- capsule. A capsule that starts inside something meets it at a fraction of 0, unless it is on
+--- its way out.
+function queries.capsuleCast(
+  state: State,
+  start: vector,
+  finish: vector,
+  radius: number,
+  halfHeight: number,
+  mask: number?,
+  ignoreHandle: number?
+): CastHit?
+  local body, fraction, normal, point = capsuleCastRaw(state, start, finish, radius, halfHeight, mask, ignoreHandle)
+  if not body then return nil end
+
+  local motion = finish - start
+
+  return {
+    handle = worlds.handleOf(state, body),
+    fraction = fraction,
+    distance = vector.magnitude(motion) * fraction,
+    center = start + motion * fraction,
+    point = point,
+    normal = normal,
+    userData = state.userData[body],
+  }
+end
+
+--- What a capsule overlaps, as columns: what, the normal that points at the capsule, how deep,
+--- and where.
+export type Overlaps = {
+  handles: { number },
+  normals: { vector },
+  depths: { number },
+  points: { vector },
+  count: number,
+}
+
+--- The columns a caller hands back to be filled again, or new ones: any table will do.
+local function overlapColumns(into: unknown): Overlaps
+  local given = (if type(into) == 'table' then into else {}) :: { [string]: unknown }
+
+  given.handles = given.handles or {}
+  given.normals = given.normals or {}
+  given.depths = given.depths or {}
+  given.points = given.points or {}
+  given.count = given.count or 0
+
+  return (given :: unknown) :: Overlaps
+end
+
+--- What an upright capsule overlaps of the bodies a box query has just answered with. `ignored`
+--- is a slot, not a handle. Returns as `capsuleContacts` does.
+function queries.capsuleContactsAmong(
+  state: State,
+  found: { number },
+  count: number,
+  at: vector,
+  radius: number,
+  halfHeight: number,
+  ignored: number?,
+  into: unknown
+): (Overlaps, number)
+  local {shape, position, turn, turnW, castCapsule: capsule, castTriangles: triangles} = state
+  local out = overlapColumns(into)
+  local {handles, normals, depths, points} = out
+  local rows = 0
+
+  capsule.radius, capsule.halfHeight = radius, halfHeight
+
+  for index = 1, count do
+    local handle = found[index]
+    local body = handle % HandleStride
+    if body == ignored then continue end
+
+    local target = shape[body]
+
+    if target.kind == 'mesh' or target.kind == 'heightfield' then
+      for corner = 1, gatherTriangles(state, body, at, halfHeight + radius, triangles) * 3, 3 do
+        local met, normal, point, depth = geometry.capsuleOnTriangle(
+          at, Zero, 1, radius, halfHeight, triangles[corner], triangles[corner + 1], triangles[corner + 2], 0
+        )
+
+        if met and depth > 0 then
+          rows += 1
+          handles[rows], normals[rows], depths[rows], points[rows] = handle, Zero - normal, depth, point
+        end
+      end
+    elseif target.kind == 'compound' then
+      local bodyAt, bodyTurn, bodyTurnW = position[body], turn[body], turnW[body]
+
+      for piece = 1, target.count do
+        local pieceAt, pieceTurn, pieceTurnW =
+          geometry.placePiece(bodyAt, bodyTurn, bodyTurnW, target.positions[piece], target.turns[piece], target.turnWs[piece])
+        local met, normal, point, depth =
+          geometry.primitiveOnPrimitive(capsule, at, Zero, 1, target.shapes[piece], pieceAt, pieceTurn, pieceTurnW, 0)
+
+        if met and depth > 0 then
+          rows += 1
+          handles[rows], normals[rows], depths[rows], points[rows] = handle, Zero - normal, depth, point
+        end
+      end
+    else
+      local met, normal, point, depth =
+        geometry.primitiveOnPrimitive(capsule, at, Zero, 1, target, position[body], turn[body], turnW[body], 0)
+
+      if met and depth > 0 then
+        rows += 1
+        handles[rows], normals[rows], depths[rows], points[rows] = handle, Zero - normal, depth, point
+      end
+    end
+  end
+
+  for index = #handles, rows + 1, -1 do
+    handles[index], normals[index], depths[index], points[index] = nil, nil, nil, nil
+  end
+
+  out.count = rows
+
+  return out, rows
+end
+
+--- Writes what an upright capsule at `at` overlaps as columns of `into`: `handles`, `normals`,
+--- which point at the capsule, `depths` and `points`. A mesh or a heightfield gives one row for
+--- each triangle touched, and a compound one for each piece. Returns the columns and how many.
+function queries.capsuleContacts(
+  state: State,
+  at: vector,
+  radius: number,
+  halfHeight: number,
+  mask: number?,
+  ignoreHandle: number?,
+  into: unknown
+): (Overlaps, number)
+  assert(
+    typeof(at) == 'vector' and type(radius) == 'number' and radius > 0 and type(halfHeight) == 'number' and halfHeight >= 0,
+    'physik.capsuleContacts: expected a position vector, radius > 0 and half height >= 0'
+  )
+
+  local ignored = if ignoreHandle then worlds.slotOf(state, ignoreHandle) else nil
+  local reach = vector.create(radius, halfHeight + radius, radius)
+  local found, count = queries.queryAabb(state, at - reach, at + reach, mask, state.castCandidates)
+
+  state.castCandidates = found
+
+  return queries.capsuleContactsAmong(state, found, count, at, radius, halfHeight, ignored, into)
+end
+
+export type RayHit = { handle: number, distance: number, point: vector, normal: vector, userData: unknown }
+
+--- What a ray meets first, no further than `reach` along it: nil when nothing. `direction` need
+--- not be of length one.
+function queries.raycast(state: State, origin: vector, direction: vector, reach: number?, mask: number?): RayHit?
+  local body, distance, point, normal = raycastRaw(state, origin, direction, reach, mask)
+  if not body or not point or not normal then return nil end
+
+  return { handle = worlds.handleOf(state, body), distance = distance, point = point, normal = normal, userData = state.userData[body] }
+end
+
+--- Many rays answered as a list of hits, nil where a ray met nothing, with how many rays there
+--- were as `count`. The list and its hits are kept between calls.
+export type RayHits = { [number]: RayHit?, count: number }
+
+function queries.raycastBatch(
+  state: State,
+  origins: { vector },
+  directions: { vector },
+  reaches: { number }?,
+  masks: { number }?,
+  into: unknown
+): RayHits
+  assert(
+    type(origins) == 'table' and type(directions) == 'table' and #origins == #directions,
+    'physik.raycastBatch: origins and directions must be equal-length arrays'
+  )
+
+  local out = ((if type(into) == 'table' then into else {}) :: unknown) :: RayHits
+  local count = #origins
+  local before = out.count or #out
+
+  for row = 1, count do
+    local body, distance, point, normal =
+      raycastRaw(state, origins[row], directions[row], if reaches then reaches[row] else nil, if masks then masks[row] else nil)
+
+    if not body or not point or not normal then
+      out[row] = nil
+      continue
+    end
+
+    local hit = out[row]
+
+    if hit then
+      hit.handle, hit.distance, hit.point, hit.normal = worlds.handleOf(state, body), distance, point, normal
+      hit.userData = state.userData[body]
+    else
+      out[row] =
+        { handle = worlds.handleOf(state, body), distance = distance, point = point, normal = normal, userData = state.userData[body] }
+    end
+  end
+
+  for row = count + 1, before do
+    out[row] = nil
+  end
+
+  out.count = count
+
+  return out
+end
+
+--- Many rays answered as columns, a row to each: `hit` says whether a ray met anything, and the
+--- other columns are empty where it did not.
+export type RayColumns = {
+  hit: { boolean },
+  handles: { number },
+  distances: { number },
+  points: { vector },
+  normals: { vector },
+  userData: { [number]: unknown },
+  count: number,
+}
+
+--- The columns a caller hands back to be filled again, or new ones: any table will do.
+local function rayColumns(into: unknown): RayColumns
+  local given = (if type(into) == 'table' then into else {}) :: { [string]: unknown }
+
+  given.hit = given.hit or {}
+  given.handles = given.handles or {}
+  given.distances = given.distances or {}
+  given.points = given.points or {}
+  given.normals = given.normals or {}
+  given.userData = given.userData or {}
+  given.count = given.count or 0
+
+  return (given :: unknown) :: RayColumns
+end
+
+function queries.raycastBatchSoA(
+  state: State,
+  origins: { vector },
+  directions: { vector },
+  reaches: { number }?,
+  masks: { number }?,
+  into: unknown
+): (RayColumns, number)
+  assert(
+    type(origins) == 'table' and type(directions) == 'table' and #origins == #directions,
+    'physik.raycastBatchSoA: origins and directions must be equal-length arrays'
+  )
+
+  local out = rayColumns(into)
+  local {hit, handles, distances, points, normals, userData} = out
+  local count = #origins
+
+  for row = 1, count do
+    local body, distance, point, normal =
+      raycastRaw(state, origins[row], directions[row], if reaches then reaches[row] else nil, if masks then masks[row] else nil)
+
+    if body then
+      hit[row], handles[row], distances[row] = true, worlds.handleOf(state, body), distance
+      points[row], normals[row], userData[row] = point, normal, state.userData[body]
+    else
+      hit[row], handles[row], distances[row] = false, nil, nil
+      points[row], normals[row], userData[row] = nil, nil, nil
+    end
+  end
+
+  for row = count + 1, out.count do
+    hit[row], handles[row], distances[row] = nil, nil, nil
+    points[row], normals[row], userData[row] = nil, nil, nil
+  end
+
+  out.count = count
+
+  return out, count
+end
+
+--- Stops the bodies that are swept where they first meet something, so that one moving fast
+--- passes through nothing: only spheres, and only against what is not dynamic. A body that is
+--- stopped is put a little short of what it met, and bounces off it.
+function queries.sweepBodies(state: State)
+  state.sweptHits = 0
+  if state.sweptCount == 0 then return end
+
+  local {alive, bodyType, sleeping, swept, shape, position, previousPosition, turn, turnW, velocity, mask, group, restitution} = state
+
+  for body = 1, state.high do
+    if not alive[body] or bodyType[body] ~= 'dynamic' or sleeping[body] or not swept[body] then continue end
+
+    local sphere = shape[body]
+    if sphere.kind ~= 'sphere' then continue end
+
+    local start, finish = previousPosition[body], position[body]
+    local motion = finish - start
+    local squared = vector.dot(motion, motion)
+    if squared <= Tiny then continue end
+
+    local radius = sphere.radius
+    local nearest: number, facing: vector?, met = 1, nil, 0
+
+    for other = 1, state.high do
+      if other == body or not alive[other] or bodyType[other] == 'dynamic' then continue end
+      if bit32.band(mask[body], group[other]) == 0 or bit32.band(mask[other], group[body]) == 0 then continue end
+
+      local target = shape[other]
+      local fraction: number?, normal = nil, Zero
+
+      if target.kind == 'sphere' then
+        fraction, normal = geometry.sweepSphereAtSphere(start, finish, radius, position[other], target.radius)
+      elseif target.kind == 'box' then
+        fraction, normal = geometry.sweepSphereAtBox(start, finish, radius, position[other], turn[other], turnW[other], target.halfExtents)
+      elseif target.kind == 'mesh' then
+        fraction, normal = sweepSphereMesh(state, other, start, finish, radius)
+      elseif target.kind == 'heightfield' then
+        fraction, normal = sweepSphereHeightfield(state, other, start, finish, radius)
+      elseif target.kind == 'compound' then
+        fraction, normal = sweepSphereCompound(state, other, start, finish, radius)
+      end
+
+      if fraction and fraction < nearest then
+        nearest, facing, met = fraction, normal, other
+      end
+    end
+
+    if not facing then continue end
+
+    local length = math.sqrt(squared)
+    local short = if length > Tiny then math.min(state.ccdSlop / length, nearest) else 0
+    local closing = vector.dot(velocity[body], facing)
+
+    position[body] = start + motion * (nearest - short)
+
+    if closing < 0 then
+      velocity[body] -= facing * (closing * (1 + math.max(restitution[body], restitution[met])))
+    end
+
+    state.sweptHits += 1
+  end
+end
+
+queries.raycastRaw = raycastRaw
+
+return queries

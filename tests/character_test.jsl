@@ -6,6 +6,13 @@ local suite = test.new()
 
 local Step = 1 / 60
 
+--- What a ray or a sweep met, where a case expects it to have met something.
+local function met<Hit>(hit: Hit?): Hit
+  if not hit then error('expected to meet something, and met nothing', 2) end
+
+  return hit :: Hit
+end
+
 local function near(actual: number, expected: number, tolerance: number?)
   local allowed = tolerance or 5e-3
   if math.abs(actual - expected) <= allowed then return end
@@ -13,7 +20,7 @@ local function near(actual: number, expected: number, tolerance: number?)
   error(`expected {actual} to be within {allowed} of {expected}`, 2)
 end
 
-local function box(world, half: vector, position: vector, rotation: any?)
+local function box(world: physik.World, half: vector, position: vector, rotation: physik.Rotation?)
   return world:addBody({ type = 'static', shape = physik.box(half), position = position, rotation = rotation })
 end
 
@@ -41,21 +48,21 @@ suite.describe('a capsule swept', function()
     world:addBody({ type = 'static', shape = physik.capsule(0.5, 1), position = vector.create(-5, 1.5, 0) })
 
     local down = world:capsuleCast(vector.create(0, 5, 0), vector.create(0, -5, 0), 0.4, 0.5)
-    near(down.center.Y, 0.9)
-    near(down.normal.Y, 1)
-    near(down.distance, 4.1)
+    near(met(down).center.y, 0.9)
+    near(met(down).normal.y, 1)
+    near(met(down).distance, 4.1)
 
     local wall = world:capsuleCast(vector.create(0, 1, 0), vector.create(8, 1, 0), 0.4, 0.5)
-    near(wall.center.X, 3.1)
-    near(wall.normal.X, -1)
+    near(met(wall).center.x, 3.1)
+    near(met(wall).normal.x, -1)
 
     local ball = world:capsuleCast(vector.create(0, 1, 0), vector.create(0, 1, 8), 0.4, 0.5)
-    near(ball.center.Z, 4.6)
-    near(ball.normal.Z, -1)
+    near(met(ball).center.z, 4.6)
+    near(met(ball).normal.z, -1)
 
     local pill = world:capsuleCast(vector.create(0, 1.5, 0), vector.create(-8, 1.5, 0), 0.4, 0.5)
-    near(pill.center.X, -4.1)
-    near(pill.normal.X, 1)
+    near(met(pill).center.x, -4.1)
+    near(met(pill).normal.x, 1)
   end)
 
   suite.it('meets nothing it passes, slides along or leaves', function()
@@ -66,7 +73,7 @@ suite.describe('a capsule swept', function()
     expect(world:capsuleCast(vector.create(0, 0.9005, 0), vector.create(2, 0.9005, 0), 0.4, 0.5)).toBe(nil)
 
     -- Sunk a little into the floor: met at once going down, and not at all going up.
-    expect(world:capsuleCast(vector.create(0, 0.85, 0), vector.create(0, 0.5, 0), 0.4, 0.5).fraction).toBe(0)
+    expect(met(world:capsuleCast(vector.create(0, 0.85, 0), vector.create(0, 0.5, 0), 0.4, 0.5)).fraction).toBe(0)
     expect(world:capsuleCast(vector.create(0, 0.85, 0), vector.create(0, 2, 0), 0.4, 0.5)).toBe(nil)
   end)
 
@@ -75,10 +82,10 @@ suite.describe('a capsule swept', function()
     box(world, vector.create(0.5, 2, 2), vector.create(4, 2, 0))
 
     local hit = world:capsuleCast(vector.create(0, 1, 3), vector.create(8, 1, 1), 0.4, 0.5)
-    local corner = vector.create(3.5, hit.center.Y, 2)
+    local corner = vector.create(3.5, met(hit).center.y, 2)
 
-    near(vector.magnitude(vector.create(hit.center.X, hit.center.Y, hit.center.Z) - corner), 0.4)
-    expect(hit.normal.X < 0 and hit.normal.Z > 0).toBe(true)
+    near(vector.magnitude(vector.create(met(hit).center.x, met(hit).center.y, met(hit).center.z) - corner), 0.4)
+    expect(met(hit).normal.x < 0 and met(hit).normal.z > 0).toBe(true)
   end)
 
   suite.it('meets a mesh, a heightfield and a compound', function()
@@ -108,10 +115,10 @@ suite.describe('a capsule swept', function()
       position = vector.create(-20, 0, 0),
     })
 
-    near(world:capsuleCast(vector.create(1, 8, 1), vector.create(1, -2, 1), 0.4, 0.5).center.Y, 2.9)
-    near(world:capsuleCast(vector.create(23, 8, 3), vector.create(23, -2, 3), 0.4, 0.5).center.Y, 1.9)
-    near(world:capsuleCast(vector.create(-20, 8, 0), vector.create(-20, -2, 0), 0.4, 0.5).center.Y, 2.4)
-    near(world:capsuleCast(vector.create(-20.8, 8, 0.8), vector.create(-20.8, -2, 0.8), 0.4, 0.5).center.Y, 1.4)
+    near(met(world:capsuleCast(vector.create(1, 8, 1), vector.create(1, -2, 1), 0.4, 0.5)).center.y, 2.9)
+    near(met(world:capsuleCast(vector.create(23, 8, 3), vector.create(23, -2, 3), 0.4, 0.5)).center.y, 1.9)
+    near(met(world:capsuleCast(vector.create(-20, 8, 0), vector.create(-20, -2, 0), 0.4, 0.5)).center.y, 2.4)
+    near(met(world:capsuleCast(vector.create(-20.8, 8, 0.8), vector.create(-20.8, -2, 0.8), 0.4, 0.5)).center.y, 1.4)
   end)
 
   suite.it('says what a capsule overlaps, and how to leave it', function()
@@ -124,8 +131,8 @@ suite.describe('a capsule swept', function()
     local up, back = 0, 0
 
     for row = 1, count do
-      up = math.max(up, overlaps.normals[row].Y * overlaps.depths[row])
-      back = math.max(back, -overlaps.normals[row].X * overlaps.depths[row])
+      up = math.max(up, overlaps.normals[row].y * overlaps.depths[row])
+      back = math.max(back, -overlaps.normals[row].x * overlaps.depths[row])
     end
 
     near(up, 0.1)
@@ -145,10 +152,10 @@ suite.describe('a character', function()
     walk(who, vector.zero, 90)
 
     expect(who.grounded).toBe(true)
-    near(who.position.Y, 0)
-    near(who.groundNormal.Y, 1)
-    near(character.slide(who, vector.create(3, -9, 0)).Y, 0)
-    near(character.slide(who, vector.create(3, -9, 0)).X, 3)
+    near(who.position.y, 0)
+    near(who.groundNormal.y, 1)
+    near(character.slide(who, vector.create(3, -9, 0)).y, 0)
+    near(character.slide(who, vector.create(3, -9, 0)).x, 3)
   end)
 
   suite.it('stops at a wall and slides along one it meets at an angle', function()
@@ -158,13 +165,13 @@ suite.describe('a character', function()
     local who = character.new(world, { radius = 0.4 })
     walk(who, vector.create(5, 0, 0), 120)
 
-    near(who.position.X, 3.1)
-    near(who.position.Z, 0)
-    near(character.slide(who, vector.create(5, 0, 0)).X, 0)
+    near(who.position.x, 3.1)
+    near(who.position.z, 0)
+    near(character.slide(who, vector.create(5, 0, 0)).x, 0)
 
     walk(who, vector.create(5, 0, 2), 60)
-    near(who.position.X, 3.1)
-    near(who.position.Z, 2, 0.05)
+    near(who.position.x, 3.1)
+    near(who.position.z, 2, 0.05)
   end)
 
   suite.it('walks up a step it can and is stopped by one it cannot', function()
@@ -175,18 +182,18 @@ suite.describe('a character', function()
     local who = character.new(world, { radius = 0.4, stepHeight = 0.3 })
     walk(who, vector.create(3, 0, 0), 80)
 
-    near(who.position.X, 4, 0.15)
-    near(who.position.Y, 0.25)
+    near(who.position.x, 4, 0.15)
+    near(who.position.y, 0.25)
     expect(who.grounded).toBe(true)
 
     -- The climb did not stop it: nothing is taken from its speed.
-    near(character.slide(who, vector.create(3, 0, 0)).X, 3)
+    near(character.slide(who, vector.create(3, 0, 0)).x, 3)
 
     who.position = vector.zero
     walk(who, vector.create(-3, 0, 0), 80)
 
-    near(who.position.X, -1.6)
-    near(who.position.Y, 0)
+    near(who.position.x, -1.6)
+    near(who.position.y, 0)
   end)
 
   suite.it('walks up a slope and not up one too steep', function()
@@ -200,8 +207,8 @@ suite.describe('a character', function()
     walk(who, vector.create(3, 0, 0), 120)
 
     expect(who.grounded).toBe(true)
-    expect(who.position.Y > 1.2).toBe(true)
-    near(who.groundNormal.Y, math.cos(math.rad(30)), 0.01)
+    expect(who.position.y > 1.2).toBe(true)
+    near(who.groundNormal.y, math.cos(math.rad(30)), 0.01)
 
     -- It stays where it stands on the slope.
     local stood = who.position
@@ -211,7 +218,7 @@ suite.describe('a character', function()
     who.position = vector.zero
     who.grounded = false
     walk(who, vector.create(-3, 0, 0), 120)
-    expect(who.position.Y < 0.05).toBe(true)
+    expect(who.position.y < 0.05).toBe(true)
   end)
 
   suite.it('follows the ground down a step, and falls from a ledge', function()
@@ -229,7 +236,7 @@ suite.describe('a character', function()
       expect(who.grounded).toBe(true)
     end
 
-    near(who.position.Y, 0)
+    near(who.position.y, 0)
 
     who.position = vector.create(0, 2, 10)
     walk(who, vector.zero, 2)
@@ -240,7 +247,7 @@ suite.describe('a character', function()
     end
 
     expect(who.grounded).toBe(false)
-    near(who.position.Y, 2)
+    near(who.position.y, 2)
   end)
 
   suite.it('is stopped by a ceiling', function()
@@ -254,9 +261,9 @@ suite.describe('a character', function()
       character.move(who, vector.create(0, 0.1, 0))
     end
 
-    near(who.position.Y, 2.25 - 1.8)
+    near(who.position.y, 2.25 - 1.8)
     expect(who.grounded).toBe(false)
-    near(character.slide(who, vector.create(0, 6, 0)).Y, 0)
+    near(character.slide(who, vector.create(0, 6, 0)).y, 0)
   end)
 
   suite.it('is carried by a lift, up and down, and says how the lift moves', function()
@@ -273,9 +280,9 @@ suite.describe('a character', function()
       character.move(who, character.groundVelocity(who) * Step + vector.create(0, -0.02, 0))
     end
 
-    near(world:getBody(lift).position.Y, 4.25, 0.01)
-    near(who.position.Y, 4.5, 0.01)
-    near(character.groundVelocity(who).Y, 2)
+    near(world:getBody(lift).position.y, 4.25, 0.01)
+    near(who.position.y, 4.5, 0.01)
+    near(character.groundVelocity(who).y, 2)
     expect(who.grounded).toBe(true)
 
     for _ = 1, 120 do
@@ -285,12 +292,12 @@ suite.describe('a character', function()
       expect(who.grounded).toBe(true)
     end
 
-    near(who.position.Y, 0.5, 0.01)
+    near(who.position.y, 0.5, 0.01)
 
     -- A lift that comes up under someone who was not told lifts them all the same.
     world:setPosition(lift, vector.create(0, 0.45, 0))
     character.move(who, vector.zero)
-    near(who.position.Y, 0.7)
+    near(who.position.y, 0.7)
 
     world:removeBody(lift)
     expect(character.groundVelocity(who)).toBe(vector.zero)
@@ -317,13 +324,13 @@ suite.describe('a character', function()
     local who = character.new(world, { position = vector.create(0, 3, 0) })
     walk(who, vector.create(1, 0, 1), 120)
     expect(who.grounded).toBe(true)
-    near(who.position.Y, 2)
-    near(who.position.X, 2, 0.05)
+    near(who.position.y, 2)
+    near(who.position.x, 2, 0.05)
 
     who.position = vector.create(23, 2, 3)
     walk(who, vector.create(1, 0, 1), 120)
     expect(who.grounded).toBe(true)
-    near(who.position.Y, 1)
+    near(who.position.y, 1)
   end)
 
   suite.it('does not meet what its mask leaves out, nor the body it is told is its own', function()
@@ -334,8 +341,8 @@ suite.describe('a character', function()
     local who = character.new(world, { radius = 0.4, mask = 1, ignore = own })
     walk(who, vector.create(5, 0, 0), 120)
 
-    near(who.position.X, 10, 0.01)
-    near(who.position.Y, 0)
+    near(who.position.x, 10, 0.01)
+    near(who.position.y, 0)
   end)
 
   suite.it('says whether it would fit somewhere', function()
@@ -346,6 +353,38 @@ suite.describe('a character', function()
     expect(character.fits(who, vector.create(0, 0.01, 0))).toBe(false)
     expect(character.fits(who, vector.create(5, 0.01, 0))).toBe(true)
   end)
+
+  suite.it('crouches under what it cannot walk under, and stands only where there is room', function()
+    local world = room()
+
+    -- A beam across the way, its underside 1.2 up.
+    box(world, vector.create(1, 0.25, 4), vector.create(4, 1.45, 0))
+
+    local who = character.new(world, { radius = 0.3, height = 1.8 })
+    walk(who, vector.create(3, 0, 0), 120)
+    near(who.position.x, 2.7, 0.01)
+
+    expect(character.setHeight(who, 1)).toBe(true)
+    expect(who.height).toBe(1)
+    walk(who, vector.create(3, 0, 0), 30)
+    near(who.position.x, 4.2, 0.02)
+    near(who.position.y, 0)
+    expect(who.grounded).toBe(true)
+
+    -- Under the beam there is no standing up.
+    expect(character.setHeight(who, 1.8)).toBe(false)
+    expect(who.height).toBe(1)
+
+    walk(who, vector.create(3, 0, 0), 60)
+    expect(character.setHeight(who, 1.8)).toBe(true)
+    expect(who.height).toBe(1.8)
+    near(who.position.y, 0)
+
+    -- No shorter than a ball of its own radius.
+    expect(character.setHeight(who, 0.1)).toBe(true)
+    expect(who.height).toBe(0.6)
+  end)
+
 end)
 
 return suite

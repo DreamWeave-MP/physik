@@ -5,6 +5,21 @@ local suite = test.new()
 
 local Generation = 1048576
 
+--- A value of the wrong kind, for a case that hands one over to see it refused.
+local function wrong<Kind>(value: unknown): Kind
+  return value :: Kind
+end
+
+-- Both ways a world finds its pairs: a case that holds for one is run for the other.
+local Broadphases: { 'grid' | 'sap' } = { 'grid', 'sap' }
+
+--- What a ray or a sweep met, where a case expects it to have met something.
+local function met<Hit>(hit: Hit?): Hit
+  if not hit then error('expected to meet something, and met nothing', 2) end
+
+  return hit :: Hit
+end
+
 --- Fails unless `actual` is within `tolerance` of `expected`: positions and distances come out
 --- of 32-bit vector arithmetic, and a case says how far that may stray.
 local function near(actual: number, expected: number, tolerance: number?)
@@ -15,12 +30,12 @@ local function near(actual: number, expected: number, tolerance: number?)
 end
 
 local function nearVector(actual: vector, expected: vector, tolerance: number?)
-  near(actual.X, expected.X, tolerance)
-  near(actual.Y, expected.Y, tolerance)
-  near(actual.Z, expected.Z, tolerance)
+  near(actual.x, expected.x, tolerance)
+  near(actual.y, expected.y, tolerance)
+  near(actual.z, expected.z, tolerance)
 end
 
-local function ground(world)
+local function ground(world: physik.World)
   return world:addBody({
     type = 'static',
     shape = physik.box(vector.create(20, 0.5, 20)),
@@ -30,8 +45,8 @@ local function ground(world)
 end
 
 --- The user data of the bodies behind `count` handles, in order.
-local function named(world, handles: { number }, count: number): { string }
-  local names = [for handle in handles[1:count] => world:getBody(handle).userData]
+local function named(world: physik.World, handles: { number }, count: number): { string }
+  local names = [for handle in handles[1:count] => world:getBody(handle).userData :: string]
   table.sort(names)
 
   return names
@@ -70,8 +85,8 @@ suite.describe('shapes', function()
     expect(buffer.readf32(fromTables.vertices, 28)).toBe(1)
     expect(fromBuffers.heads).toEqual(fromTables.heads)
     expect(fromBuffers.nextNode).toEqual(fromTables.nextNode)
-    expect(fromBuffers.nodeTri).toEqual(fromTables.nodeTri)
-    expect(#fromTables.nodeTri).toBe(8)
+    expect(fromBuffers.nodeTriangle).toEqual(fromTables.nodeTriangle)
+    expect(#fromTables.nodeTriangle).toBe(8)
   end)
 
   suite.it('numbers the triangles of a mesh without indices in vertex order', function()
@@ -96,7 +111,7 @@ suite.describe('shapes', function()
     local mesh = physik.triangleMesh(vertices, { 1, 2, 3, 1, 4, 2 }, { cellSize = 1, maxCellsPerTriangle = 16 })
 
     expect(mesh.overflow).toEqual({ 0 })
-    expect(#mesh.nodeTri).toBe(9)
+    expect(#mesh.nodeTriangle).toBe(9)
   end)
 
   suite.it('leaves a vertex that is not a number out of a mesh\'s bounds', function()
@@ -126,7 +141,7 @@ suite.describe('shapes', function()
     end).toThrow('physik.triangleMesh: table indices are 1-based and must reference a vertex')
 
     expect(function()
-      physik.triangleMesh({ triangle[1], triangle[2], 3 })
+      physik.triangleMesh(wrong<<{ vector }>>({ triangle[1], triangle[2], 3 }))
     end).toThrow('physik.triangleMesh: every vertex must be a vector')
 
     expect(function()
@@ -164,14 +179,14 @@ suite.describe('shapes', function()
     local none = physik.heightfield(2, 2, { 0 / 0, 0 / 0, 0 / 0, 0 / 0 })
     local unbounded = physik.heightfield(2, 2, { math.huge, -math.huge, 0, 1 })
 
-    expect(first.localMin.Y).toBe(1)
-    expect(first.localMax.Y).toBe(3)
-    expect(last.localMin.Y).toBe(-1)
-    expect(last.localMax.Y).toBe(4)
-    expect(none.localMin.Y).toBe(math.huge)
-    expect(none.localMax.Y).toBe(-math.huge)
-    expect(unbounded.localMin.Y).toBe(-math.huge)
-    expect(unbounded.localMax.Y).toBe(math.huge)
+    expect(first.localMin.y).toBe(1)
+    expect(first.localMax.y).toBe(3)
+    expect(last.localMin.y).toBe(-1)
+    expect(last.localMax.y).toBe(4)
+    expect(none.localMin.y).toBe(math.huge)
+    expect(none.localMax.y).toBe(-math.huge)
+    expect(unbounded.localMin.y).toBe(-math.huge)
+    expect(unbounded.localMax.y).toBe(math.huge)
   end)
 
   suite.it('refuses heightfields that are not a grid of numbers', function()
@@ -184,7 +199,7 @@ suite.describe('shapes', function()
     end).toThrow('physik.heightfield: heights must contain width*depth values')
 
     expect(function()
-      physik.heightfield(2, 2, { 1, 2, 'three', 4 })
+      physik.heightfield(2, 2, wrong<<{ number }>>({ 1, 2, 'three', 4 }))
     end).toThrow('physik.heightfield: heights must be numbers')
 
     expect(function()
@@ -212,7 +227,7 @@ suite.describe('shapes', function()
     end).toThrow('physik.compound: children must be a non-empty array')
 
     expect(function()
-      physik.compound({ { shape = compound } })
+      physik.compound({ { shape = wrong<<physik.Primitive>>(compound) } })
     end).toThrow('physik.compound: children must be sphere, box, or capsule shapes')
   end)
 end)
@@ -235,7 +250,7 @@ suite.describe('bodies', function()
     expect(world:stats().bodies).toBe(2)
   end)
 
-  for _, broadphase in { 'grid', 'sap' } do
+  for _, broadphase in Broadphases do
     suite.it(`offers a pair once however often a slot has been taken again, by {broadphase}`, function()
       local world = physik.newWorld({ broadphase = broadphase, gravity = vector.zero })
 
@@ -274,8 +289,8 @@ suite.describe('bodies', function()
     expect(body.handle).toBe(handle)
     expect(body.type).toBe('kinematic')
     expect(body.position).toBe(vector.create(4, 5, 6))
-    nearVector(body.rotation.v, vector.create(0, 0, 0.6), 1e-6)
-    near(body.rotation.w, 0.8, 1e-6)
+    nearVector(body.rotation.turn, vector.create(0, 0, 0.6), 1e-6)
+    near(body.rotation.turnW, 0.8, 1e-6)
     expect(body.velocity).toBe(vector.create(1, 0, 0))
     expect(body.angularVelocity).toBe(vector.create(0, 0, 0))
     expect(body.sleeping).toBe(false)
@@ -287,7 +302,7 @@ suite.describe('bodies', function()
     local mesh = physik.triangleMesh({ vector.create(0, 0, 0), vector.create(1, 0, 0), vector.create(0, 0, 1) })
 
     expect(function()
-      world:addBody({ type = 'floating' })
+      world:addBody({ type = wrong<<'static'>>('floating') })
     end).toThrow("physik: body type must be 'dynamic', 'static', or 'kinematic'")
 
     expect(function()
@@ -295,11 +310,11 @@ suite.describe('bodies', function()
     end).toThrow('physik.addBody: triangle meshes and heightfields must be static or kinematic')
 
     expect(function()
-      world:addBody({ shape = {} })
+      world:addBody({ shape = wrong<<physik.Shape>>({}) })
     end).toThrow('physik.addBody: invalid shape')
 
     expect(function()
-      world:addBody({ rotation = vector.create(0, 0, 1) })
+      world:addBody({ rotation = wrong<<physik.Rotation>>(vector.create(0, 0, 1)) })
     end).toThrow('physik.addBody: rotation must come from physik.quat/axisAngle')
 
     -- A body that is refused leaves nothing behind, and the world goes on stepping.
@@ -320,8 +335,8 @@ suite.describe('stepping', function()
 
     local body = world:getBody(handle)
 
-    near(body.velocity.Y, -10, 1e-3)
-    near(body.position.Y, -10 * 1830 / 3600, 1e-3)
+    near(body.velocity.y, -10, 1e-3)
+    near(body.position.y, -10 * 1830 / 3600, 1e-3)
     expect(world:stats().frame).toBe(60)
   end)
 
@@ -330,7 +345,7 @@ suite.describe('stepping', function()
     local handle = world:addBody({ shape = physik.sphere(0.5), linearDamping = 0 })
     world:step(1 / 30, 2)
 
-    near(world:getBody(handle).position.Y, -10 * 3 / 3600, 1e-5)
+    near(world:getBody(handle).position.y, -10 * 3 / 3600, 1e-5)
     expect(world:stats().frame).toBe(1)
 
     expect(function()
@@ -356,7 +371,7 @@ suite.describe('stepping', function()
     expect(world:stats().frame).toBe(6)
   end)
 
-  for _, broadphase in { 'grid', 'sap' } do
+  for _, broadphase in Broadphases do
     suite.it(`rests a sphere, a box and a capsule on the floor and puts them to sleep, by {broadphase}`, function()
       local world = physik.newWorld({ broadphase = broadphase })
       ground(world)
@@ -376,10 +391,10 @@ suite.describe('stepping', function()
       local stats = world:stats()
 
       -- Each settles a little into the floor: the solver leaves the slop it is allowed.
-      near(world:getBody(sphere).position.Y, 0.4773, 1e-3)
-      near(world:getBody(box).position.Y, 0.2441, 1e-3)
-      near(world:getBody(capsule).position.Y, 0.7273, 1e-3)
-      near(world:getBody(sphere).position.X, -3, 1e-3)
+      near(world:getBody(sphere).position.y, 0.4773, 1e-3)
+      near(world:getBody(box).position.y, 0.2441, 1e-3)
+      near(world:getBody(capsule).position.y, 0.7273, 1e-3)
+      near(world:getBody(sphere).position.x, -3, 1e-3)
       expect(stats.sleeping).toBe(3)
       expect(stats.activeContacts).toBe(0)
       expect(stats.bodies).toBe(4)
@@ -392,7 +407,7 @@ suite.describe('stepping', function()
       expect(world:getBody(box).sleeping).toBe(false)
       world:step(1 / 60)
       expect(world:stats().sleeping).toBe(2)
-      near(world:getBody(box).position.Y, 0.2914, 1e-3)
+      near(world:getBody(box).position.y, 0.2914, 1e-3)
     end)
 
     suite.it(`stacks boxes and keeps every pair of neighbours in contact, by {broadphase}`, function()
@@ -417,9 +432,9 @@ suite.describe('stepping', function()
       for level, box in boxes do
         local body = world:getBody(box)
 
-        near(body.position.Y, level - 0.5, 0.08)
-        near(body.position.X, 0, 0.02)
-        near(body.position.Z, 0, 0.02)
+        near(body.position.y, level - 0.5, 0.08)
+        near(body.position.x, 0, 0.02)
+        near(body.position.z, 0, 0.02)
       end
 
       expect(stats.manifolds).toBe(2)
@@ -446,7 +461,7 @@ suite.describe('stepping', function()
 
       expect(world:step(1 / 60)).toBe(40)
 
-      local pairs = [for contact in world:contacts() => math.abs(contact.a - contact.b)]
+      local pairs = [for contact in world:contacts() => math.abs(contact.first - contact.second)]
       expect(pairs).toEqual(table.create(40, 1))
 
       -- Enough removals that the sweep's order is compacted before it is sorted again.
@@ -484,12 +499,12 @@ suite.describe('stepping', function()
 
         for _ = 1, 150 do
           world:step(1 / 60)
-          lowest = math.min(lowest, world:getBody(ball).position.Y)
+          lowest = math.min(lowest, world:getBody(ball).position.y)
         end
 
         -- Ten units on, far from the cells it started over, it is still resting on the surface.
         expect(lowest > 0.3).toBe(true)
-        expect(world:getBody(ball).position.X > 0).toBe(true)
+        expect(world:getBody(ball).position.x > 0).toBe(true)
         expect(world:stats().contacts > 0).toBe(true)
       end
     end)
@@ -513,7 +528,7 @@ suite.describe('stepping', function()
       expect(world:step(1 / 60)).toBe(66)
 
       local contacts = world:contacts()
-      local order = sum[for index, contact in enumerate(contacts) => index * (contact.a % Generation * 100 + contact.b % Generation)]
+      local order = sum[for index, contact in enumerate(contacts) => index * (contact.first % Generation * 100 + contact.second % Generation)]
 
       expect(order).toBe(if broadphase == 'sap' then 4678762 else 5070681)
     end)
@@ -562,9 +577,9 @@ suite.describe('stepping', function()
           error(`{left} against {right} made {count} contacts, not {expected[`{left} {right}`]}`)
         end
 
-        expect(contact.a).toBe(first)
-        expect(contact.b).toBe(second)
-        expect(contact.normal.X > 0.9).toBe(true)
+        expect(contact.first).toBe(first)
+        expect(contact.second).toBe(second)
+        expect(contact.normal.x > 0.9).toBe(true)
         expect(contact.penetration > 0).toBe(true)
       end
     end
@@ -598,12 +613,12 @@ suite.describe('stepping', function()
         world:step(1 / 60)
       end
 
-      near(world:getBody(sphere).position.Y, 1.4773, 1e-3)
-      near(world:getBody(capsule).position.Y, 1.5773, 1e-3)
+      near(world:getBody(sphere).position.y, 1.4773, 1e-3)
+      near(world:getBody(capsule).position.y, 1.5773, 1e-3)
       nearVector(world:getBody(sphere).position, vector.create(-2.5, 1.4773, 0.3), 1e-3)
 
       -- A box does not come to rest on triangles: it rides a little above them, and wanders.
-      near(world:getBody(box).position.Y, 1.6, 0.1)
+      near(world:getBody(box).position.y, 1.6, 0.1)
       expect(world:stats().sleeping).toBe(2)
       expect(world:stats().contacts).toBe(3)
     end
@@ -631,7 +646,7 @@ suite.describe('stepping', function()
     end
 
     expect(contacts > 0).toBe(true)
-    expect(world:getBody(ball).position.X < 104).toBe(true)
+    expect(world:getBody(ball).position.x < 104).toBe(true)
   end)
 
   suite.it('keeps a sensor out of the solve and reports what it touches', function()
@@ -654,8 +669,8 @@ suite.describe('stepping', function()
       if count == 0 then continue end
 
       expect(count).toBe(1)
-      expect(events.a[1]).toBe(sensor)
-      expect(events.b[1]).toBe(mover)
+      expect(events.first[1]).toBe(sensor)
+      expect(events.second[1]).toBe(mover)
       expect(events.sensor[1]).toBe(true)
       table.insert(kinds, events.kind[1])
     end
@@ -666,8 +681,8 @@ suite.describe('stepping', function()
     expect(kinds[#kinds]).toBe(event.exit)
     expect(#[for kind in kinds if kind == event.stay => kind]).toBe(#kinds - 2)
     expect(#kinds).toBe(32)
-    near(world:getBody(mover).velocity.X, 6, 1e-4)
-    near(world:getBody(mover).position.X, 3, 1e-3)
+    near(world:getBody(mover).velocity.x, 6, 1e-4)
+    near(world:getBody(mover).position.x, 3, 1e-3)
     expect(select(2, world:writeContactEvents({}, false))).toBe(0)
   end)
 
@@ -696,7 +711,7 @@ suite.describe('stepping', function()
       world:step(1 / 60)
       expect(world:stats().ccdHits).toBe(if swept then 1 else 0)
 
-      return world:getBody(bullet).position.X
+      return world:getBody(bullet).position.x
     end
 
     near(fire(false), 1000 / 60, 1e-3)
@@ -716,7 +731,7 @@ suite.describe('stepping', function()
       world:step(1 / 60)
     end
 
-    near(world:getBody(weight).position.Y, 4, 0.1)
+    near(world:getBody(weight).position.y, 4, 0.1)
     world:removeJoint(joint)
     expect(world:stats().joints).toBe(0)
 
@@ -724,7 +739,7 @@ suite.describe('stepping', function()
       world:step(1 / 60)
     end
 
-    expect(world:getBody(weight).position.Y < 3).toBe(true)
+    expect(world:getBody(weight).position.y < 3).toBe(true)
   end)
 
   suite.it('lets jointed bodies overlap unless the joint says they collide', function()
@@ -811,8 +826,8 @@ suite.describe('stepping', function()
 
     local contact = world:contacts()[1]
 
-    expect(contact.b).toBe(atItsEnd)
-    expect(contact.normal.Z > 0.9).toBe(true)
+    expect(contact.second).toBe(atItsEnd)
+    expect(contact.normal.z > 0.9).toBe(true)
   end)
 
   suite.it('wakes a sleeping body that a kinematic one runs into', function()
@@ -840,7 +855,7 @@ suite.describe('stepping', function()
     end
 
     expect(world:getBody(ball).sleeping).toBe(false)
-    expect(world:getBody(ball).position.X > 0.2).toBe(true)
+    expect(world:getBody(ball).position.x > 0.2).toBe(true)
   end)
 end)
 
@@ -883,8 +898,8 @@ suite.describe('queries', function()
     return world
   end
 
-  local tops = { sphere = 1, box = 0.5, capsule = 1.5, compound = 1.5, mesh = 0.5, heightfield = 0.75 }
-  local columns = { sphere = 0, box = 10, capsule = 20, compound = 30, mesh = 40, heightfield = 50 }
+  local tops: { [string]: number } = { sphere = 1, box = 0.5, capsule = 1.5, compound = 1.5, mesh = 0.5, heightfield = 0.75 }
+  local columns: { [string]: number } = { sphere = 0, box = 10, capsule = 20, compound = 30, mesh = 40, heightfield = 50 }
 
   suite.it('finds where a ray first meets each kind of shape', function()
     local world = gallery()
@@ -892,10 +907,10 @@ suite.describe('queries', function()
     for name, column in columns do
       local hit = world:raycast(vector.create(column + 0.1, 8, 0.1), vector.create(0, -2, 0), 20)
 
-      expect(hit.userData).toBe(name)
-      near(hit.distance, 8 - tops[name], 0.03)
-      near(hit.point.Y, tops[name], 0.03)
-      expect(hit.normal.Y > 0.9).toBe(true)
+      expect(met(hit).userData).toBe(name)
+      near(met(hit).distance, 8 - tops[name], 0.03)
+      near(met(hit).point.y, tops[name], 0.03)
+      expect(met(hit).normal.y > 0.9).toBe(true)
     end
 
     expect(world:raycast(vector.create(5, 8, 0), vector.create(0, -1, 0), 20)).toBe(nil)
@@ -909,16 +924,16 @@ suite.describe('queries', function()
     local along = world:raycast(vector.create(-5, 0, 0), vector.create(1, 0, 0))
     local back = world:raycast(vector.create(60, 0.2, 0), vector.create(-1, 0, 0), 100)
 
-    expect(along.userData).toBe('sphere')
-    near(along.distance, 4, 1e-4)
-    nearVector(along.normal, vector.create(-1, 0, 0), 1e-4)
+    expect(met(along).userData).toBe('sphere')
+    near(met(along).distance, 4, 1e-4)
+    nearVector(met(along).normal, vector.create(-1, 0, 0), 1e-4)
     -- The heightfield and the mesh are surfaces: a ray below them passes under.
-    expect(back.userData).toBe('compound')
-    near(back.distance, 29, 1e-4)
+    expect(met(back).userData).toBe('compound')
+    near(met(back).distance, 29, 1e-4)
   end)
 
   suite.it('finds a sphere where it has moved to, not where it was added', function()
-    for _, broadphase in { 'grid', 'sap' } do
+    for _, broadphase in Broadphases do
       local world = physik.newWorld({ gravity = vector.create(0, 0, 0), broadphase = broadphase, broadphaseCellSize = 2 })
 
       world:addBody({
@@ -935,9 +950,9 @@ suite.describe('queries', function()
       local hit = world:raycast(vector.create(5, 5, 0), vector.create(0, -1, 0), 10)
       local swept = world:sphereCast(vector.create(5, 5, 0), vector.create(5, -5, 0), 0.2)
 
-      expect(hit.userData).toBe('ball')
-      near(hit.distance, 4.5, 1e-3)
-      expect(swept.userData).toBe('ball')
+      expect(met(hit).userData).toBe('ball')
+      near(met(hit).distance, 4.5, 1e-3)
+      expect(met(swept).userData).toBe('ball')
       expect(world:raycast(vector.create(0, 5, 0), vector.create(0, -1, 0), 10)).toBe(nil)
       expect(named(world, world:queryAabb(vector.create(4.8, -1, -1), vector.create(5.2, 1, 1)), 1)).toEqual({ 'ball' })
     end
@@ -947,7 +962,7 @@ suite.describe('queries', function()
     local nowhere = 0 / 0
     local origins = { vector.create(nowhere, 8, 0), vector.create(0, nowhere, 0), vector.create(0, 8, nowhere) }
 
-    for _, broadphase in { 'grid', 'sap' } do
+    for _, broadphase in Broadphases do
       local world = physik.newWorld({ gravity = vector.create(0, 0, 0), broadphase = broadphase, broadphaseCellSize = 4 })
 
       -- Spheres small enough to be in the grid's cells, which is where such a ray is not.
@@ -964,7 +979,7 @@ suite.describe('queries', function()
 
       expect(count).toBe(3)
       expect(drained.hit).toEqual({ false, false, false })
-      expect(world:raycast(vector.create(0, 8, 0), vector.create(0, -1, 0), 20).distance).toBe(7)
+      expect(met(world:raycast(vector.create(0, 8, 0), vector.create(0, -1, 0), 20)).distance).toBe(7)
     end
   end)
 
@@ -1028,7 +1043,7 @@ suite.describe('queries', function()
     expect(select(2, world:queryAabb(vector.create(-1, -1, -1), vector.create(1, 1, 1), 2))).toBe(0)
 
     expect(function()
-      world:queryAabb(0, 1)
+      world:queryAabb(wrong<<vector>>(0), wrong<<vector>>(1))
     end).toThrow('physik.queryAabb: bounds must be vectors')
   end)
 
@@ -1134,9 +1149,9 @@ suite.describe('queries', function()
     local hit = world:sphereCast(vector.create(0, 5, 0), vector.create(0, -5, 0), 0.25)
 
     expect(again).toBe(2 * Generation + 2)
-    expect(hit.handle).toBe(again)
-    expect(hit.userData).toBe('again')
-    near(hit.center.Y, 0.75, 1e-3)
+    expect(met(hit).handle).toBe(again)
+    expect(met(hit).userData).toBe('again')
+    near(met(hit).center.y, 0.75, 1e-3)
     expect(world:sphereCast(vector.create(0, 5, 0), vector.create(0, -5, 0), 0.25, nil, again)).toBe(nil)
   end)
 
@@ -1146,12 +1161,12 @@ suite.describe('queries', function()
     for name, column in columns do
       local hit = world:sphereCast(vector.create(column + 0.1, 8, 0.1), vector.create(column + 0.1, -2, 0.1), 0.25)
 
-      expect(hit.userData).toBe(name)
-      near(hit.center.Y, tops[name] + 0.25, 0.03)
-      near(hit.point.Y, tops[name], 0.03)
-      near(hit.distance, 8 - tops[name] - 0.25, 0.03)
-      near(hit.fraction, hit.distance / 10, 1e-6)
-      expect(hit.normal.Y > 0.9).toBe(true)
+      expect(met(hit).userData).toBe(name)
+      near(met(hit).center.y, tops[name] + 0.25, 0.03)
+      near(met(hit).point.y, tops[name], 0.03)
+      near(met(hit).distance, 8 - tops[name] - 0.25, 0.03)
+      near(met(hit).fraction, met(hit).distance / 10, 1e-6)
+      expect(met(hit).normal.y > 0.9).toBe(true)
     end
 
     expect(world:sphereCast(vector.create(5, 8, 0), vector.create(5, -2, 0), 0.25)).toBe(nil)
@@ -1224,7 +1239,7 @@ suite.describe('drains', function()
     expect(state.positions[4]).toBe(vector.create(-4, 3, 0))
     expect(state.rotationW[1]).toBe(1)
     expect(state.rotations[1]).toBe(vector.create(0, 0, 0))
-    expect(state.velocities[3].Y < -5).toBe(true)
+    expect(state.velocities[3].y < -5).toBe(true)
     expect(state.angularVelocities[1]).toBe(vector.create(0, 0, 0))
 
     local dynamic, dynamicCount = world:writeTransforms(state, { dynamicOnly = true })
@@ -1269,16 +1284,16 @@ suite.describe('drains', function()
 
     expect(count).toBe(1)
     expect(#records).toBe(1)
-    expect(state.a).toEqual({ floor })
-    expect(state.b).toEqual({ resting })
+    expect(state.first).toEqual({ floor })
+    expect(state.second).toEqual({ resting })
     expect(state.sensor).toEqual({ false })
     nearVector(state.normals[1], vector.create(0, 1, 0), 1e-4)
-    near(state.points[1].Y, 0, 0.02)
+    near(state.points[1].y, 0, 0.02)
 
     local record = records[1]
 
-    expect(record.a).toBe(floor)
-    expect(record.b).toBe(resting)
+    expect(record.first).toBe(floor)
+    expect(record.second).toBe(resting)
     expect(record.normal).toBe(state.normals[1])
     expect(record.point).toBe(state.points[1])
     expect(record.penetration).toBe(state.penetration[1])
@@ -1286,10 +1301,10 @@ suite.describe('drains', function()
     expect(record.sensor).toBe(false)
 
     -- A drain that held more contacts is cut back to the ones there are.
-    table.insert(state.a, 0)
+    table.insert(state.first, 0)
     table.insert(state.sensor, true)
     world:writeContacts(state)
-    expect(state.a).toEqual({ floor })
+    expect(state.first).toEqual({ floor })
     expect(state.sensor).toEqual({ false })
     expect(state.count).toBe(1)
   end)
@@ -1310,10 +1325,10 @@ suite.describe('drains', function()
     expect(world:getBody(resting).position).toBe(vector.create(-93, 0.5, 57))
     expect(world:getBody(carried).position).toBe(vector.create(-104, 3, 50))
     expect(world:getBody(floor).position).toBe(vector.create(-100, -0.5, 50))
-    expect(world:raycast(vector.create(-93, 5, 57), vector.create(0, -1, 0), 10).userData).toBe('resting')
+    expect(met(world:raycast(vector.create(-93, 5, 57), vector.create(0, -1, 0), 10)).userData).toBe('resting')
 
     expect(function()
-      world:applyTransforms({})
+      world:applyTransforms(wrong<<physik.Transforms>>({}))
     end).toThrow('physik.applyTransforms: expected writeTransforms-compatible data')
   end)
 
@@ -1352,7 +1367,7 @@ end)
 
 suite.describe('a level of static bodies', function()
   --- A floor of 36 slabs four across, each named by where it is.
-  local function floor(world): { [string]: number }
+  local function floor(world: physik.World): { [string]: number }
     local slabs = {}
 
     for column = 0, 5 do
@@ -1381,8 +1396,8 @@ suite.describe('a level of static bodies', function()
     expect(#contacts > 0).toBe(true)
 
     for _, contact in contacts do
-      expect(world:getBody(contact.a).userData).toBe('3,2')
-      expect(contact.b).toBe(dropped)
+      expect(world:getBody(contact.first).userData).toBe('3,2')
+      expect(contact.second).toBe(dropped)
     end
   end)
 
@@ -1398,13 +1413,13 @@ suite.describe('a level of static bodies', function()
     world:step(1 / 60)
     expect(world:stats().contacts).toBe(0)
     expect(world:raycast(vector.create(9, 5, 9), vector.create(0, -1, 0), 20)).toBe(nil)
-    near(world:raycast(vector.create(9, 5, 9), vector.create(0, -1, 0), 60).distance, 44.5)
+    near(met(world:raycast(vector.create(9, 5, 9), vector.create(0, -1, 0), 60)).distance, 44.5)
 
     world:setPosition(slabs['0,0'], vector.create(8, -0.5, 8))
     world:step(1 / 60)
     expect(world:stats().contacts).toBe(1)
-    expect(world:getBody(world:contacts()[1].a).userData).toBe('0,0')
-    expect(world:contacts()[1].b).toBe(resting)
+    expect(world:getBody(world:contacts()[1].first).userData).toBe('0,0')
+    expect(world:contacts()[1].second).toBe(resting)
   end)
 
   suite.it('forgets a static body that is removed', function()
@@ -1426,8 +1441,8 @@ suite.describe('a level of static bodies', function()
     local slabs = floor(world)
 
     -- Straight down the seam between two slabs, and down the corner of four.
-    expect(world:raycast(vector.create(2, 5, 0), vector.create(0, -1, 0), 20).handle).toBe(slabs['0,0'])
-    expect(world:raycast(vector.create(10, 5, 14), vector.create(0, -1, 0), 20).handle).toBe(slabs['2,3'])
+    expect(met(world:raycast(vector.create(2, 5, 0), vector.create(0, -1, 0), 20)).handle).toBe(slabs['0,0'])
+    expect(met(world:raycast(vector.create(10, 5, 14), vector.create(0, -1, 0), 20)).handle).toBe(slabs['2,3'])
   end)
 
   suite.it('answers a box with every slab it overlaps', function()
@@ -1446,17 +1461,16 @@ suite.describe('a level of static bodies', function()
     floor(world)
 
     local hit = world:sphereCast(vector.create(17, 3, 21), vector.create(17, -3, 21), 0.5)
-    expect(world:getBody(hit.handle).userData).toBe('4,5')
-    near(hit.center.Y, 0.5)
+    expect(world:getBody(met(hit).handle).userData).toBe('4,5')
+    near(met(hit).center.y, 0.5)
   end)
 end)
 
 suite.describe('bodies at rest', function()
-  for _, broadphase in { 'grid', 'sap' } do
+  for _, broadphase in Broadphases do
     --- A floor, a box asleep on it and a box asleep on that: stepped until both sleep.
-    local function stack(options)
-      options.broadphase = broadphase
-      local world = physik.newWorld(options)
+    local function stack(contactEvents: boolean)
+      local world = physik.newWorld({ broadphase = broadphase, contactEvents = contactEvents })
       local floor = ground(world)
       local lower = world:addBody({ shape = physik.box(vector.create(0.5, 0.5, 0.5)), position = vector.create(0, 0.5, 0) })
       local upper = world:addBody({ shape = physik.box(vector.create(0.4, 0.4, 0.4)), position = vector.create(0, 1.4, 0) })
@@ -1471,7 +1485,7 @@ suite.describe('bodies at rest', function()
     end
 
     suite.it(`touch as they did for as long as they lie there, by {broadphase}`, function()
-      local world = stack({ contactEvents = true })
+      local world = stack(true)
       local before = world:contacts()
 
       for _ = 1, 30 do
@@ -1483,8 +1497,8 @@ suite.describe('bodies at rest', function()
       expect(#after >= 8).toBe(true)
 
       for index, contact in after do
-        expect(contact.a).toBe(before[index].a)
-        expect(contact.b).toBe(before[index].b)
+        expect(contact.first).toBe(before[index].first)
+        expect(contact.second).toBe(before[index].second)
         expect(contact.point).toBe(before[index].point)
         expect(contact.normal).toBe(before[index].normal)
         expect(contact.penetration).toBe(before[index].penetration)
@@ -1499,19 +1513,19 @@ suite.describe('bodies at rest', function()
     end)
 
     suite.it(`are found again where one is put without waking it, by {broadphase}`, function()
-      local world, _, _, upper = stack({})
+      local world, _, _, upper = stack(false)
 
       world:setPosition(upper, vector.create(10, 0.39, 0), false)
       world:step(1 / 60)
 
       expect(world:stats().sleeping).toBe(2)
 
-      local pairs = [for contact in world:contacts() => `{contact.a % Generation}-{contact.b % Generation}`]
+      local pairs = [for contact in world:contacts() => `{contact.first % Generation}-{contact.second % Generation}`]
       expect(table.concat(pairs, ' ')).toBe('1-2 1-2 1-2 1-2 1-3 1-3 1-3 1-3')
     end)
 
     suite.it(`stop touching a body that is taken away, by {broadphase}`, function()
-      local world, _, lower = stack({})
+      local world, _, lower = stack(false)
 
       world:removeBody(lower)
       world:step(1 / 60)
@@ -1524,7 +1538,7 @@ suite.describe('bodies at rest', function()
     end)
 
     suite.it(`stop touching a static body that is moved away, and touch one moved in, by {broadphase}`, function()
-      local world, floor = stack({})
+      local world, floor = stack(false)
 
       world:setPosition(floor, vector.create(0, -30, 0))
       world:step(1 / 60)
@@ -1536,7 +1550,7 @@ suite.describe('bodies at rest', function()
     end)
 
     suite.it(`wake together when one of them is struck, by {broadphase}`, function()
-      local world, _, lower, upper = stack({})
+      local world, _, lower, upper = stack(false)
 
       world:applyImpulse(upper, vector.create(3, 0, 0))
       world:step(1 / 60)

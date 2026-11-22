@@ -1,0 +1,357 @@
+--!strict
+--!native
+-- Drains: a world's state read out in bulk, as columns that a caller keeps and hands back to be
+-- filled again, so that reading every body every step allocates nothing. Also the other way:
+-- a state written back over the bodies it was read from.
+local solver = require './solver'
+local worlds = require './world'
+
+local drains = {}
+
+type State = worlds.State
+
+local EventStay = solver.ContactEvent.stay
+
+--- A table a caller hands back to be filled again, or a new one. A caller may hand in any
+--- table, its own empty one included, so what it holds is not known until it is looked at.
+local function adopt(into: unknown): { [string]: unknown }
+  return (if type(into) == 'table' then into else {}) :: { [string]: unknown }
+end
+
+export type DrainOptions = {
+  --- Leave out the bodies that are asleep.
+  read awakeOnly: boolean?,
+  --- Leave out the bodies that are static or kinematic.
+  read dynamicOnly: boolean?,
+  --- For `writeLinearState`: false leaves the handles out.
+  read handles: boolean?,
+  --- For `writeLinearState`: true puts each body's user data beside it.
+  read userData: boolean?,
+}
+
+--- The world's own columns of where its bodies are and how they move, for a caller that reads
+--- them at once and keeps nothing: they change with the next step.
+function drains.linearStateView(state: State): worlds.LinearView
+  local view = state.linearView
+
+  view.high = state.high
+
+  return view
+end
+
+export type LinearState = {
+  handles: { number }?,
+  userData: { [number]: unknown }?,
+  positions: { vector },
+  velocities: { vector },
+  count: number,
+}
+
+--- Writes where every body is and how fast it is moving, and nothing else: for what does not
+--- need rotations.
+function drains.writeLinearState(state: State, into: unknown, options: DrainOptions?): (LinearState, number)
+  local given: DrainOptions = options or {}
+  local out = adopt(into)
+  local handles = if given.handles ~= false then (out.handles or {}) :: { number } else nil
+  local userData = if given.userData == true then (out.userData or {}) :: { [number]: unknown } else nil
+  local positions, velocities = (out.positions or {}) :: { vector }, (out.velocities or {}) :: { vector }
+  local awakeOnly, dynamicOnly = given.awakeOnly == true, given.dynamicOnly == true
+  local {alive, sleeping, bodyType, generation, position, velocity, userData: bodyData} = state
+  local count = 0
+
+  out.handles, out.userData, out.positions, out.velocities = handles, userData, positions, velocities
+
+  for body = 1, state.high do
+    if not alive[body] then continue end
+    if awakeOnly and sleeping[body] then continue end
+    if dynamicOnly and bodyType[body] ~= 'dynamic' then continue end
+
+    count += 1
+    if handles then handles[count] = generation[body] * worlds.HandleStride + body end
+    if userData then userData[count] = bodyData[body] end
+
+    positions[count], velocities[count] = position[body], velocity[body]
+  end
+
+  if handles then
+    for index = #handles, count + 1, -1 do
+      handles[index] = nil
+    end
+  end
+
+  if userData then
+    for index = #userData, count + 1, -1 do
+      userData[index] = nil
+    end
+  end
+
+  for index = #positions, count + 1, -1 do
+    positions[index], velocities[index] = nil, nil
+  end
+
+  out.count = count
+
+  return (out :: unknown) :: LinearState, count
+end
+
+--- Every body's state as columns. A rotation is in two: `rotations` is its vector and
+--- `rotationW` its scalar.
+export type Transforms = {
+  handles: { number },
+  positions: { vector },
+  rotations: { vector },
+  rotationW: { number },
+  velocities: { vector },
+  angularVelocities: { vector },
+  count: number,
+}
+
+function drains.writeTransforms(state: State, into: unknown, options: DrainOptions?): (Transforms, number)
+  local given: DrainOptions = options or {}
+  local out = adopt(into)
+  local handles, positions = (out.handles or {}) :: { number }, (out.positions or {}) :: { vector }
+  local rotations, rotationW = (out.rotations or {}) :: { vector }, (out.rotationW or {}) :: { number }
+  local velocities, angularVelocities = (out.velocities or {}) :: { vector }, (out.angularVelocities or {}) :: { vector }
+  local awakeOnly, dynamicOnly = given.awakeOnly == true, given.dynamicOnly == true
+  local {alive, sleeping, bodyType, generation, position, turn, turnW, velocity, spin} = state
+  local count = 0
+
+  out.handles, out.positions, out.rotations = handles, positions, rotations
+  out.rotationW, out.velocities, out.angularVelocities = rotationW, velocities, angularVelocities
+
+  for body = 1, state.high do
+    if not alive[body] then continue end
+    if awakeOnly and sleeping[body] then continue end
+    if dynamicOnly and bodyType[body] ~= 'dynamic' then continue end
+
+    count += 1
+    handles[count] = generation[body] * worlds.HandleStride + body
+    positions[count], rotations[count], rotationW[count] = position[body], turn[body], turnW[body]
+    velocities[count], angularVelocities[count] = velocity[body], spin[body]
+  end
+
+  for index = #handles, count + 1, -1 do
+    handles[index], positions[index], rotations[index] = nil, nil, nil
+    rotationW[index], velocities[index], angularVelocities[index] = nil, nil, nil
+  end
+
+  out.count = count
+
+  return (out :: unknown) :: Transforms, count
+end
+
+--- What `applyTransforms` takes: what `writeTransforms` writes, of which only the handles and
+--- the positions have to be there.
+export type TransformsToApply = {
+  read handles: { number },
+  read positions: { vector },
+  read rotations: { vector }?,
+  read rotationW: { number }?,
+  read velocities: { vector }?,
+  read angularVelocities: { vector }?,
+  read count: number?,
+}
+
+--- Puts bodies where a drained state says they are: for a state that came from somewhere that
+--- knows better, a server or a recording. Dynamic bodies are woken unless `wake` is false. What
+--- touched before is forgotten, since nothing says the bodies are near where they were.
+function drains.applyTransforms(state: State, from: TransformsToApply, wake: boolean?): number
+  assert(
+    type(from) == 'table' and type(from.handles) == 'table' and type(from.positions) == 'table',
+    'physik.applyTransforms: expected writeTransforms-compatible data'
+  )
+
+  local count = from.count or #from.handles
+  local rotations, rotationW, velocities, spins = from.rotations, from.rotationW, from.velocities, from.angularVelocities
+
+  for row = 1, count do
+    local body = worlds.slotOf(state, from.handles[row])
+
+    state.position[body] = from.positions[row]
+
+    if rotations and rotationW and rotations[row] and rotationW[row] then
+      worlds.turnTo(state, body, rotations[row], rotationW[row])
+    end
+
+    if velocities and velocities[row] then state.velocity[body] = velocities[row] end
+    if spins and spins[row] then state.spin[body] = spins[row] end
+
+    state.previousPosition[body] = state.position[body]
+    worlds.refreshBounds(state, body)
+
+    if state.bodyType[body] == 'static' then worlds.unsettle(state, body) end
+
+    if wake ~= false and state.bodyType[body] == 'dynamic' then
+      state.sleeping[body] = false
+      state.sleepTime[body] = 0
+    end
+  end
+
+  -- The bodies are as they were sorted, but what the solver kept of each contact is of where
+  -- they were, and the grid a question is answered from has to be looked over again.
+  state.cacheEpoch += 2
+  state.gridValid = false
+
+  return count
+end
+
+--- A step's contacts as columns: the two bodies, the normal from the first to the second, the
+--- point, how deep, how hard the solver pushed, and whether either body is a sensor.
+export type ContactColumns = {
+  first: { number },
+  second: { number },
+  normals: { vector },
+  points: { vector },
+  penetration: { number },
+  normalImpulse: { number },
+  sensor: { boolean },
+  count: number,
+}
+
+function drains.writeContacts(state: State, into: unknown): (ContactColumns, number)
+  local out = adopt(into)
+  local firsts, seconds = (out.first or {}) :: { number }, (out.second or {}) :: { number }
+  local normals, points = (out.normals or {}) :: { vector }, (out.points or {}) :: { vector }
+  local depths, impulses = (out.penetration or {}) :: { number }, (out.normalImpulse or {}) :: { number }
+  local sensors = (out.sensor or {}) :: { boolean }
+  local {contactFirst, contactSecond, contactNormal, contactPoint, contactDepth, normalImpulse, sensor, generation} = state
+  local count = state.contactCount
+
+  out.first, out.second, out.normals, out.points = firsts, seconds, normals, points
+  out.penetration, out.normalImpulse, out.sensor = depths, impulses, sensors
+
+  for contact = 1, count do
+    local first, second = contactFirst[contact], contactSecond[contact]
+
+    firsts[contact] = generation[first] * worlds.HandleStride + first
+    seconds[contact] = generation[second] * worlds.HandleStride + second
+    normals[contact], points[contact], depths[contact] = contactNormal[contact], contactPoint[contact], contactDepth[contact]
+    impulses[contact] = normalImpulse[contact]
+    sensors[contact] = sensor[first] or sensor[second]
+  end
+
+  for contact = #firsts, count + 1, -1 do
+    firsts[contact], seconds[contact], normals[contact], points[contact] = nil, nil, nil, nil
+    depths[contact], impulses[contact], sensors[contact] = nil, nil, nil
+  end
+
+  out.count = count
+
+  return (out :: unknown) :: ContactColumns, count
+end
+
+--- What pairs of bodies did this step, as columns: `kind` is one of `physik.contactEvent`.
+export type EventColumns = {
+  first: { number },
+  second: { number },
+  kind: { number },
+  sensor: { boolean },
+  count: number,
+}
+
+--- Writes the step's contact events: a pair that began to touch, one that is still touching, and
+--- one that stopped. `includeStay` false leaves out the ones still touching. A world tracks these
+--- only when it was made with `contactEvents`.
+function drains.writeContactEvents(state: State, into: unknown, includeStay: boolean?): (EventColumns, number)
+  local out = adopt(into)
+  local firsts, seconds = (out.first or {}) :: { number }, (out.second or {}) :: { number }
+  local kinds, sensors = (out.kind or {}) :: { number }, (out.sensor or {}) :: { boolean }
+  local {eventFirst, eventSecond, eventKind, eventSensor, alive, generation} = state
+  local count = 0
+
+  out.first, out.second, out.kind, out.sensor = firsts, seconds, kinds, sensors
+
+  for event = 1, state.contactEventCount do
+    local kind = eventKind[event]
+    if includeStay == false and kind == EventStay then continue end
+
+    local first, second = eventFirst[event], eventSecond[event]
+    if not alive[first] or not alive[second] then continue end
+
+    count += 1
+    firsts[count] = generation[first] * worlds.HandleStride + first
+    seconds[count] = generation[second] * worlds.HandleStride + second
+    kinds[count], sensors[count] = kind, eventSensor[event]
+  end
+
+  for index = #firsts, count + 1, -1 do
+    firsts[index], seconds[index], kinds[index], sensors[index] = nil, nil, nil, nil
+  end
+
+  out.count = count
+
+  return (out :: unknown) :: EventColumns, count
+end
+
+export type Contact = {
+  first: number,
+  second: number,
+  normal: vector,
+  point: vector,
+  penetration: number,
+  normalImpulse: number,
+  sensor: boolean,
+}
+
+--- A step's contacts as a list of records: for looking at, where `writeContacts` is for reading
+--- every step.
+function drains.contacts(state: State): { Contact }
+  local {contactFirst, contactSecond, contactNormal, contactPoint, contactDepth, normalImpulse, sensor, generation} = state
+  local count = state.contactCount
+  local out = table.create(count) :: { Contact }
+
+  for contact = 1, count do
+    local first, second = contactFirst[contact], contactSecond[contact]
+
+    out[contact] = {
+      first = generation[first] * worlds.HandleStride + first,
+      second = generation[second] * worlds.HandleStride + second,
+      normal = contactNormal[contact],
+      point = contactPoint[contact],
+      penetration = contactDepth[contact],
+      normalImpulse = normalImpulse[contact],
+      sensor = sensor[first] or sensor[second],
+    }
+  end
+
+  return out
+end
+
+export type Stats = {
+  frame: number,
+  bodies: number,
+  sleeping: number,
+  islands: number,
+  candidates: number,
+  contacts: number,
+  sensorContacts: number,
+  activeContacts: number,
+  manifolds: number,
+  warmStarted: number,
+  ccdHits: number,
+  joints: number,
+}
+
+--- What the last step came to, in numbers.
+function drains.stats(state: State): Stats
+  local {alive, sleeping, sensor, contactFirst, contactSecond} = state
+
+  return {
+    frame = state.frame,
+    bodies = state.aliveCount,
+    sleeping = #[for body in range(1, state.high) if alive[body] and sleeping[body] => body],
+    islands = state.islandCount,
+    candidates = state.candidateCount,
+    contacts = state.contactCount,
+    sensorContacts = #[
+      for contact in range(1, state.contactCount) if sensor[contactFirst[contact]] or sensor[contactSecond[contact]] => contact
+    ],
+    activeContacts = state.activeContactCount,
+    manifolds = state.manifoldCount,
+    warmStarted = state.warmStartedCount,
+    ccdHits = state.sweptHits,
+    joints = state.jointCount,
+  }
+end
+
+return drains

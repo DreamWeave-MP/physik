@@ -1,0 +1,1160 @@
+--!strict
+--!native
+-- A world: what it is made of, and its bodies. Everything a world knows is a column here, one
+-- entry to a body or to a contact, and the other modules are what is done to them: finding what
+-- touches, solving it, and answering questions about it.
+--
+-- A body is a slot: an index into every column. A handle is a slot and the number of bodies
+-- that have held it, so that the handle of a body that is gone names nothing.
+local geometry = require './geometry'
+local shapes = require './shape'
+local types = require './types'
+
+local world = {}
+
+local Zero = vector.zero
+local Up = vector.create(0, 1, 0)
+
+-- A handle is a generation times this, plus a slot: twenty bits of slot, exact in a double.
+local HandleStride = 1048576
+
+-- The bytes of the filter that says a grid cell is empty without a lookup: a prime, so that
+-- cells spread over it.
+local GridFilterSize = 65521
+
+world.HandleStride = HandleStride
+world.GridFilterSize = GridFilterSize
+
+export type BodyKind = 'static' | 'dynamic' | 'kinematic'
+
+--- A joint between two bodies: a distance kept, a point shared, or a point and an axis shared.
+export type Joint = {
+  kind: 'distance' | 'ball' | 'hinge',
+  first: number,
+  second: number,
+  firstGeneration: number,
+  secondGeneration: number,
+  firstAnchor: vector,
+  secondAnchor: vector,
+  stiffness: number,
+  damping: number,
+  collideConnected: boolean,
+  --- A distance joint's length, and the impulse it has built up.
+  rest: number,
+  impulse: number,
+  --- A hinge's axis in each body, how stiffly the two are kept in line, and its motor.
+  firstAxis: vector,
+  secondAxis: vector,
+  angularStiffness: number,
+  motorSpeed: number?,
+  maxMotorTorque: number,
+  motorImpulse: number,
+}
+
+--- What `linearStateView` hands out: the world's own columns, to be read and not kept.
+export type LinearView = {
+  alive: { boolean },
+  bodyType: { BodyKind },
+  userData: { [number]: unknown },
+  positions: { vector },
+  velocities: { vector },
+  high: number,
+  dynamicCode: BodyKind,
+}
+
+export type State = {
+  -- How it steps.
+  gravity: vector,
+  velocityIterations: number,
+  positionIterations: number,
+  positionCorrection: number,
+  baumgarte: number,
+  baumgarteSlop: number,
+  maxDepenetrationVelocity: number,
+  penetrationSlop: number,
+  restitutionThreshold: number,
+  allowSleep: boolean,
+  sleepLinear: number,
+  sleepAngular: number,
+  sleepDelay: number,
+  wakeSpeed: number,
+  wakePenetration: number,
+  warmStarting: boolean,
+  warmStartFactor: number,
+  trackContactEvents: boolean,
+  manifoldMatchDistance: number,
+  contactMargin: number,
+  manifoldSlop: number,
+  ccdSlop: number,
+  broadphase: 'grid' | 'sap',
+  broadphaseCellSize: number,
+  directLargeThreshold: number,
+  meshQueryCellLimit: number,
+  queryRayCellLimit: number,
+  queryAabbCellLimit: number,
+  fixedDt: number,
+  maxCatchUpSteps: number,
+  accumulator: number,
+  frame: number,
+
+  -- Bodies: `high` is the highest slot ever used, and `free` a heap of the ones given back.
+  high: number,
+  aliveCount: number,
+  free: { number },
+  generation: { number },
+  alive: { boolean },
+  bodyType: { BodyKind },
+  shape: { types.Shape },
+  --- A sphere's radius, and false for a body that is not one.
+  sphereRadius: { number | false },
+  position: { vector },
+  turn: { vector },
+  turnW: { number },
+  --- Where a body's rotation takes the three axes, kept beside the rotation.
+  axis0: { vector },
+  axis1: { vector },
+  axis2: { vector },
+  velocity: { vector },
+  spin: { vector },
+  force: { vector },
+  torque: { vector },
+  inverseMass: { number },
+  inverseInertia: { vector },
+  friction: { number },
+  restitution: { number },
+  linearDamping: { number },
+  angularDamping: { number },
+  group: { number },
+  mask: { number },
+  userData: { [number]: unknown },
+  sensor: { boolean },
+  --- Whether a body is swept from where it was to where it is, and where it was.
+  swept: { boolean },
+  sweptCount: number,
+  sweptHits: number,
+  previousPosition: { vector },
+  sleeping: { boolean },
+  sleepTime: { number },
+  boundsLow: { vector },
+  boundsHigh: { vector },
+  linearView: LinearView,
+
+  -- The bodies that can move, and the ones at rest.
+  movers: { number },
+  moversDirty: boolean,
+  rest: { boolean },
+  unsettled: { number },
+  unseen: { number },
+  seenPosition: { [number]: vector? },
+  seenTurn: { vector },
+  seenTurnW: { number },
+  stirring: number,
+  stillWasMoved: boolean,
+  quiet: boolean,
+  changed: boolean,
+
+  -- The tree of the static bodies, and each mover's answer from it.
+  stillDirty: boolean,
+  stillRoot: number,
+  stillEpoch: number,
+  stillNodeCount: number,
+  stillLow: { vector },
+  stillHigh: { vector },
+  stillLeft: { number },
+  stillRight: { number },
+  stillStack: { number },
+  stillNear: { number },
+  nearStill: { [number]: { number } },
+  nearLows: { vector },
+  nearHighs: { vector },
+  nearEpochs: { number },
+
+  -- The grid of the bodies that can move, and the order the sweep keeps them in.
+  gridHeads: { [number]: number },
+  gridKeys: { number },
+  gridNext: { number },
+  gridLarge: { number },
+  gridColumn: { number },
+  gridRow: { number },
+  gridLayer: { number },
+  gridKey: { [number]: number? },
+  gridKeyColumn: { number },
+  gridKeyRow: { number },
+  gridKeyLayer: { number },
+  gridOccupied: buffer,
+  gridDenseKeys: { number },
+  gridPairFirst: { number },
+  gridPairSecond: { number },
+  gridDenseCount: number,
+  gridPairCount: number,
+  gridTopologyReady: boolean,
+  gridTopologyDirty: boolean,
+  gridValid: boolean,
+  gridSmallCount: number,
+  order: { number },
+  inOrder: { [number]: boolean? },
+
+  -- Contacts, one entry to each: what a step found, and what the solver made of it.
+  contactCount: number,
+  candidateCount: number,
+  manifoldCount: number,
+  warmStartedCount: number,
+  activeContactCount: number,
+  islandCount: number,
+  cacheEpoch: number,
+  contactFirst: { number },
+  contactSecond: { number },
+  contactNormal: { vector },
+  contactPoint: { vector },
+  contactDepth: { number },
+  contactSolved: { boolean },
+  normalImpulse: { number },
+  tangentImpulse1: { number },
+  tangentImpulse2: { number },
+  firstArm: { vector },
+  secondArm: { vector },
+  firstAnchor: { vector },
+  secondAnchor: { vector },
+  normalMass: { number },
+  contactFriction: { number },
+  contactBounce: { number },
+  contactBias: { number },
+  firstNormalTurn: { vector },
+  secondNormalTurn: { vector },
+  tangent1: { vector },
+  tangent2: { vector },
+  tangentMass1: { number },
+  tangentMass2: { number },
+  firstTangentTurn1: { vector },
+  secondTangentTurn1: { vector },
+  firstTangentTurn2: { vector },
+  secondTangentTurn2: { vector },
+  --- What each touching pair's contacts were last step, to start this step's solve from: a
+  --- header of numbers, then an anchor in each body, a normal and two impulses to a contact.
+  contactCache: { [number]: { number | vector } },
+  activeContacts: { number },
+
+  -- Which pairs touch, for the events that say when one starts and stops.
+  contactEventEpoch: number,
+  contactEventCount: number,
+  contactPairSeen: { [number]: number },
+  contactPairActive: { [number]: boolean? },
+  contactPairFirst: { [number]: number? },
+  contactPairSecond: { [number]: number? },
+  contactPairSensor: { [number]: boolean? },
+  contactPairsBefore: { number },
+  contactPairsNow: { number },
+  eventFirst: { number },
+  eventSecond: { number },
+  eventKind: { number },
+  eventSensor: { boolean },
+
+  -- Room to work in, kept between calls so that a step allocates nothing.
+  clipFrom: { vector },
+  clipTo: { vector },
+  manifoldPoints: { vector },
+  manifoldDepths: { number },
+  meshNormals: { vector },
+  meshPoints: { vector },
+  meshDepths: { number },
+  meshContactCount: number,
+  firstPieceCentres: { vector },
+  firstPieceTurns: { vector },
+  firstPieceTurnWs: { number },
+  secondPieceCentres: { vector },
+  secondPieceTurns: { vector },
+  secondPieceTurnWs: { number },
+  meshMarks: { [number]: number },
+  meshMarkEpoch: number,
+  queryMarks: { [number]: number },
+  queryMarkEpoch: number,
+  castCandidates: { number },
+  castCapsule: { kind: 'capsule', radius: number, halfHeight: number },
+  castTriangles: { vector },
+  meshTriangles: { number },
+
+  -- Islands: the bodies that touch or are joined, which sleep and wake together.
+  islandParent: { number },
+  islandSize: { number },
+  islandAwake: { boolean },
+  islandRoots: { number },
+  islandCanSleep: { boolean },
+  islandLeastRest: { number },
+
+  joints: { [number]: Joint },
+  jointNoCollide: { [number]: number },
+  nextJoint: number,
+  jointCount: number,
+}
+
+export type Options = {
+  read gravity: vector?,
+  read velocityIterations: number?,
+  read positionIterations: number?,
+  read positionCorrection: number?,
+  read baumgarte: number?,
+  read baumgarteSlop: number?,
+  read maxDepenetrationVelocity: number?,
+  read penetrationSlop: number?,
+  read restitutionThreshold: number?,
+  read allowSleep: boolean?,
+  read sleepLinear: number?,
+  read sleepAngular: number?,
+  read sleepDelay: number?,
+  read wakeSpeed: number?,
+  read wakePenetration: number?,
+  read warmStarting: boolean?,
+  read warmStartFactor: number?,
+  read contactEvents: boolean?,
+  read manifoldMatchDistance: number?,
+  read contactMargin: number?,
+  read manifoldSlop: number?,
+  read ccdSlop: number?,
+  read broadphase: ('grid' | 'sap')?,
+  read broadphaseCellSize: number?,
+  read directLargeThreshold: number?,
+  read meshQueryCellLimit: number?,
+  read queryRayCellLimit: number?,
+  read queryAabbCellLimit: number?,
+  read fixedDt: number?,
+  read maxCatchUpSteps: number?,
+}
+
+--- A whole number of at least `least`, or an error naming the option that was not one.
+local function wholeOption(value: number, least: number, complaint: string): number
+  assert(value >= least and value % 1 == 0, complaint)
+
+  return value
+end
+
+--- A world with nothing in it.
+function world.new(options: Options?): State
+  local given: Options = options or {}
+  local contactMargin = if given.contactMargin == nil then 0.015 else given.contactMargin
+  local broadphase = given.broadphase or 'grid'
+  local cellSize = given.broadphaseCellSize or 1.0
+
+  assert(broadphase == 'grid' or broadphase == 'sap', 'physik.newWorld: broadphase must be grid or sap')
+  assert(cellSize > 0, 'physik.newWorld: broadphaseCellSize must be > 0')
+
+  local alive: { boolean }, bodyType: { BodyKind }, userData: { [number]: unknown } = {}, {}, {}
+  local position: { vector }, velocity: { vector } = {}, {}
+
+  return {
+    gravity = given.gravity or vector.create(0, -9.81, 0),
+    velocityIterations = given.velocityIterations or 4,
+    positionIterations = wholeOption(given.positionIterations or 1, 1, 'physik.newWorld: positionIterations must be a positive integer'),
+    positionCorrection = if given.positionCorrection == nil then 0.12 else given.positionCorrection,
+    baumgarte = if given.baumgarte == nil then 0.03 else given.baumgarte,
+    baumgarteSlop = if given.baumgarteSlop == nil then 0.05 else given.baumgarteSlop,
+    maxDepenetrationVelocity = given.maxDepenetrationVelocity or 1.0,
+    penetrationSlop = given.penetrationSlop or 0.003,
+    restitutionThreshold = given.restitutionThreshold or 1.0,
+    allowSleep = if given.allowSleep == nil then true else given.allowSleep,
+    sleepLinear = given.sleepLinear or 0.04,
+    sleepAngular = given.sleepAngular or 0.05,
+    sleepDelay = given.sleepDelay or 0.6,
+    wakeSpeed = given.wakeSpeed or 0.5,
+    wakePenetration = given.wakePenetration or 0.05,
+    warmStarting = if given.warmStarting == nil then true else given.warmStarting,
+    warmStartFactor = given.warmStartFactor or 0.85,
+    trackContactEvents = given.contactEvents == true,
+    manifoldMatchDistance = given.manifoldMatchDistance or 0.08,
+    contactMargin = contactMargin,
+    manifoldSlop = given.manifoldSlop or contactMargin,
+    ccdSlop = given.ccdSlop or 0.001,
+    broadphase = broadphase,
+    broadphaseCellSize = cellSize,
+    directLargeThreshold = wholeOption(
+      given.directLargeThreshold or 16,
+      0,
+      'physik.newWorld: directLargeThreshold must be a non-negative integer'
+    ),
+    meshQueryCellLimit = wholeOption(given.meshQueryCellLimit or 4096, 1, 'physik.newWorld: meshQueryCellLimit must be a positive integer'),
+    queryRayCellLimit = wholeOption(given.queryRayCellLimit or 2048, 1, 'physik.newWorld: queryRayCellLimit must be a positive integer'),
+    queryAabbCellLimit = wholeOption(given.queryAabbCellLimit or 8192, 1, 'physik.newWorld: queryAabbCellLimit must be a positive integer'),
+    fixedDt = given.fixedDt or (1 / 60),
+    maxCatchUpSteps = given.maxCatchUpSteps or 8,
+    accumulator = 0,
+    frame = 0,
+
+    high = 0,
+    aliveCount = 0,
+    free = {},
+    generation = {},
+    alive = alive,
+    bodyType = bodyType,
+    shape = {},
+    sphereRadius = {},
+    position = position,
+    turn = {},
+    turnW = {},
+    axis0 = {},
+    axis1 = {},
+    axis2 = {},
+    velocity = velocity,
+    spin = {},
+    force = {},
+    torque = {},
+    inverseMass = {},
+    inverseInertia = {},
+    friction = {},
+    restitution = {},
+    linearDamping = {},
+    angularDamping = {},
+    group = {},
+    mask = {},
+    userData = userData,
+    sensor = {},
+    swept = {},
+    sweptCount = 0,
+    sweptHits = 0,
+    previousPosition = {},
+    sleeping = {},
+    sleepTime = {},
+    boundsLow = {},
+    boundsHigh = {},
+    linearView = {
+      alive = alive,
+      bodyType = bodyType,
+      userData = userData,
+      positions = position,
+      velocities = velocity,
+      high = 0,
+      dynamicCode = 'dynamic' :: BodyKind,
+    },
+
+    movers = {},
+    moversDirty = true,
+    rest = {},
+    unsettled = {},
+    unseen = {},
+    seenPosition = {},
+    seenTurn = {},
+    seenTurnW = {},
+    stirring = 0,
+    stillWasMoved = false,
+    quiet = false,
+    changed = true,
+
+    stillDirty = true,
+    stillRoot = 0,
+    stillEpoch = 0,
+    stillNodeCount = 0,
+    stillLow = {},
+    stillHigh = {},
+    stillLeft = {},
+    stillRight = {},
+    stillStack = {},
+    stillNear = {},
+    nearStill = {},
+    nearLows = {},
+    nearHighs = {},
+    nearEpochs = {},
+
+    gridHeads = {},
+    gridKeys = {},
+    gridNext = {},
+    gridLarge = {},
+    gridColumn = {},
+    gridRow = {},
+    gridLayer = {},
+    gridKey = {},
+    gridKeyColumn = {},
+    gridKeyRow = {},
+    gridKeyLayer = {},
+    gridOccupied = buffer.create(GridFilterSize),
+    gridDenseKeys = {},
+    gridPairFirst = {},
+    gridPairSecond = {},
+    gridDenseCount = 0,
+    gridPairCount = 0,
+    gridTopologyReady = false,
+    gridTopologyDirty = true,
+    gridValid = false,
+    gridSmallCount = 0,
+    order = {},
+    inOrder = {},
+
+    contactCount = 0,
+    candidateCount = 0,
+    manifoldCount = 0,
+    warmStartedCount = 0,
+    activeContactCount = 0,
+    islandCount = 0,
+    cacheEpoch = 0,
+    contactFirst = {},
+    contactSecond = {},
+    contactNormal = {},
+    contactPoint = {},
+    contactDepth = {},
+    contactSolved = {},
+    normalImpulse = {},
+    tangentImpulse1 = {},
+    tangentImpulse2 = {},
+    firstArm = {},
+    secondArm = {},
+    firstAnchor = {},
+    secondAnchor = {},
+    normalMass = {},
+    contactFriction = {},
+    contactBounce = {},
+    contactBias = {},
+    firstNormalTurn = {},
+    secondNormalTurn = {},
+    tangent1 = {},
+    tangent2 = {},
+    tangentMass1 = {},
+    tangentMass2 = {},
+    firstTangentTurn1 = {},
+    secondTangentTurn1 = {},
+    firstTangentTurn2 = {},
+    secondTangentTurn2 = {},
+    contactCache = {},
+    activeContacts = {},
+
+    contactEventEpoch = 0,
+    contactEventCount = 0,
+    contactPairSeen = {},
+    contactPairActive = {},
+    contactPairFirst = {},
+    contactPairSecond = {},
+    contactPairSensor = {},
+    contactPairsBefore = {},
+    contactPairsNow = {},
+    eventFirst = {},
+    eventSecond = {},
+    eventKind = {},
+    eventSensor = {},
+
+    clipFrom = {},
+    clipTo = {},
+    manifoldPoints = {},
+    manifoldDepths = {},
+    meshNormals = {},
+    meshPoints = {},
+    meshDepths = {},
+    meshContactCount = 0,
+    firstPieceCentres = {},
+    firstPieceTurns = {},
+    firstPieceTurnWs = {},
+    secondPieceCentres = {},
+    secondPieceTurns = {},
+    secondPieceTurnWs = {},
+    meshMarks = {},
+    meshMarkEpoch = 0,
+    queryMarks = {},
+    queryMarkEpoch = 0,
+    castCandidates = {},
+    castCapsule = { kind = 'capsule' :: 'capsule', radius = 0, halfHeight = 0 },
+    castTriangles = {},
+    meshTriangles = {},
+
+    islandParent = {},
+    islandSize = {},
+    islandAwake = {},
+    islandRoots = {},
+    islandCanSleep = {},
+    islandLeastRest = {},
+
+    joints = {},
+    jointNoCollide = {},
+    nextJoint = 1,
+    jointCount = 0,
+  }
+end
+
+--- The handle of the body in a slot.
+function world.handleOf(state: State, body: number): number
+  return state.generation[body] * HandleStride + body
+end
+
+--- The slot a handle names, or an error when its body is gone.
+function world.slotOf(state: State, handle: number): number
+  assert(type(handle) == 'number', 'physik: body handle must be a number')
+
+  local body = handle % HandleStride
+  assert(
+    body >= 1 and state.alive[body] and state.generation[body] == (handle - body) / HandleStride,
+    'physik: stale or invalid body handle'
+  )
+
+  return body
+end
+
+--- Whether a handle is of a body that is still in the world.
+function world.hasBody(state: State, handle: number): boolean
+  if type(handle) ~= 'number' then return false end
+
+  local body = handle % HandleStride
+
+  return body >= 1 and state.alive[body] == true and state.generation[body] == (handle - body) / HandleStride
+end
+
+--- The one number that names a pair of slots, whichever way round they are given.
+function world.pairKey(first: number, second: number): number
+  if second < first then return second * HandleStride + first end
+
+  return first * HandleStride + second
+end
+
+--- Works out a body's bounds from where it is and how it is turned, and the axes its rotation
+--- makes. The bounds are wider than the body by the margin within which contacts are found.
+function world.refreshBounds(state: State, body: number)
+  local shape = state.shape[body]
+  local at = state.position[body]
+  local margin = state.contactMargin
+
+  if shape.kind == 'sphere' then
+    local reach = shape.radius + margin
+    local each = vector.create(reach, reach, reach)
+
+    state.boundsLow[body], state.boundsHigh[body] = at - each, at + each
+
+    return
+  end
+
+  local axis0, axis1, axis2 = geometry.axesOf(state.turn[body], state.turnW[body])
+  local low, high
+
+  state.axis0[body], state.axis1[body], state.axis2[body] = axis0, axis1, axis2
+
+  if shape.kind == 'box' then
+    local half = shape.halfExtents
+    local reach = vector.create(
+      math.abs(axis0.x) * half.x + math.abs(axis1.x) * half.y + math.abs(axis2.x) * half.z,
+      math.abs(axis0.y) * half.x + math.abs(axis1.y) * half.y + math.abs(axis2.y) * half.z,
+      math.abs(axis0.z) * half.x + math.abs(axis1.z) * half.y + math.abs(axis2.z) * half.z
+    )
+
+    low, high = at - reach, at + reach
+  elseif shape.kind == 'capsule' then
+    local halfHeight, radius = shape.halfHeight, shape.radius
+    local reach = vector.create(
+      math.abs(axis1.x) * halfHeight + radius,
+      math.abs(axis1.y) * halfHeight + radius,
+      math.abs(axis1.z) * halfHeight + radius
+    )
+
+    low, high = at - reach, at + reach
+  else
+    -- A mesh, a heightfield or a compound: the box round its own bounds, turned.
+    local middle = (shape.localMin + shape.localMax) * 0.5
+    local half = (shape.localMax - shape.localMin) * 0.5
+    local centre = at + geometry.rotate(state.turn[body], state.turnW[body], middle)
+    local reach = vector.create(
+      math.abs(axis0.x) * half.x + math.abs(axis1.x) * half.y + math.abs(axis2.x) * half.z,
+      math.abs(axis0.y) * half.x + math.abs(axis1.y) * half.y + math.abs(axis2.y) * half.z,
+      math.abs(axis0.z) * half.x + math.abs(axis1.z) * half.y + math.abs(axis2.z) * half.z
+    )
+
+    low, high = centre - reach, centre + reach
+  end
+
+  if margin > 0 then
+    local skin = vector.create(margin, margin, margin)
+
+    low -= skin
+    high += skin
+  end
+
+  state.boundsLow[body], state.boundsHigh[body] = low, high
+end
+
+--- Takes a free slot, the lowest there is, or a new one. The free slots are a heap with the
+--- lowest on top: a world that has had bodies taken out of it then gives the same slots to the
+--- same bodies as a new one, and steps as a new one does.
+local function takeSlot(state: State, moves: boolean): number
+  local free = state.free
+  local count = #free
+  local body
+
+  if count > 0 then
+    local last = free[count]
+    local at = 1
+
+    body = free[1]
+    free[count] = nil
+    count -= 1
+
+    -- The last one, sifted down from the top.
+    while true do
+      local below = at * 2
+      if below > count then break end
+      if below < count and free[below + 1] < free[below] then below += 1 end
+      if free[below] >= last then break end
+
+      free[at] = free[below]
+      at = below
+    end
+
+    if count > 0 then free[at] = last end
+
+    state.generation[body] += 1
+  else
+    body = state.high + 1
+    assert(body < HandleStride, 'physik: world body capacity exceeded')
+    state.high = body
+    state.generation[body] = 1
+  end
+
+  state.alive[body] = true
+  state.aliveCount += 1
+
+  -- The sweep's order is of the bodies that can move. A slot that is taken again before the
+  -- order was compacted is still listed in it, and listing it twice would offer each of its
+  -- pairs twice.
+  if moves and not state.inOrder[body] then
+    state.inOrder[body] = true
+    table.insert(state.order, body)
+  end
+
+  return body
+end
+
+export type BodyOptions = {
+  --- Dynamic unless given.
+  read type: BodyKind?,
+  --- A sphere of radius 0.5 unless given.
+  read shape: types.Shape?,
+  read position: vector?,
+  read rotation: types.Rotation?,
+  read velocity: vector?,
+  read angularVelocity: vector?,
+  --- 1 unless given. A static or kinematic body has none.
+  read mass: number?,
+  read friction: number?,
+  read restitution: number?,
+  read linearDamping: number?,
+  read angularDamping: number?,
+  --- The bits a body is in, and the bits of the bodies it meets.
+  read group: number?,
+  read mask: number?,
+  read userData: unknown,
+  --- A sensor touches and is told so, and pushes nothing.
+  read sensor: boolean?,
+  --- A sphere that is swept from where it was to where it is, so that it passes through nothing.
+  read ccd: boolean?,
+}
+
+--- Adds a body and returns its handle.
+function world.addBody(state: State, options: BodyOptions?): number
+  local given: BodyOptions = options or {}
+  local shape: types.Shape = given.shape or shapes.sphere(0.5)
+  local kind: BodyKind = given.type or 'dynamic'
+
+  assert(
+    kind == 'dynamic' or kind == 'static' or kind == 'kinematic',
+    "physik: body type must be 'dynamic', 'static', or 'kinematic'"
+  )
+  assert(type(shape) == 'table' and type(shape.kind) == 'string', 'physik.addBody: invalid shape')
+  assert(
+    not ((shape.kind == 'mesh' or shape.kind == 'heightfield') and kind == 'dynamic'),
+    'physik.addBody: triangle meshes and heightfields must be static or kinematic'
+  )
+
+  local mass = if kind == 'dynamic' then given.mass or 1 else 0
+  assert(mass >= 0, 'physik.addBody: mass must be >= 0')
+
+  -- Checked before a slot is taken, so a body that is refused leaves nothing behind.
+  local rotation = given.rotation
+  local turn, turnW = Zero, 1
+
+  if rotation ~= nil then
+    if type(rotation) ~= 'table' or typeof(rotation.turn) ~= 'vector' or type(rotation.turnW) ~= 'number' then
+      error('physik.addBody: rotation must come from physik.quat/axisAngle', 2)
+    end
+
+    turn, turnW = geometry.normalizeTurn(rotation.turn, rotation.turnW)
+  end
+
+  local body = takeSlot(state, kind ~= 'static')
+  local at = given.position or Zero
+
+  state.bodyType[body] = kind
+  state.shape[body] = shape
+  state.sphereRadius[body] = shape.kind == 'sphere' and shape.radius
+  state.position[body] = at
+  state.velocity[body] = given.velocity or Zero
+  state.spin[body] = given.angularVelocity or Zero
+  state.force[body] = Zero
+  state.torque[body] = Zero
+  state.turn[body], state.turnW[body] = turn, turnW
+  state.axis0[body], state.axis1[body], state.axis2[body] = geometry.axesOf(turn, turnW)
+  state.inverseMass[body] = if kind == 'dynamic' and mass > 1e-8 then 1 / mass else 0
+  state.inverseInertia[body] = if kind == 'dynamic' then shapes.inverseInertia(shape, mass) else Zero
+  state.friction[body] = given.friction or 0.6
+  state.restitution[body] = given.restitution or 0.05
+  state.linearDamping[body] = given.linearDamping or 0.02
+  state.angularDamping[body] = given.angularDamping or 0.05
+  state.group[body] = given.group or 1
+  state.mask[body] = if given.mask == nil then 0xffffffff else given.mask
+  state.userData[body] = given.userData
+  state.swept[body] = given.ccd == true
+  state.sensor[body] = given.sensor == true
+  state.previousPosition[body] = at
+  state.sleeping[body] = false
+  state.sleepTime[body] = 0
+  state.boundsLow[body] = Zero
+  state.boundsHigh[body] = Zero
+  world.refreshBounds(state, body)
+
+  state.gridValid = false
+  state.gridTopologyDirty = true
+  state.gridKey[body] = nil
+  state.rest[body], state.seenPosition[body] = false, nil
+  state.changed = true
+  state.nearEpochs[body] = 0
+
+  if kind == 'static' then
+    state.stillDirty = true
+    table.insert(state.unsettled, body)
+  else
+    state.moversDirty = true
+  end
+
+  if state.swept[body] then state.sweptCount += 1 end
+
+  return world.handleOf(state, body)
+end
+
+--- Forgets a joint: the pair it kept from colliding may collide again.
+function world.dropJoint(state: State, id: number)
+  local joint = state.joints[id]
+  if not joint then return end
+
+  if not joint.collideConnected then
+    local key = world.pairKey(joint.first, joint.second)
+    local held = state.jointNoCollide[key] or 0
+
+    state.jointNoCollide[key] = if held <= 1 then nil else held - 1
+  end
+
+  state.joints[id] = nil
+  state.jointCount -= 1
+end
+
+--- Takes a body out of the world, and its joints with it.
+function world.removeBody(state: State, handle: number)
+  local body = world.slotOf(state, handle)
+
+  for id = 1, state.nextJoint - 1 do
+    local joint = state.joints[id]
+    if joint and (joint.first == body or joint.second == body) then world.dropJoint(state, id) end
+  end
+
+  state.alive[body] = false
+  state.aliveCount -= 1
+  state.rest[body] = false
+  state.changed = true
+
+  if state.bodyType[body] == 'static' then
+    state.stillDirty = true
+  else
+    state.moversDirty = true
+  end
+
+  if state.swept[body] then state.sweptCount -= 1 end
+
+  -- Onto the heap of free slots, sifted up from the bottom.
+  local free = state.free
+  local at = #free + 1
+
+  while at > 1 do
+    local above = at // 2
+    if free[above] <= body then break end
+
+    free[at] = free[above]
+    at = above
+  end
+
+  free[at] = body
+  state.userData[body] = nil
+  state.sleeping[body] = false
+
+  -- A pair with a body that is gone must not be found still touching by whatever takes its slot.
+  local first, second, active, sensed = state.contactPairFirst, state.contactPairSecond, state.contactPairActive, state.contactPairSensor
+
+  for _, key in state.contactPairsBefore do
+    if first[key] == body or second[key] == body then
+      active[key], first[key], second[key], sensed[key] = nil, nil, nil, nil
+    end
+  end
+
+  state.gridValid = false
+  state.gridTopologyDirty = true
+end
+
+--- A static body has been moved: the tree is to be built again, and what the body touches is to
+--- be found again.
+local function unsettle(state: State, body: number)
+  state.stillDirty = true
+  state.rest[body] = false
+  state.changed = true
+  table.insert(state.unsettled, body)
+end
+
+--- Wakes a body, which is what touching it does.
+local function rouse(state: State, body: number)
+  state.sleeping[body] = false
+  state.sleepTime[body] = 0
+end
+
+export type Body = {
+  handle: number,
+  type: BodyKind,
+  position: vector,
+  rotation: types.Rotation,
+  velocity: vector,
+  angularVelocity: vector,
+  sleeping: boolean,
+  sensor: boolean,
+  userData: unknown,
+}
+
+--- A body as it is now.
+function world.getBody(state: State, handle: number): Body
+  local body = world.slotOf(state, handle)
+
+  return {
+    handle = handle,
+    type = state.bodyType[body],
+    position = state.position[body],
+    rotation = { turn = state.turn[body], turnW = state.turnW[body] },
+    velocity = state.velocity[body],
+    angularVelocity = state.spin[body],
+    sleeping = state.sleeping[body],
+    sensor = state.sensor[body],
+    userData = state.userData[body],
+  }
+end
+
+--- Turns a body to a rotation given in its two parts, which need not be of length one.
+function world.turnTo(state: State, body: number, turn: vector, turnW: number)
+  local unitTurn, unitTurnW = geometry.normalizeTurn(turn, turnW)
+
+  state.turn[body], state.turnW[body] = unitTurn, unitTurnW
+  state.axis0[body], state.axis1[body], state.axis2[body] = geometry.axesOf(unitTurn, unitTurnW)
+end
+
+--- Puts a body somewhere, and wakes it unless `wake` is false.
+function world.setPosition(state: State, handle: number, position: vector, wake: boolean?)
+  local body = world.slotOf(state, handle)
+
+  state.position[body] = position
+  state.gridValid = false
+
+  if state.bodyType[body] == 'static' then unsettle(state, body) end
+  if wake ~= false then rouse(state, body) end
+end
+
+--- Turns a body to a rotation, and wakes it unless `wake` is false.
+function world.setRotation(state: State, handle: number, rotation: types.Rotation, wake: boolean?)
+  local body = world.slotOf(state, handle)
+  local turn, turnW = geometry.normalizeTurn(rotation.turn, rotation.turnW)
+
+  state.turn[body], state.turnW[body] = turn, turnW
+  state.axis0[body], state.axis1[body], state.axis2[body] = geometry.axesOf(turn, turnW)
+  state.gridValid = false
+
+  if state.bodyType[body] == 'static' then unsettle(state, body) end
+  if wake ~= false then rouse(state, body) end
+end
+
+--- Gives a kinematic body the velocity and spin that bring it to a place, and to a rotation if
+--- one is given, in `duration`: the next step of that long moves it there, pushing what is in
+--- its way.
+function world.driveKinematic(state: State, handle: number, position: vector, rotation: types.Rotation?, duration: number)
+  local body = world.slotOf(state, handle)
+
+  assert(state.bodyType[body] == 'kinematic', 'physik.driveKinematic: body must be kinematic')
+  assert(
+    typeof(position) == 'vector' and type(duration) == 'number' and duration > 0,
+    'physik.driveKinematic: target position must be a vector and dt > 0'
+  )
+
+  state.velocity[body] = (position - state.position[body]) / duration
+
+  if not rotation then
+    state.spin[body] = Zero
+
+    return
+  end
+
+  assert(
+    type(rotation) == 'table' and typeof(rotation.turn) == 'vector' and type(rotation.turnW) == 'number',
+    'physik.driveKinematic: rotation must come from physik.quat/axisAngle'
+  )
+
+  -- The rotation from where it is turned to where it is to be, the short way round.
+  local target, targetW = geometry.normalizeTurn(rotation.turn, rotation.turnW)
+  local change, changeW = geometry.composeTurns(target, targetW, -state.turn[body], state.turnW[body])
+
+  if changeW < 0 then
+    change, changeW = -change, -changeW
+  end
+
+  changeW = geometry.clamp(changeW, -1, 1)
+
+  local angle = 2 * math.acos(changeW)
+  local sine = math.max(1 - changeW * changeW, 0)
+
+  state.spin[body] = if angle > 1e-7 and sine > 1e-12 then change * (angle / (math.sqrt(sine) * duration)) else Zero
+end
+
+--- Moves the origin by `delta`: every body and every contact is that much nearer it. For a
+--- world that has travelled far enough from the origin to lose precision.
+function world.shiftOrigin(state: State, delta: vector)
+  assert(typeof(delta) == 'vector', 'physik.shiftOrigin: delta must be a vector')
+
+  local {alive, position, previousPosition, boundsLow, boundsHigh, contactPoint} = state
+
+  for body = 1, state.high do
+    if not alive[body] then continue end
+
+    position[body] -= delta
+    previousPosition[body] -= delta
+    boundsLow[body] -= delta
+    boundsHigh[body] -= delta
+  end
+
+  for contact = 1, state.contactCount do
+    contactPoint[contact] -= delta
+  end
+
+  state.gridValid = false
+  state.stillDirty = true
+end
+
+function world.setVelocity(state: State, handle: number, velocity: vector)
+  local body = world.slotOf(state, handle)
+
+  state.velocity[body] = velocity
+  rouse(state, body)
+end
+
+function world.setAngularVelocity(state: State, handle: number, spin: vector)
+  local body = world.slotOf(state, handle)
+
+  state.spin[body] = spin
+  rouse(state, body)
+end
+
+function world.wake(state: State, handle: number)
+  rouse(state, world.slotOf(state, handle))
+end
+
+--- Pushes a dynamic body for the length of the next step.
+function world.applyForce(state: State, handle: number, force: vector)
+  local body = world.slotOf(state, handle)
+  if state.bodyType[body] ~= 'dynamic' then return end
+
+  state.force[body] += force
+  rouse(state, body)
+end
+
+--- Pushes a dynamic body at a point of the world, which turns it too.
+function world.applyForceAtPoint(state: State, handle: number, force: vector, point: vector)
+  local body = world.slotOf(state, handle)
+  if state.bodyType[body] ~= 'dynamic' then return end
+
+  state.force[body] += force
+  state.torque[body] += vector.cross(point - state.position[body], force)
+  rouse(state, body)
+end
+
+function world.applyTorque(state: State, handle: number, torque: vector)
+  local body = world.slotOf(state, handle)
+  if state.bodyType[body] ~= 'dynamic' then return end
+
+  state.torque[body] += torque
+  rouse(state, body)
+end
+
+export type JointOptions = {
+  --- Where the joint holds each body, in the body's own space. Its middle unless given.
+  read localAnchorA: vector?,
+  read localAnchorB: vector?,
+  --- A hinge's axis in each body's own space. Y unless given.
+  read localAxisA: vector?,
+  read localAxisB: vector?,
+  --- A distance joint's length. How far apart the anchors are when it is made, unless given.
+  read length: number?,
+  read stiffness: number?,
+  read damping: number?,
+  --- How stiffly a hinge keeps the two axes in line.
+  read angularStiffness: number?,
+  --- A hinge's motor: the speed it turns at, and the most it will twist to get there.
+  read motorSpeed: number?,
+  read maxMotorTorque: number?,
+  --- Whether the two bodies still collide with each other. They do not unless this is true.
+  read collideConnected: boolean?,
+}
+
+--- Joins two bodies and returns the joint's number. Unless the joint says otherwise the pair
+--- stops colliding, for as long as any joint between them is left.
+local function join(state: State, kind: 'distance' | 'ball' | 'hinge', firstHandle: number, secondHandle: number, options: JointOptions?): number
+  local first, second = world.slotOf(state, firstHandle), world.slotOf(state, secondHandle)
+  local given: JointOptions = options or {}
+  local firstAnchor, secondAnchor = given.localAnchorA or Zero, given.localAnchorB or Zero
+  local id = state.nextJoint
+  local rest = 0
+
+  if kind == 'distance' then
+    local firstAt = state.position[first] + geometry.rotate(state.turn[first], state.turnW[first], firstAnchor)
+    local secondAt = state.position[second] + geometry.rotate(state.turn[second], state.turnW[second], secondAnchor)
+
+    rest = given.length or vector.magnitude(secondAt - firstAt)
+  end
+
+  state.nextJoint += 1
+  state.joints[id] = {
+    kind = kind,
+    first = first,
+    second = second,
+    firstGeneration = state.generation[first],
+    secondGeneration = state.generation[second],
+    firstAnchor = firstAnchor,
+    secondAnchor = secondAnchor,
+    stiffness = given.stiffness or 0.25,
+    damping = given.damping or 0.05,
+    collideConnected = given.collideConnected == true,
+    rest = rest,
+    impulse = 0,
+    firstAxis = geometry.unit(given.localAxisA or Up, Up),
+    secondAxis = geometry.unit(given.localAxisB or Up, Up),
+    angularStiffness = given.angularStiffness or 0.2,
+    motorSpeed = given.motorSpeed,
+    maxMotorTorque = given.maxMotorTorque or math.huge,
+    motorImpulse = 0,
+  }
+
+  if given.collideConnected ~= true then
+    local key = world.pairKey(first, second)
+
+    state.jointNoCollide[key] = (state.jointNoCollide[key] or 0) + 1
+  end
+
+  state.jointCount += 1
+
+  return id
+end
+
+--- Keeps two points, one in each body, a set distance apart.
+function world.addDistanceJoint(state: State, first: number, second: number, options: JointOptions?): number
+  return join(state, 'distance', first, second, options)
+end
+
+--- Keeps two points, one in each body, together: the bodies turn freely about it.
+function world.addBallJoint(state: State, first: number, second: number, options: JointOptions?): number
+  return join(state, 'ball', first, second, options)
+end
+
+--- Keeps two points together and two axes in line: the bodies turn about the axis only.
+function world.addHingeJoint(state: State, first: number, second: number, options: JointOptions?): number
+  return join(state, 'hinge', first, second, options)
+end
+
+world.unsettle = unsettle
+
+return world

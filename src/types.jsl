@@ -1,0 +1,64 @@
+--!strict
+-- The shapes physik collides, as types. Only types: nothing here runs, and a module that needs
+-- one of them costs nothing to require it.
+
+export type Sphere = { read kind: 'sphere', read radius: number }
+
+export type Box = { read kind: 'box', read halfExtents: vector }
+
+--- Its axis runs along its own Y, `halfHeight` each way from its middle.
+export type Capsule = { read kind: 'capsule', read radius: number, read halfHeight: number }
+
+export type Primitive = Sphere | Box | Capsule
+
+--- Triangles, for ground and walls: never a body that moves by itself. The vertices are packed
+--- f32 triples and the indices u32, three to a triangle and zero-based. The triangles are
+--- sorted into a grid of cells: `heads` is a cell's first node, and a node names a triangle and
+--- the cell's next node. A triangle over too many cells is in `overflow` and is always tested.
+export type Mesh = {
+  read kind: 'mesh',
+  read vertices: buffer,
+  read indices: buffer,
+  read vertexCount: number,
+  read triangleCount: number,
+  read localMin: vector,
+  read localMax: vector,
+  read cellSize: number,
+  read heads: { [number]: number },
+  read nextNode: { number },
+  read nodeTriangle: { number },
+  read overflow: { number },
+}
+
+--- Ground as a sheet of heights, `width` samples across X and `depth` along Z, packed f32.
+export type Heightfield = {
+  read kind: 'heightfield',
+  read width: number,
+  read depth: number,
+  read heights: buffer,
+  read cellSizeX: number,
+  read cellSizeZ: number,
+  read origin: vector,
+  read localMin: vector,
+  read localMax: vector,
+}
+
+--- Several primitives that move as one body, each placed and turned within it.
+export type Compound = {
+  read kind: 'compound',
+  read count: number,
+  read shapes: { Primitive },
+  read positions: { vector },
+  read turns: { vector },
+  read turnWs: { number },
+  read localMin: vector,
+  read localMax: vector,
+}
+
+export type Shape = Primitive | Mesh | Heightfield | Compound
+
+--- A rotation as `physik.quat` and `physik.axisAngle` make one: a unit quaternion's vector, `turn`, and
+--- its scalar, `turnW`.
+export type Rotation = { read turn: vector, read turnW: number }
+
+return {}

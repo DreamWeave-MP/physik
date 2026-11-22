@@ -1,0 +1,20 @@
+--!strict
+--!native
+-- Cells: the cubes a grid cuts space into, each named by one number so that a table can be
+-- keyed by it. A world's grid of bodies and a mesh's grid of triangles both use them.
+local cells = {}
+
+-- A cell's column, row and layer each fit in sixteen bits, so the three pack into a number a
+-- double holds exactly.
+cells.Base = 65536
+cells.Offset = 32768
+cells.Base2 = 4294967296
+
+--- The number of a cell, or nil for one too far out to have one.
+function cells.pack(column: number, row: number, layer: number): number?
+  if column < -32768 or column >= 32768 or row < -32768 or row >= 32768 or layer < -32768 or layer >= 32768 then return nil end
+
+  return (column + 32768) * 4294967296 + (row + 32768) * 65536 + (layer + 32768)
+end
+
+return cells
