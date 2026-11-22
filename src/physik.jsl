@@ -1254,11 +1254,25 @@ function World:_check(handle)
 end
 
 function World:_allocSlot()
-    local n = #self.free
+    local free = self.free
+    local n = #free
     local i
     if n > 0 then
-        i = self.free[n]
-        self.free[n] = nil
+        -- The lowest free slot, off the top of the heap, and the last one sifted down from there.
+        i = free[1]
+        local last = free[n]
+        free[n] = nil
+        n -= 1
+        local at = 1
+        while true do
+            local below = at * 2
+            if below > n then break end
+            if below < n and free[below + 1] < free[below] then below += 1 end
+            if free[below] >= last then break end
+            free[at] = free[below]
+            at = below
+        end
+        if n > 0 then free[at] = last end
         self.generation[i] += 1
     else
         i = self.high + 1
@@ -1354,16 +1368,18 @@ function World:removeBody(handle)
     self.changed = true
     if self.bodyType[i]==BODY_STATIC then self.stillDirty=true else self.moversDirty=true end
     if self.ccd[i] then self.ccdCount-=1 end
-    -- The free slots are kept highest first, so the lowest is the next one taken: a world that
-    -- has had bodies taken out of it then gives the same slots to the same bodies as a new one,
-    -- and steps as a new one does.
+    -- The free slots are a heap with the lowest on top, which is the next one taken: a world
+    -- that has had bodies taken out of it then gives the same slots to the same bodies as a new
+    -- one, and steps as a new one does.
     local free = self.free
-    local low, high = 1, #free + 1
-    while low < high do
-        local middle = (low + high) // 2
-        if free[middle] > i then low = middle + 1 else high = middle end
+    local at = #free + 1
+    while at > 1 do
+        local above = at // 2
+        if free[above] <= i then break end
+        free[at] = free[above]
+        at = above
     end
-    table.insert(free, low, i)
+    free[at] = i
     self.userData[i] = nil
     self.sleeping[i] = false
     -- A destroyed slot must not turn into a "stay" event if the numeric slot is reused.
@@ -2531,13 +2547,33 @@ end
 local function carryContacts(self, movers: { number })
   local {rest, sleeping, pos, qv, qw, seenPos, seenTurn, seenTurnW} = self
 
-  local stirring = 0
+  local unseen = self.unseen
+  local stirring, unseenCount = 0, 0
 
   for _, body in movers do
-    local still = sleeping[body] and pos[body] == seenPos[body] and qv[body] == seenTurn[body] and qw[body] == seenTurnW[body]
+    -- Awake: not at rest, and where it last slept is no longer where it sleeps.
+    if not sleeping[body] then
+      stirring += 1
+      if rest[body] then rest[body] = false end
+      if seenPos[body] then seenPos[body] = nil end
+
+      continue
+    end
+
+    local still = pos[body] == seenPos[body] and qv[body] == seenTurn[body] and qw[body] == seenTurnW[body]
 
     rest[body] = still
-    if not still then stirring += 1 end
+
+    -- Asleep somewhere new: where is noted once what it touches there has been found.
+    if not still then
+      stirring += 1
+      unseenCount += 1
+      unseen[unseenCount] = body
+    end
+  end
+
+  for index = #unseen, unseenCount + 1, -1 do
+    unseen[index] = nil
   end
 
   self.stirring = stirring
@@ -2576,16 +2612,10 @@ end
 --- Notes where each sleeping body is, now that what it touches there is known, and takes the
 --- static bodies that had been moved to be at rest again.
 local function settle(self, movers: { number })
-  local {rest, sleeping, pos, qv, qw, seenPos, seenTurn, seenTurnW, unsettled, alive, bodyType} = self
+  local {rest, pos, qv, qw, seenPos, seenTurn, seenTurnW, unsettled, alive, bodyType} = self
 
-  for _, body in movers do
-    if rest[body] then continue end
-
-    if sleeping[body] then
-      seenPos[body], seenTurn[body], seenTurnW[body] = pos[body], qv[body], qw[body]
-    else
-      seenPos[body] = nil
-    end
+  for _, body in self.unseen do
+    seenPos[body], seenTurn[body], seenTurnW[body] = pos[body], qv[body], qw[body]
   end
 
   self.stillWasMoved = #unsettled > 0
@@ -4840,6 +4870,7 @@ function M.newWorld(opts)
     w.gridTopologyReady=false;w.gridTopologyDirty=true
     w.stillDirty=true;w.stillRoot=0;w.movers={};w.moversDirty=true
     w.nearStill={};w.nearLow={};w.nearHigh={};w.nearEpoch={};w.stillEpoch=0
+    w.unseen={}
     w.stirring=0;w.stillWasMoved=false;w.quiet=false;w.changed=true
     w.rest={};w.unsettled={};w.seenPos={};w.seenTurn={};w.seenTurnW={}
     w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={};w.stillNear={}
