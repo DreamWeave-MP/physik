@@ -664,7 +664,7 @@ end
 --- Takes a free slot, the lowest there is, or a new one. The free slots are a heap with the
 --- lowest on top: a world that has had bodies taken out of it then gives the same slots to the
 --- same bodies as a new one, and steps as a new one does.
-local function takeSlot(state: State): number
+local function takeSlot(state: State, moves: boolean): number
   local free = state.free
   local count = #free
   local body
@@ -701,9 +701,10 @@ local function takeSlot(state: State): number
   state.alive[body] = true
   state.aliveCount += 1
 
-  -- A slot that is taken again before the sweep's order was compacted is still listed in it,
-  -- and listing it twice would offer each of its pairs twice.
-  if not state.inOrder[body] then
+  -- The sweep's order is of the bodies that can move. A slot that is taken again before the
+  -- order was compacted is still listed in it, and listing it twice would offer each of its
+  -- pairs twice.
+  if moves and not state.inOrder[body] then
     state.inOrder[body] = true
     table.insert(state.order, body)
   end
@@ -767,7 +768,7 @@ function world.addBody(state: State, options: BodyOptions?): number
     turn, turnW = geometry.normalizeTurn(rotation.turn, rotation.turnW)
   end
 
-  local body = takeSlot(state)
+  local body = takeSlot(state, kind ~= 'static')
   local at = given.position or Zero
 
   state.bodyType[body] = kind

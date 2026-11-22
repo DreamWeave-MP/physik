@@ -40,11 +40,40 @@ local GridKeyStep = [
 -- a clear byte says a cell is empty without a lookup in the table of cells.
 local GridFilterSize = worlds.GridFilterSize
 
+-- How much bigger than a body the box is that the tree of static bodies is asked about for it.
+local NearPad = vector.create(0.3, 0.3, 0.3)
 
 
 
 
 
+
+
+--- The bodies that are not static, in the order of their slots: what a step has to visit. A
+--- level is mostly static bodies, and a step that asked each of them whether it moves would
+--- spend its time on that.
+local function listMovers(state: State): { number }
+  local movers = state.movers
+  if not state.moversDirty then return movers end
+
+  local {alive, bodyType} = state
+  local count = 0
+
+  for body = 1, state.high do
+    if not alive[body] or bodyType[body] == 'static' then continue end
+
+    count += 1
+    movers[count] = body
+  end
+
+  for index = #movers, count + 1, -1 do
+    movers[index] = nil
+  end
+
+  state.moversDirty = false
+
+  return movers
+end
 
 --- Sorts `order` by each body's least X from scratch: the keys go into a buffer, the data plane
 --- orders them, and the bodies follow. It is stable, as the insertion sort it stands in for is, so
@@ -71,7 +100,7 @@ local function sortOrder(state: State)
   local count = #order
 
   -- Compact dead slots opportunistically.
-  if count > state.aliveCount + 64 then
+  if count > #listMovers(state) + 64 then
     local kept = 0
 
     for index = 1, count do
@@ -178,20 +207,125 @@ local function tryPair(state: State, first: number, second: number)
   if state.contactCount > before then state.manifoldCount += 1 end
 end
 
+--- Offers each body that can move the static bodies near it. They are in a tree, and a body
+--- looks itself up in it.
+local function offerStill(state: State, movers: { number })
+  local root = state.stillRoot
+  if root == 0 then return end
+
+  local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = state
+  local {sphereRadius, position, boundsLow, boundsHigh} = state
+  local margin = state.contactMargin
+  local rest, stillSettled = state.rest, #state.unsettled == 0
+  local {nearStill, nearLows, nearHighs, nearEpochs, stillEpoch: epoch} = state
+
+  for _, body in movers do
+    -- A body at rest touches the static bodies it did, unless one of those has been moved.
+    if stillSettled and rest[body] then continue end
+
+    -- One body is no tree, and the pair is tested on its own bounds.
+    if root < 0 then
+      tryPair(state, -root, body)
+      continue
+    end
+
+    local low, high
+    local radius = sphereRadius[body]
+
+    if radius then
+      local reach = radius + margin
+      local centre = position[body]
+      low, high = centre - vector.create(reach, reach, reach), centre + vector.create(reach, reach, reach)
+    else
+      low, high = boundsLow[body], boundsHigh[body]
+    end
+
+    -- The tree is asked about a box a little bigger than the body's, and the answer is kept
+    -- until the body leaves that box or the tree changes: most steps a body is offered the
+    -- few static bodies it was near last step, in the order the tree gave them.
+    local near = nearStill[body]
+    local nearLow, nearHigh = nearLows[body], nearHighs[body]
+
+    if
+      nearEpochs[body] ~= epoch
+      or low.x < nearLow.x
+      or low.y < nearLow.y
+      or low.z < nearLow.z
+      or high.x > nearHigh.x
+      or high.y > nearHigh.y
+      or high.z > nearHigh.z
+    then
+      if not near then
+        near = {}
+        nearStill[body] = near
+      end
+
+      low, high = low - NearPad, high + NearPad
+      nearLows[body], nearHighs[body], nearEpochs[body] = low, high, epoch
+
+      local entry, top, count = root, 0, 0
+
+      while true do
+        if entry < 0 then
+          count += 1
+          near[count] = -entry
+        else
+          local nodeLow, nodeHigh = lows[entry], highs[entry]
+
+          if
+            not (
+              low.x > nodeHigh.x
+              or high.x < nodeLow.x
+              or low.y > nodeHigh.y
+              or high.y < nodeLow.y
+              or low.z > nodeHigh.z
+              or high.z < nodeLow.z
+            )
+          then
+            top += 1
+            stack[top] = rights[entry]
+            entry = lefts[entry]
+            continue
+          end
+        end
+
+        if top == 0 then break end
+
+        entry = stack[top]
+        top -= 1
+      end
+
+      for index = #near, count + 1, -1 do
+        near[index] = nil
+      end
+    end
+
+    for _, still in near do
+      tryPair(state, still, body)
+    end
+  end
+end
+
+--- Offers the pairs of bodies that can move whose bounds overlap along X: the bodies are kept
+--- in the order of where their bounds begin, so that each is offered only the ones that begin
+--- before it ends. A slot that was a mover's and is now a static body's may still be listed.
 local function collideSap(state: State)
+  -- What a body rests on first, and then what rests on it: a stack is solved from the ground up.
+  offerStill(state, listMovers(state))
   sortOrder(state)
-  local {order, alive, boundsLow, boundsHigh} = state
+
+  local {order, alive, bodyType, boundsLow, boundsHigh} = state
   local count = #order
 
   for position = 1, count do
     local first = order[position]
-    if not alive[first] then continue end
+    if not alive[first] or bodyType[first] == 'static' then continue end
 
     local reach = boundsHigh[first].x
 
     for after = position + 1, count do
       local second = order[after]
-      if not alive[second] then continue end
+      if not alive[second] or bodyType[second] == 'static' then continue end
       if boundsLow[second].x > reach then break end
 
       tryPair(state, first, second)
@@ -293,35 +427,6 @@ local function buildStill(state: State, members: { number }): number
   state.stillRight[node] = buildStill(state, table.move(members, half + 1, #members, 1, {}))
 
   return node
-end
-
--- How much bigger than a body the box is that the tree of static bodies is asked about for it.
-local NearPad = vector.create(0.3, 0.3, 0.3)
-
---- The bodies that are not static, in the order of their slots: what a step has to visit. A
---- level is mostly static bodies, and a step that asked each of them whether it moves would
---- spend its time on that.
-local function listMovers(state: State): { number }
-  local movers = state.movers
-  if not state.moversDirty then return movers end
-
-  local {alive, bodyType} = state
-  local count = 0
-
-  for body = 1, state.high do
-    if not alive[body] or bodyType[body] == 'static' then continue end
-
-    count += 1
-    movers[count] = body
-  end
-
-  for index = #movers, count + 1, -1 do
-    movers[index] = nil
-  end
-
-  state.moversDirty = false
-
-  return movers
 end
 
 --- Builds the tree of the static bodies. They neither move nor touch each other, so they are
@@ -555,102 +660,7 @@ local function collideGrid(state: State)
   end
 
   local {gridLarge: large, alive, gridKey, bodyType, movers} = state
-  local root = state.stillRoot
-
-  -- The static bodies are in a tree, and everything else looks itself up in it.
-  if root ~= 0 then
-    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = state
-    local {sphereRadius, position, boundsLow, boundsHigh} = state
-    local margin = state.contactMargin
-    local rest, stillSettled = state.rest, #state.unsettled == 0
-    local {nearStill, nearLows, nearHighs, nearEpochs, stillEpoch: epoch} = state
-
-    for _, body in movers do
-      -- A body at rest touches the static bodies it did, unless one of those has been moved.
-      if stillSettled and rest[body] then continue end
-
-      -- One body is no tree, and the pair is tested on its own bounds.
-      if root < 0 then
-        tryPair(state, -root, body)
-        continue
-      end
-
-      local low, high
-      local radius = sphereRadius[body]
-
-      if radius then
-        local reach = radius + margin
-        local centre = position[body]
-        low, high = centre - vector.create(reach, reach, reach), centre + vector.create(reach, reach, reach)
-      else
-        low, high = boundsLow[body], boundsHigh[body]
-      end
-
-      -- The tree is asked about a box a little bigger than the body's, and the answer is kept
-      -- until the body leaves that box or the tree changes: most steps a body is offered the
-      -- few static bodies it was near last step, in the order the tree gave them.
-      local near = nearStill[body]
-      local nearLow, nearHigh = nearLows[body], nearHighs[body]
-
-      if
-        nearEpochs[body] ~= epoch
-        or low.x < nearLow.x
-        or low.y < nearLow.y
-        or low.z < nearLow.z
-        or high.x > nearHigh.x
-        or high.y > nearHigh.y
-        or high.z > nearHigh.z
-      then
-        if not near then
-          near = {}
-          nearStill[body] = near
-        end
-
-        low, high = low - NearPad, high + NearPad
-        nearLows[body], nearHighs[body], nearEpochs[body] = low, high, epoch
-
-        local entry, top, count = root, 0, 0
-
-        while true do
-          if entry < 0 then
-            count += 1
-            near[count] = -entry
-          else
-            local nodeLow, nodeHigh = lows[entry], highs[entry]
-
-            if
-              not (
-                low.x > nodeHigh.x
-                or high.x < nodeLow.x
-                or low.y > nodeHigh.y
-                or high.y < nodeLow.y
-                or low.z > nodeHigh.z
-                or high.z < nodeLow.z
-              )
-            then
-              top += 1
-              stack[top] = rights[entry]
-              entry = lefts[entry]
-              continue
-            end
-          end
-
-          if top == 0 then break end
-
-          entry = stack[top]
-          top -= 1
-        end
-
-        for index = #near, count + 1, -1 do
-          near[index] = nil
-        end
-      end
-
-      for _, still in near do
-        tryPair(state, still, body)
-      end
-    end
-  end
+  offerStill(state, movers)
 
   -- Bodies wider than one grid cell stay out of the hash grid. Pair anything involving them
   -- directly while they are few, and with a coherent X sweep when they are not. Small-small pairs
