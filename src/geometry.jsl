@@ -1,0 +1,1263 @@
+--!strict
+--!native
+-- The geometry physik is made of: turning a vector by a body's rotation, the nearest points of
+-- two things, whether and how deeply two shapes overlap, and where a ray or a swept shape first
+-- meets one. Everything here is a function of positions, rotations and sizes: nothing knows what
+-- a world or a body is.
+--
+-- It is one module because calls between modules are never inlined, and the few lines that turn
+-- a vector are in the middle of nearly every function here. Kept beside what calls them they
+-- cost nothing; in a module of their own they cost a tenth of a step on meshes and compounds.
+--
+-- A rotation is a unit quaternion in two parts, `turn` and `turnW`: its vector and its scalar.
+-- A contact test answers whether the two touch, then the normal from the first to the second,
+-- a point on the contact, and how deeply they overlap; when they do not touch the rest is filler.
+local types = require './types'
+
+local geometry = {}
+
+local Zero = vector.zero
+local Up = vector.create(0, 1, 0)
+
+-- Under this a squared length is nothing: too short to give a direction.
+local Tiny = 1e-8
+
+local function clamp(value: number, low: number, high: number): number
+  if value < low then return low end
+  if value > high then return high end
+
+  return value
+end
+
+--- -1 below zero and 1 from zero up: a side, where `math.sign` would have none at zero.
+local function sideOf(value: number): number
+  if value < 0 then return -1 end
+
+  return 1
+end
+
+--- `value` at length one, or `fallback` when it is too short to point anywhere.
+local function unit(value: vector, fallback: vector): vector
+  local squared = vector.dot(value, value)
+  if squared <= Tiny then return fallback end
+
+  return value / math.sqrt(squared)
+end
+
+local function normalizeTurn(turn: vector, turnW: number): (vector, number)
+  local squared = vector.dot(turn, turn) + turnW * turnW
+  if squared <= Tiny then return Zero, 1 end
+
+  local inverse = 1 / math.sqrt(squared)
+
+  return turn * inverse, turnW * inverse
+end
+
+--- `value` turned by a rotation.
+local function rotate(turn: vector, turnW: number, value: vector): vector
+  local twice = vector.cross(turn, value) * 2
+
+  return value + twice * turnW + vector.cross(turn, twice)
+end
+
+--- `value` turned back: by the rotation's inverse.
+local function unrotate(turn: vector, turnW: number, value: vector): vector
+  local back = -turn
+  local twice = vector.cross(back, value) * 2
+
+  return value + twice * turnW + vector.cross(back, twice)
+end
+
+--- The rotation that is `second` and then `first`.
+local function composeTurns(first: vector, firstW: number, second: vector, secondW: number): (vector, number)
+  return first * secondW + second * firstW + vector.cross(first, second), firstW * secondW - vector.dot(first, second)
+end
+
+--- Where a rotation takes the three axes.
+local function axesOf(turn: vector, turnW: number): (vector, vector, vector)
+  local turnX, turnY, turnZ = turn.x, turn.y, turn.z
+  local xx, yy, zz = turnX * turnX, turnY * turnY, turnZ * turnZ
+  local xy, xz, yz = turnX * turnY, turnX * turnZ, turnY * turnZ
+  local wx, wy, wz = turnW * turnX, turnW * turnY, turnW * turnZ
+
+  return vector.create(1 - 2 * (yy + zz), 2 * (xy + wz), 2 * (xz - wy)),
+    vector.create(2 * (xy - wz), 1 - 2 * (xx + zz), 2 * (yz + wx)),
+    vector.create(2 * (xz + wy), 2 * (yz - wx), 1 - 2 * (xx + yy))
+end
+
+--- A rotation after turning at `spin` for `duration`.
+local function integrateTurn(turn: vector, turnW: number, spin: vector, duration: number): (vector, number)
+  local half = 0.5 * duration
+
+  return normalizeTurn(turn + (spin * turnW + vector.cross(spin, turn)) * half, turnW - vector.dot(spin, turn) * half)
+end
+
+geometry.clamp = clamp
+geometry.unit = unit
+geometry.normalizeTurn = normalizeTurn
+geometry.rotate = rotate
+geometry.unrotate = unrotate
+geometry.composeTurns = composeTurns
+geometry.axesOf = axesOf
+geometry.integrateTurn = integrateTurn
+
+--- The corner of a box furthest along `direction`.
+local function boxSupport(centre: vector, axis0: vector, axis1: vector, axis2: vector, half: vector, direction: vector): vector
+  return centre
+    + axis0 * (if vector.dot(direction, axis0) >= 0 then half.x else -half.x)
+    + axis1 * (if vector.dot(direction, axis1) >= 0 then half.y else -half.y)
+    + axis2 * (if vector.dot(direction, axis2) >= 0 then half.z else -half.z)
+end
+
+geometry.boxSupport = boxSupport
+
+--- The point of a segment nearest `point`.
+local function nearestOnSegment(point: vector, from: vector, to: vector): vector
+  local along = to - from
+  local squared = vector.dot(along, along)
+  if squared <= Tiny then return from end
+
+  return from + along * clamp(vector.dot(point - from, along) / squared, 0, 1)
+end
+
+--- The nearest points of two segments: one on the first, one on the second.
+local function nearestBetweenSegments(firstFrom: vector, firstTo: vector, secondFrom: vector, secondTo: vector): (vector, vector)
+  local first, second = firstTo - firstFrom, secondTo - secondFrom
+  local between = firstFrom - secondFrom
+  local firstSquared, secondSquared = vector.dot(first, first), vector.dot(second, second)
+  local secondAcross = vector.dot(second, between)
+  local onFirst, onSecond
+
+  if firstSquared <= Tiny and secondSquared <= Tiny then return firstFrom, secondFrom end
+
+  if firstSquared <= Tiny then
+    onFirst = 0
+    onSecond = clamp(secondAcross / secondSquared, 0, 1)
+  else
+    local firstAcross = vector.dot(first, between)
+
+    if secondSquared <= Tiny then
+      onSecond = 0
+      onFirst = clamp(-firstAcross / firstSquared, 0, 1)
+    else
+      local together = vector.dot(first, second)
+      local spread = firstSquared * secondSquared - together * together
+
+      onFirst = if math.abs(spread) > Tiny
+        then clamp((together * secondAcross - firstAcross * secondSquared) / spread, 0, 1)
+        else 0
+      onSecond = (together * onFirst + secondAcross) / secondSquared
+
+      if onSecond < 0 then
+        onSecond = 0
+        onFirst = clamp(-firstAcross / firstSquared, 0, 1)
+      elseif onSecond > 1 then
+        onSecond = 1
+        onFirst = clamp((together - firstAcross) / firstSquared, 0, 1)
+      end
+    end
+  end
+
+  return firstFrom + first * onFirst, secondFrom + second * onSecond
+end
+
+--- Two spheres. `margin` is how near they may be and still be reported, not touching yet.
+local function sphereOnSphere(
+  firstAt: vector,
+  firstRadius: number,
+  secondAt: vector,
+  secondRadius: number,
+  margin: number?
+): (boolean, vector, vector, number)
+  local between = secondAt - firstAt
+  local reach = firstRadius + secondRadius
+  local detect = reach + (margin or 0)
+  local squared = vector.dot(between, between)
+  if squared >= detect * detect then return false, Zero, Zero, 0 end
+
+  local distance = math.sqrt(math.max(squared, Tiny))
+  local normal = if squared > Tiny then between / distance else Up
+  local depth = reach - distance
+
+  return true, normal, firstAt + normal * (firstRadius - depth * 0.5), depth
+end
+
+--- A sphere and a box: the normal is from the sphere to the box.
+local function sphereOnBox(
+  sphereAt: vector,
+  radius: number,
+  boxAt: vector,
+  turn: vector,
+  turnW: number,
+  half: vector,
+  margin: number?
+): (boolean, vector, vector, number)
+  local inside = unrotate(turn, turnW, sphereAt - boxAt)
+  local nearest = vector.create(clamp(inside.x, -half.x, half.x), clamp(inside.y, -half.y, half.y), clamp(inside.z, -half.z, half.z))
+
+  -- From the box to the sphere, in the box's own space.
+  local out = inside - nearest
+  local squared = vector.dot(out, out)
+  local detect = radius + (margin or 0)
+  if squared > detect * detect then return false, Zero, Zero, 0 end
+
+  local normal, depth, point
+
+  if squared > Tiny then
+    local distance = math.sqrt(squared)
+
+    normal = -(out / distance)
+    depth = radius - distance
+    point = nearest
+  else
+    -- The centre is inside the box: out by the nearest face.
+    local toX, toY, toZ = half.x - math.abs(inside.x), half.y - math.abs(inside.y), half.z - math.abs(inside.z)
+
+    if toX <= toY and toX <= toZ then
+      local outward = vector.create(sideOf(inside.x), 0, 0)
+
+      normal, depth, point = -outward, radius + toX, inside + outward * toX
+    elseif toY <= toZ then
+      local outward = vector.create(0, sideOf(inside.y), 0)
+
+      normal, depth, point = -outward, radius + toY, inside + outward * toY
+    else
+      local outward = vector.create(0, 0, sideOf(inside.z))
+
+      normal, depth, point = -outward, radius + toZ, inside + outward * toZ
+    end
+  end
+
+  return true, rotate(turn, turnW, normal), boxAt + rotate(turn, turnW, point), depth
+end
+
+-- The fifteen axes two boxes can be apart along: each box's three, then the nine crosses of one
+-- of each. Kept between calls, and filled a stage at a time, since most pairs are apart on an
+-- early axis.
+local BoxAxes: { vector } = table.create(15, Zero)
+
+--- Two boxes, each given by its centre, the three axes its rotation makes and its half extents.
+--- As well as the contact, says which of the fifteen axes they overlap least along: 1 to 3 are
+--- the first box's faces, 4 to 6 the second's, and the rest are edge against edge.
+local function boxOnBox(
+  firstAt: vector,
+  first0: vector,
+  first1: vector,
+  first2: vector,
+  firstHalf: vector,
+  secondAt: vector,
+  second0: vector,
+  second1: vector,
+  second2: vector,
+  secondHalf: vector,
+  margin: number?
+): (boolean, vector, vector, number, number)
+  local between = secondAt - firstAt
+  local least, leastAxis, leastFeature = math.huge, nil :: vector?, 0
+  local axes = BoxAxes
+  local slack = -(margin or 0)
+  local firstX, firstY, firstZ = firstHalf.x, firstHalf.y, firstHalf.z
+  local secondX, secondY, secondZ = secondHalf.x, secondHalf.y, secondHalf.z
+
+  axes[1], axes[2], axes[3], axes[4], axes[5], axes[6] = first0, first1, first2, second0, second1, second2
+
+  for feature = 1, 15 do
+    if feature == 7 then
+      axes[7], axes[8], axes[9] = vector.cross(first0, second0), vector.cross(first0, second1), vector.cross(first0, second2)
+      axes[10], axes[11], axes[12] = vector.cross(first1, second0), vector.cross(first1, second1), vector.cross(first1, second2)
+      axes[13], axes[14], axes[15] = vector.cross(first2, second0), vector.cross(first2, second1), vector.cross(first2, second2)
+    end
+
+    -- One axis: how far the boxes reach along it, against how far apart their centres are.
+    local axis = axes[feature]
+    local squared = vector.dot(axis, axis)
+    if squared <= 1e-10 then continue end
+
+    local along = if math.abs(squared - 1) < 1e-5 then axis else axis / math.sqrt(squared)
+    local firstReach = firstX * math.abs(vector.dot(along, first0))
+      + firstY * math.abs(vector.dot(along, first1))
+      + firstZ * math.abs(vector.dot(along, first2))
+    local secondReach = secondX * math.abs(vector.dot(along, second0))
+      + secondY * math.abs(vector.dot(along, second1))
+      + secondZ * math.abs(vector.dot(along, second2))
+    local apart = vector.dot(between, along)
+    local overlap = firstReach + secondReach - math.abs(apart)
+    if overlap <= slack then return false, Zero, Zero, 0, 0 end
+
+    if overlap < least then
+      least = overlap
+      leastAxis = if apart >= 0 then along else -along
+      leastFeature = feature
+    end
+  end
+
+  local normal = leastAxis or unit(between, Up)
+  local onFirst = boxSupport(firstAt, first0, first1, first2, firstHalf, normal)
+  local onSecond = boxSupport(secondAt, second0, second1, second2, secondHalf, -normal)
+
+  return true, normal, (onFirst + onSecond) * 0.5, least, leastFeature
+end
+
+geometry.sphereOnSphere = sphereOnSphere
+geometry.sphereOnBox = sphereOnBox
+geometry.boxOnBox = boxOnBox
+
+--- The two ends of a capsule's axis, which runs along its own Y.
+local function capsuleEnds(at: vector, turn: vector, turnW: number, halfHeight: number): (vector, vector)
+  local reach = rotate(turn, turnW, Up) * halfHeight
+
+  return at - reach, at + reach
+end
+
+geometry.capsuleEnds = capsuleEnds
+
+--- A capsule and a sphere: the normal is from the capsule to the sphere.
+local function capsuleOnSphere(
+  capsuleAt: vector,
+  turn: vector,
+  turnW: number,
+  capsuleRadius: number,
+  halfHeight: number,
+  sphereAt: vector,
+  sphereRadius: number,
+  margin: number?
+): (boolean, vector, vector, number)
+  local from, to = capsuleEnds(capsuleAt, turn, turnW, halfHeight)
+
+  return sphereOnSphere(nearestOnSegment(sphereAt, from, to), capsuleRadius, sphereAt, sphereRadius, margin)
+end
+
+local function capsuleOnCapsule(
+  firstAt: vector,
+  firstTurn: vector,
+  firstTurnW: number,
+  firstRadius: number,
+  firstHalfHeight: number,
+  secondAt: vector,
+  secondTurn: vector,
+  secondTurnW: number,
+  secondRadius: number,
+  secondHalfHeight: number,
+  margin: number?
+): (boolean, vector, vector, number)
+  local firstFrom, firstTo = capsuleEnds(firstAt, firstTurn, firstTurnW, firstHalfHeight)
+  local secondFrom, secondTo = capsuleEnds(secondAt, secondTurn, secondTurnW, secondHalfHeight)
+  local onFirst, onSecond = nearestBetweenSegments(firstFrom, firstTo, secondFrom, secondTo)
+
+  return sphereOnSphere(onFirst, firstRadius, onSecond, secondRadius, margin)
+end
+
+--- The part of a segment inside a box centred on the origin: whether any is, and the fractions
+--- of the segment it runs between. The three axes are written out, each the same as the last:
+--- a vector's parts cannot be reached by number, and a call for each costs what this saves.
+local function segmentInBox(from: vector, to: vector, half: vector): (boolean, number, number)
+  local along = to - from
+  local enter, leave = 0, 1
+
+  local position, travel, reach = from.x, along.x, half.x
+
+  if math.abs(travel) <= Tiny then
+    if position < -reach or position > reach then return false, 0, 0 end
+  else
+    local inverse = 1 / travel
+    local near, far = (-reach - position) * inverse, (reach - position) * inverse
+    if near > far then
+      near, far = far, near
+    end
+
+    if near > enter then enter = near end
+    if far < leave then leave = far end
+    if enter > leave then return false, 0, 0 end
+  end
+
+  position, travel, reach = from.y, along.y, half.y
+
+  if math.abs(travel) <= Tiny then
+    if position < -reach or position > reach then return false, 0, 0 end
+  else
+    local inverse = 1 / travel
+    local near, far = (-reach - position) * inverse, (reach - position) * inverse
+    if near > far then
+      near, far = far, near
+    end
+
+    if near > enter then enter = near end
+    if far < leave then leave = far end
+    if enter > leave then return false, 0, 0 end
+  end
+
+  position, travel, reach = from.z, along.z, half.z
+
+  if math.abs(travel) <= Tiny then
+    if position < -reach or position > reach then return false, 0, 0 end
+  else
+    local inverse = 1 / travel
+    local near, far = (-reach - position) * inverse, (reach - position) * inverse
+    if near > far then
+      near, far = far, near
+    end
+
+    if near > enter then enter = near end
+    if far < leave then leave = far end
+    if enter > leave then return false, 0, 0 end
+  end
+
+  return true, enter, leave
+end
+
+--- Keeps the nearer of what is held and the nearest points of a segment and one edge.
+local function nearerEdge(
+  from: vector,
+  to: vector,
+  edgeFrom: vector,
+  edgeTo: vector,
+  least: number,
+  onSegment: vector,
+  onBox: vector
+): (number, vector, vector)
+  local segmentPoint, edgePoint = nearestBetweenSegments(from, to, edgeFrom, edgeTo)
+  local between = segmentPoint - edgePoint
+  local squared = vector.dot(between, between)
+  if squared < least then return squared, segmentPoint, edgePoint end
+
+  return least, onSegment, onBox
+end
+
+--- The nearest points of a segment and a box centred on the origin: one on the segment, one on
+--- the box. When the segment runs through the box they are the middle of what is inside and
+--- the nearest face to it, and the rest says so: true, the way out, and how far out it is.
+--- Otherwise false, a filler, and how far apart the points are.
+local function nearestSegmentToBox(from: vector, to: vector, half: vector): (vector, vector, boolean, vector, number)
+  local through, enter, leave = segmentInBox(from, to, half)
+
+  if through then
+    local middle = from + (to - from) * ((enter + leave) * 0.5)
+    local toX, toY, toZ = half.x - math.abs(middle.x), half.y - math.abs(middle.y), half.z - math.abs(middle.z)
+
+    if toX <= toY and toX <= toZ then
+      local outward = vector.create(sideOf(middle.x), 0, 0)
+
+      return middle, middle + outward * toX, true, outward, toX
+    end
+
+    if toY <= toZ then
+      local outward = vector.create(0, sideOf(middle.y), 0)
+
+      return middle, middle + outward * toY, true, outward, toY
+    end
+
+    local outward = vector.create(0, 0, sideOf(middle.z))
+
+    return middle, middle + outward * toZ, true, outward, toZ
+  end
+
+  -- An end of the segment against the box, or the segment against one of the box's twelve edges.
+  local onBox = vector.create(clamp(from.x, -half.x, half.x), clamp(from.y, -half.y, half.y), clamp(from.z, -half.z, half.z))
+  local apart = from - onBox
+  local least = vector.dot(apart, apart)
+  local onSegment = from
+  local other = vector.create(clamp(to.x, -half.x, half.x), clamp(to.y, -half.y, half.y), clamp(to.z, -half.z, half.z))
+
+  apart = to - other
+
+  local squared = vector.dot(apart, apart)
+  if squared < least then
+    least, onSegment, onBox = squared, to, other
+  end
+
+  local reachX, reachY, reachZ = half.x, half.y, half.z
+
+  -- The edges along X, then along Y, then along Z.
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(-reachX, -reachY, -reachZ), vector.create(reachX, -reachY, -reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(-reachX, -reachY, reachZ), vector.create(reachX, -reachY, reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(-reachX, reachY, -reachZ), vector.create(reachX, reachY, -reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(-reachX, reachY, reachZ), vector.create(reachX, reachY, reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(-reachX, -reachY, -reachZ), vector.create(-reachX, reachY, -reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(-reachX, -reachY, reachZ), vector.create(-reachX, reachY, reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(reachX, -reachY, -reachZ), vector.create(reachX, reachY, -reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(reachX, -reachY, reachZ), vector.create(reachX, reachY, reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(-reachX, -reachY, -reachZ), vector.create(-reachX, -reachY, reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(-reachX, reachY, -reachZ), vector.create(-reachX, reachY, reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(reachX, -reachY, -reachZ), vector.create(reachX, -reachY, reachZ), least, onSegment, onBox)
+  least, onSegment, onBox = nearerEdge(from, to, vector.create(reachX, reachY, -reachZ), vector.create(reachX, reachY, reachZ), least, onSegment, onBox)
+
+  return onSegment, onBox, false, Zero, math.sqrt(least)
+end
+
+--- A capsule and a box: the normal is from the capsule to the box.
+local function capsuleOnBox(
+  capsuleAt: vector,
+  capsuleTurn: vector,
+  capsuleTurnW: number,
+  radius: number,
+  halfHeight: number,
+  boxAt: vector,
+  boxTurn: vector,
+  boxTurnW: number,
+  half: vector,
+  margin: number?
+): (boolean, vector, vector, number)
+  local from, to = capsuleEnds(capsuleAt, capsuleTurn, capsuleTurnW, halfHeight)
+  local onAxis, onBox, through, outward, measure =
+    nearestSegmentToBox(unrotate(boxTurn, boxTurnW, from - boxAt), unrotate(boxTurn, boxTurnW, to - boxAt), half)
+  local normal, depth
+
+  if through then
+    normal = -outward
+    depth = radius + measure
+  else
+    -- From the box to the capsule's axis.
+    local out = onAxis - onBox
+    local squared = vector.dot(out, out)
+    local detect = radius + (margin or 0)
+    if squared > detect * detect then return false, Zero, Zero, 0 end
+
+    local distance = math.sqrt(math.max(squared, 0))
+
+    normal = if distance > Tiny then -(out / distance) else Up
+    depth = radius - distance
+  end
+
+  return true, rotate(boxTurn, boxTurnW, normal), boxAt + rotate(boxTurn, boxTurnW, onBox), depth
+end
+
+geometry.capsuleOnSphere = capsuleOnSphere
+geometry.capsuleOnCapsule = capsuleOnCapsule
+geometry.capsuleOnBox = capsuleOnBox
+
+--- The point of a triangle nearest `point`: a corner, a point on an edge, or a point on its face.
+local function nearestOnTriangle(point: vector, first: vector, second: vector, third: vector): vector
+  local toSecond, toThird = second - first, third - first
+  local fromFirst = point - first
+  local firstAlong, firstAcross = vector.dot(toSecond, fromFirst), vector.dot(toThird, fromFirst)
+  if firstAlong <= 0 and firstAcross <= 0 then return first end
+
+  local fromSecond = point - second
+  local secondAlong, secondAcross = vector.dot(toSecond, fromSecond), vector.dot(toThird, fromSecond)
+  if secondAlong >= 0 and secondAcross <= secondAlong then return second end
+
+  local thirdWeight = firstAlong * secondAcross - secondAlong * firstAcross
+  if thirdWeight <= 0 and firstAlong >= 0 and secondAlong <= 0 then
+    return first + toSecond * (firstAlong / (firstAlong - secondAlong))
+  end
+
+  local fromThird = point - third
+  local thirdAlong, thirdAcross = vector.dot(toSecond, fromThird), vector.dot(toThird, fromThird)
+  if thirdAcross >= 0 and thirdAlong <= thirdAcross then return third end
+
+  local secondWeight = thirdAlong * firstAcross - firstAlong * thirdAcross
+  if secondWeight <= 0 and firstAcross >= 0 and thirdAcross <= 0 then
+    return first + toThird * (firstAcross / (firstAcross - thirdAcross))
+  end
+
+  local firstWeight = secondAlong * thirdAcross - thirdAlong * secondAcross
+  if firstWeight <= 0 and (secondAcross - secondAlong) >= 0 and (thirdAlong - thirdAcross) >= 0 then
+    local along = (secondAcross - secondAlong) / ((secondAcross - secondAlong) + (thirdAlong - thirdAcross))
+
+    return second + (third - second) * along
+  end
+
+  local scale = 1 / (firstWeight + secondWeight + thirdWeight)
+
+  return first + toSecond * (secondWeight * scale) + toThird * (thirdWeight * scale)
+end
+
+--- Whether a point in a triangle's plane is inside it, whichever way the triangle winds.
+local function insideTriangle(point: vector, first: vector, second: vector, third: vector, normal: vector): boolean
+  local side0 = vector.dot(vector.cross(second - first, point - first), normal)
+  local side1 = vector.dot(vector.cross(third - second, point - second), normal)
+  local side2 = vector.dot(vector.cross(first - third, point - third), normal)
+
+  return (side0 >= -1e-7 and side1 >= -1e-7 and side2 >= -1e-7) or (side0 <= 1e-7 and side1 <= 1e-7 and side2 <= 1e-7)
+end
+
+--- The nearest points of a segment and a triangle: one on the segment, one on the triangle.
+local function nearestSegmentToTriangle(from: vector, to: vector, first: vector, second: vector, third: vector): (vector, vector)
+  local normal = vector.cross(second - first, third - first)
+
+  -- Through the face: the two are the one point.
+  if vector.dot(normal, normal) > Tiny then
+    local along = to - from
+    local closing = vector.dot(normal, along)
+
+    if math.abs(closing) > Tiny then
+      local fraction = vector.dot(normal, first - from) / closing
+
+      if fraction >= 0 and fraction <= 1 then
+        local crossing = from + along * fraction
+        if insideTriangle(crossing, first, second, third, normal) then return crossing, crossing end
+      end
+    end
+  end
+
+  -- Otherwise an end of the segment against the triangle, or the segment against an edge.
+  local onSegment = from
+  local onTriangle = nearestOnTriangle(from, first, second, third)
+  local least = vector.dot(onTriangle - onSegment, onTriangle - onSegment)
+  local other = nearestOnTriangle(to, first, second, third)
+  local squared = vector.dot(other - to, other - to)
+  if squared < least then
+    least, onSegment, onTriangle = squared, to, other
+  end
+
+  local segmentPoint, edgePoint = nearestBetweenSegments(from, to, first, second)
+
+  squared = vector.dot(edgePoint - segmentPoint, edgePoint - segmentPoint)
+  if squared < least then
+    least, onSegment, onTriangle = squared, segmentPoint, edgePoint
+  end
+
+  segmentPoint, edgePoint = nearestBetweenSegments(from, to, second, third)
+  squared = vector.dot(edgePoint - segmentPoint, edgePoint - segmentPoint)
+  if squared < least then
+    least, onSegment, onTriangle = squared, segmentPoint, edgePoint
+  end
+
+  segmentPoint, edgePoint = nearestBetweenSegments(from, to, third, first)
+  squared = vector.dot(edgePoint - segmentPoint, edgePoint - segmentPoint)
+  if squared < least then
+    onSegment, onTriangle = segmentPoint, edgePoint
+  end
+
+  return onSegment, onTriangle
+end
+
+--- The normal for a shape touching a triangle so exactly that there is no direction between
+--- them: the triangle's own, on the side its middle is from `at`.
+local function faceToward(at: vector, first: vector, second: vector, third: vector): vector
+  local face = unit(vector.cross(second - first, third - first), Up)
+
+  return if vector.dot((first + second + third) / 3 - at, face) >= 0 then face else -face
+end
+
+--- A sphere and a triangle: the normal is from the sphere to the triangle.
+local function sphereOnTriangle(
+  at: vector,
+  radius: number,
+  first: vector,
+  second: vector,
+  third: vector,
+  margin: number?
+): (boolean, vector, vector, number)
+  local nearest = nearestOnTriangle(at, first, second, third)
+  local out = nearest - at
+  local squared = vector.dot(out, out)
+  local detect = radius + (margin or 0)
+  if squared > detect * detect then return false, Zero, Zero, 0 end
+
+  local distance = math.sqrt(math.max(squared, Tiny))
+  local normal = if squared > Tiny then out / distance else faceToward(at, first, second, third)
+
+  return true, normal, nearest, radius - distance
+end
+
+--- A capsule and a triangle: the normal is from the capsule to the triangle.
+local function capsuleOnTriangle(
+  at: vector,
+  turn: vector,
+  turnW: number,
+  radius: number,
+  halfHeight: number,
+  first: vector,
+  second: vector,
+  third: vector,
+  margin: number?
+): (boolean, vector, vector, number)
+  local from, to = capsuleEnds(at, turn, turnW, halfHeight)
+  local onAxis, onTriangle = nearestSegmentToTriangle(from, to, first, second, third)
+  local out = onTriangle - onAxis
+  local squared = vector.dot(out, out)
+  local detect = radius + (margin or 0)
+  if squared > detect * detect then return false, Zero, Zero, 0 end
+
+  local distance = math.sqrt(math.max(squared, Tiny))
+  local normal = if squared > Tiny then out / distance else faceToward(at, first, second, third)
+
+  return true, normal, onTriangle, radius - distance
+end
+
+-- The thirteen axes a box and a triangle can be apart along, in the box's own space: the box's
+-- three, the triangle's face, and the nine crosses of an edge and an axis. Kept between calls.
+local TriangleAxes: { vector } = table.create(13, Zero)
+local AxisX, AxisZ = vector.create(1, 0, 0), vector.create(0, 0, 1)
+
+--- A box and a triangle: the normal is from the box to the triangle.
+local function boxOnTriangle(
+  at: vector,
+  turn: vector,
+  turnW: number,
+  half: vector,
+  worldFirst: vector,
+  worldSecond: vector,
+  worldThird: vector,
+  margin: number?
+): (boolean, vector, vector, number)
+  local first = unrotate(turn, turnW, worldFirst - at)
+  local second = unrotate(turn, turnW, worldSecond - at)
+  local third = unrotate(turn, turnW, worldThird - at)
+  local edge0, edge1, edge2 = second - first, third - second, first - third
+  local axes = TriangleAxes
+  local least, leastAxis = math.huge, nil :: vector?
+  local slack = -(margin or 0)
+  local halfX, halfY, halfZ = half.x, half.y, half.z
+
+  axes[1], axes[2], axes[3], axes[4] = AxisX, Up, AxisZ, vector.cross(edge0, edge1)
+  axes[5], axes[6], axes[7] = vector.cross(edge0, AxisX), vector.cross(edge0, Up), vector.cross(edge0, AxisZ)
+  axes[8], axes[9], axes[10] = vector.cross(edge1, AxisX), vector.cross(edge1, Up), vector.cross(edge1, AxisZ)
+  axes[11], axes[12], axes[13] = vector.cross(edge2, AxisX), vector.cross(edge2, Up), vector.cross(edge2, AxisZ)
+
+  for _, axis in axes do
+    local squared = vector.dot(axis, axis)
+    if squared <= 1e-10 then continue end
+
+    local along = if math.abs(squared - 1) < 1e-5 then axis else axis / math.sqrt(squared)
+    local firstAt, secondAt, thirdAt = vector.dot(first, along), vector.dot(second, along), vector.dot(third, along)
+    local low, high = math.min(firstAt, secondAt, thirdAt), math.max(firstAt, secondAt, thirdAt)
+    local reach = halfX * math.abs(along.x) + halfY * math.abs(along.y) + halfZ * math.abs(along.z)
+    local overlap = math.min(reach, high) - math.max(-reach, low)
+    if overlap <= slack then return false, Zero, Zero, 0 end
+
+    if overlap < least then
+      least = overlap
+      leastAxis = if (low + high) * 0.5 >= 0 then along else -along
+    end
+  end
+
+  -- A triangle has no thickness, so the least overlap can be nearly nothing even while the box
+  -- has crossed the triangle's plane. The axes decide whether they touch; the plane gives the
+  -- normal and the depth that are of use.
+  local point = nearestOnTriangle(Zero, first, second, third)
+  local face = unit(vector.cross(second - first, third - first), leastAxis or Up)
+  local plane = (vector.dot(first, face) + vector.dot(second, face) + vector.dot(third, face)) / 3
+
+  if plane < 0 then
+    face, plane = -face, -plane
+  end
+
+  local reach = halfX * math.abs(face.x) + halfY * math.abs(face.y) + halfZ * math.abs(face.z)
+
+  return true, rotate(turn, turnW, face), at + rotate(turn, turnW, point), reach - plane
+end
+
+geometry.nearestSegmentToTriangle = nearestSegmentToTriangle
+geometry.sphereOnTriangle = sphereOnTriangle
+geometry.capsuleOnTriangle = capsuleOnTriangle
+geometry.boxOnTriangle = boxOnTriangle
+
+--- The box, in the space of a body at `at` turned by a rotation, that holds a box of the world's.
+function geometry.boundsWithin(turn: vector, turnW: number, at: vector, low: vector, high: vector): (vector, vector)
+  local least = vector.create(math.huge, math.huge, math.huge)
+  local most = vector.create(-math.huge, -math.huge, -math.huge)
+
+  for corner = 0, 7 do
+    local inside = unrotate(
+      turn,
+      turnW,
+      vector.create(
+        if corner < 4 then low.x else high.x,
+        if corner % 4 < 2 then low.y else high.y,
+        if corner % 2 == 0 then low.z else high.z
+      ) - at
+    )
+
+    least = vector.create(math.min(least.x, inside.x), math.min(least.y, inside.y), math.min(least.z, inside.z))
+    most = vector.create(math.max(most.x, inside.x), math.max(most.y, inside.y), math.max(most.z, inside.z))
+  end
+
+  return least, most
+end
+
+--- Two primitives, each a shape with where it is and how it is turned. The normal is from the
+--- first to the second.
+function geometry.primitiveOnPrimitive(
+  first: types.Primitive,
+  firstAt: vector,
+  firstTurn: vector,
+  firstTurnW: number,
+  second: types.Primitive,
+  secondAt: vector,
+  secondTurn: vector,
+  secondTurnW: number,
+  margin: number?
+): (boolean, vector, vector, number)
+  if first.kind == 'sphere' then
+    if second.kind == 'sphere' then return sphereOnSphere(firstAt, first.radius, secondAt, second.radius, margin) end
+
+    if second.kind == 'box' then
+      return sphereOnBox(firstAt, first.radius, secondAt, secondTurn, secondTurnW, second.halfExtents, margin)
+    end
+
+    local met, normal, point, depth =
+      capsuleOnSphere(secondAt, secondTurn, secondTurnW, second.radius, second.halfHeight, firstAt, first.radius, margin)
+
+    return met, -normal, point, depth
+  end
+
+  if first.kind == 'box' then
+    if second.kind == 'sphere' then
+      local met, normal, point, depth =
+        sphereOnBox(secondAt, second.radius, firstAt, firstTurn, firstTurnW, first.halfExtents, margin)
+
+      return met, -normal, point, depth
+    end
+
+    if second.kind == 'box' then
+      local first0, first1, first2 = axesOf(firstTurn, firstTurnW)
+      local second0, second1, second2 = axesOf(secondTurn, secondTurnW)
+      local met, normal, point, depth =
+        boxOnBox(firstAt, first0, first1, first2, first.halfExtents, secondAt, second0, second1, second2, second.halfExtents, margin)
+
+      return met, normal, point, depth
+    end
+
+    local met, normal, point, depth = capsuleOnBox(
+      secondAt, secondTurn, secondTurnW, second.radius, second.halfHeight, firstAt, firstTurn, firstTurnW, first.halfExtents, margin
+    )
+
+    return met, -normal, point, depth
+  end
+
+  if second.kind == 'sphere' then
+    return capsuleOnSphere(firstAt, firstTurn, firstTurnW, first.radius, first.halfHeight, secondAt, second.radius, margin)
+  end
+
+  if second.kind == 'box' then
+    return capsuleOnBox(
+      firstAt, firstTurn, firstTurnW, first.radius, first.halfHeight, secondAt, secondTurn, secondTurnW, second.halfExtents, margin
+    )
+  end
+
+  return capsuleOnCapsule(
+    firstAt, firstTurn, firstTurnW, first.radius, first.halfHeight, secondAt, secondTurn, secondTurnW, second.radius, second.halfHeight, margin
+  )
+end
+
+--- A primitive and a triangle. The normal is from the primitive to the triangle.
+function geometry.primitiveOnTriangle(
+  shape: types.Primitive,
+  at: vector,
+  turn: vector,
+  turnW: number,
+  first: vector,
+  second: vector,
+  third: vector,
+  margin: number?
+): (boolean, vector, vector, number)
+  if shape.kind == 'sphere' then return sphereOnTriangle(at, shape.radius, first, second, third, margin) end
+  if shape.kind == 'box' then return boxOnTriangle(at, turn, turnW, shape.halfExtents, first, second, third, margin) end
+
+  return capsuleOnTriangle(at, turn, turnW, shape.radius, shape.halfHeight, first, second, third, margin)
+end
+
+-- How near a swept capsule comes to what it meets before it is said to touch it.
+local SweepSkin = 1e-3
+
+geometry.SweepSkin = SweepSkin
+
+--- Sweeps an upright capsule along `motion` at a primitive, or at a triangle when `target` is
+--- nil, no further than the fraction `limit`. Returns the fraction at which they touch, the
+--- normal there, which points at the capsule, and the point on what was met; or nil and fillers.
+---
+--- Both are convex, so the capsule can close on the other no faster than it moves along the line
+--- between their nearest points: it is advanced by the gap over that speed until there is no gap,
+--- and is past it for good once it is not closing. A capsule that starts inside is met at once,
+--- unless it is on its way out.
+function geometry.sweepCapsule(
+  radius: number,
+  halfHeight: number,
+  start: vector,
+  motion: vector,
+  length: number,
+  limit: number,
+  target: types.Primitive?,
+  at: vector,
+  turn: vector,
+  turnW: number,
+  first: vector,
+  second: vector,
+  third: vector
+): (number?, vector, vector)
+  local fraction = 0
+  local normal, point = Zero, Zero
+
+  for _ = 1, 32 do
+    local centre = start + motion * fraction
+    local reach = length * (limit - fraction) + SweepSkin
+    local met, depth
+
+    if not target then
+      met, normal, point, depth = capsuleOnTriangle(centre, Zero, 1, radius, halfHeight, first, second, third, reach)
+    elseif target.kind == 'sphere' then
+      met, normal, point, depth = capsuleOnSphere(centre, Zero, 1, radius, halfHeight, at, target.radius, reach)
+    elseif target.kind == 'box' then
+      met, normal, point, depth = capsuleOnBox(centre, Zero, 1, radius, halfHeight, at, turn, turnW, target.halfExtents, reach)
+    else
+      met, normal, point, depth =
+        capsuleOnCapsule(centre, Zero, 1, radius, halfHeight, at, turn, turnW, target.radius, target.halfHeight, reach)
+    end
+
+    if not met then return nil, Zero, Zero end
+
+    -- Motion along a surface is not into it, to within what the arithmetic can tell.
+    local closing = vector.dot(motion, normal)
+    if closing <= length * 1e-4 then return nil, Zero, Zero end
+    if -depth <= SweepSkin then return fraction, Zero - normal, point end
+
+    fraction += (-depth - SweepSkin * 0.5) / closing
+    if fraction >= limit then return nil, Zero, Zero end
+  end
+
+  -- Thirty-two advances and still closing on it: it is no nearer than this, which is safe to
+  -- take as where they meet.
+  return fraction, Zero - normal, point
+end
+
+--- How far along a ray a triangle is, when it is no further than `reach`.
+function geometry.rayToTriangle(origin: vector, direction: vector, reach: number, first: vector, second: vector, third: vector): number?
+  local toSecond, toThird = second - first, third - first
+  local across = vector.cross(direction, toThird)
+  local facing = vector.dot(toSecond, across)
+  if math.abs(facing) < 1e-9 then return nil end
+
+  local inverse = 1 / facing
+  local from = origin - first
+  local alongSecond = vector.dot(from, across) * inverse
+  if alongSecond < 0 or alongSecond > 1 then return nil end
+
+  local around = vector.cross(from, toSecond)
+  local alongThird = vector.dot(direction, around) * inverse
+  if alongThird < 0 or alongSecond + alongThird > 1 then return nil end
+
+  local distance = vector.dot(toThird, around) * inverse
+  if distance < 0 or distance > reach then return nil end
+
+  return distance
+end
+
+--- A triangle's normal, on the side a ray going along `direction` strikes.
+function geometry.triangleFacing(first: vector, second: vector, third: vector, direction: vector): vector
+  local normal = unit(vector.cross(second - first, third - first), Up)
+
+  return if vector.dot(normal, direction) > 0 then -normal else normal
+end
+
+--- Where a ray meets a sphere: how far along, the normal there and the point; or nil and fillers.
+--- A ray that starts inside meets it at once.
+local function rayToSphere(origin: vector, direction: vector, reach: number, centre: vector, radius: number): (number?, vector, vector)
+  local from = origin - centre
+  local closing = vector.dot(from, direction)
+  local outside = vector.dot(from, from) - radius * radius
+  if outside > 0 and closing > 0 then return nil, Zero, Zero end
+
+  local under = closing * closing - outside
+  if under < 0 then return nil, Zero, Zero end
+
+  local distance = math.max(-closing - math.sqrt(under), 0)
+  if distance > reach then return nil, Zero, Zero end
+
+  local point = origin + direction * distance
+
+  return distance, unit(point - centre, -direction), point
+end
+
+--- Narrows the stretch of a ray inside a slab centred on the origin, and notes the axis and the
+--- side it came in by when this slab is the last one entered.
+local function narrowBySlab(
+  origin: number,
+  direction: number,
+  half: number,
+  enter: number,
+  leave: number,
+  axis: number,
+  entered: number,
+  side: number
+): (boolean, number, number, number, number)
+  if math.abs(direction) < Tiny then return math.abs(origin) <= half, enter, leave, entered, side end
+
+  local inverse = 1 / direction
+  local near, far = (-half - origin) * inverse, (half - origin) * inverse
+  local nearSide = -1
+
+  if near > far then
+    near, far = far, near
+    nearSide = 1
+  end
+
+  if near > enter then
+    enter, entered, side = near, axis, nearSide
+  end
+
+  if far < leave then leave = far end
+
+  return enter <= leave, enter, leave, entered, side
+end
+
+--- Where a ray meets a box.
+local function rayToBox(
+  origin: vector,
+  direction: vector,
+  reach: number,
+  centre: vector,
+  turn: vector,
+  turnW: number,
+  half: vector
+): (number?, vector, vector)
+  local from, along = unrotate(turn, turnW, origin - centre), unrotate(turn, turnW, direction)
+  local enter, leave = 0, reach
+  local entered, side = 1, 1
+  local inside
+
+  inside, enter, leave, entered, side = narrowBySlab(from.x, along.x, half.x, enter, leave, 1, entered, side)
+  if not inside then return nil, Zero, Zero end
+
+  inside, enter, leave, entered, side = narrowBySlab(from.y, along.y, half.y, enter, leave, 2, entered, side)
+  if not inside then return nil, Zero, Zero end
+
+  inside, enter, leave, entered, side = narrowBySlab(from.z, along.z, half.z, enter, leave, 3, entered, side)
+  if not inside then return nil, Zero, Zero end
+
+  if enter < 0 or enter > reach then return nil, Zero, Zero end
+
+  local normal = if entered == 1
+    then vector.create(side, 0, 0)
+    elseif entered == 2 then vector.create(0, side, 0)
+    else vector.create(0, 0, side)
+
+  return enter, rotate(turn, turnW, normal), origin + direction * enter
+end
+
+--- Where a ray meets a primitive. A capsule is met as three spheres: its ends and its middle.
+function geometry.rayToPrimitive(
+  shape: types.Primitive,
+  at: vector,
+  turn: vector,
+  turnW: number,
+  origin: vector,
+  direction: vector,
+  reach: number
+): (number?, vector, vector)
+  if shape.kind == 'sphere' then return rayToSphere(origin, direction, reach, at, shape.radius) end
+  if shape.kind == 'box' then return rayToBox(origin, direction, reach, at, turn, turnW, shape.halfExtents) end
+
+  local from, to = capsuleEnds(at, turn, turnW, shape.halfHeight)
+  local distance, normal, point = rayToSphere(origin, direction, reach, from, shape.radius)
+  local middleDistance, middleNormal, middlePoint = rayToSphere(origin, direction, reach, (from + to) * 0.5, shape.radius)
+  local endDistance, endNormal, endPoint = rayToSphere(origin, direction, reach, to, shape.radius)
+
+  if middleDistance and (not distance or middleDistance < distance) then
+    distance, normal, point = middleDistance, middleNormal, middlePoint
+  end
+
+  if endDistance and (not distance or endDistance < distance) then
+    distance, normal, point = endDistance, endNormal, endPoint
+  end
+
+  return distance, normal, point
+end
+
+geometry.rayToSphere = rayToSphere
+
+--- Narrows the stretch of a ray between two planes across one axis.
+local function narrowByRange(origin: number, direction: number, low: number, high: number, enter: number, leave: number): (boolean, number, number)
+  if math.abs(direction) < Tiny then return origin >= low and origin <= high, enter, leave end
+
+  local inverse = 1 / direction
+  local near, far = (low - origin) * inverse, (high - origin) * inverse
+  if near > far then
+    near, far = far, near
+  end
+
+  if near > enter then enter = near end
+  if far < leave then leave = far end
+
+  return enter <= leave, enter, leave
+end
+
+--- The stretch of a ray inside a box of the world's, no further than `reach`: where it comes
+--- in and where it goes out, or nil when it misses.
+function geometry.rayThroughBox(origin: vector, direction: vector, reach: number, low: vector, high: vector): (number?, number)
+  local enter, leave = 0, reach
+  local inside
+
+  inside, enter, leave = narrowByRange(origin.x, direction.x, low.x, high.x, enter, leave)
+  if not inside then return nil, 0 end
+
+  inside, enter, leave = narrowByRange(origin.y, direction.y, low.y, high.y, enter, leave)
+  if not inside then return nil, 0 end
+
+  inside, enter, leave = narrowByRange(origin.z, direction.z, low.z, high.z, enter, leave)
+  if not inside then return nil, 0 end
+
+  return enter, leave
+end
+
+--- How far a sphere's centre, at a fraction of its motion, is from touching a triangle: the
+--- square of the distance less the square of the radius. Also the centre and the nearest point.
+local function gapToTriangle(
+  start: vector,
+  motion: vector,
+  fraction: number,
+  radiusSquared: number,
+  first: vector,
+  second: vector,
+  third: vector
+): (number, vector, vector)
+  local centre = start + motion * fraction
+  local nearest = nearestOnTriangle(centre, first, second, third)
+  local out = centre - nearest
+
+  return vector.dot(out, out) - radiusSquared, centre, nearest
+end
+
+--- Sweeps a sphere at a triangle: the fraction of the way at which they touch and the normal
+--- there, or nil and a filler. The gap along the way has one low point, which is found by
+--- thirds, and where it first closes is found by halves between the start and there. A sphere
+--- that starts touching is left to the contacts.
+function geometry.sweepSphereAtTriangle(
+  start: vector,
+  finish: vector,
+  radius: number,
+  first: vector,
+  second: vector,
+  third: vector
+): (number?, vector)
+  local radiusSquared = radius * radius
+  local out = start - nearestOnTriangle(start, first, second, third)
+  if vector.dot(out, out) <= radiusSquared then return nil, Zero end
+
+  local motion = finish - start
+  local low, high = 0, 1
+
+  for _ = 1, 10 do
+    local nearer, further = (2 * low + high) / 3, (low + 2 * high) / 3
+
+    if
+      gapToTriangle(start, motion, nearer, radiusSquared, first, second, third)
+      < gapToTriangle(start, motion, further, radiusSquared, first, second, third)
+    then
+      high = further
+    else
+      low = nearer
+    end
+  end
+
+  local closest = (low + high) * 0.5
+  if gapToTriangle(start, motion, closest, radiusSquared, first, second, third) > 0 then return nil, Zero end
+
+  low, high = 0, closest
+
+  for _ = 1, 14 do
+    local middle = (low + high) * 0.5
+
+    if gapToTriangle(start, motion, middle, radiusSquared, first, second, third) <= 0 then
+      high = middle
+    else
+      low = middle
+    end
+  end
+
+  local _, centre, nearest = gapToTriangle(start, motion, high, radiusSquared, first, second, third)
+
+  return high, unit(centre - nearest, unit(vector.cross(second - first, third - first), Up))
+end
+
+local function gapToSegment(start: vector, motion: vector, fraction: number, radiusSquared: number, from: vector, to: vector): (number, vector, vector)
+  local centre = start + motion * fraction
+  local nearest = nearestOnSegment(centre, from, to)
+  local out = centre - nearest
+
+  return vector.dot(out, out) - radiusSquared, centre, nearest
+end
+
+--- Sweeps a sphere at a segment, as at a triangle: `radius` is the sphere's and the capsule's
+--- together when the segment is a capsule's axis.
+function geometry.sweepSphereAtSegment(start: vector, finish: vector, radius: number, from: vector, to: vector): (number?, vector)
+  local radiusSquared = radius * radius
+  local out = start - nearestOnSegment(start, from, to)
+  if vector.dot(out, out) <= radiusSquared then return nil, Zero end
+
+  local motion = finish - start
+  local low, high = 0, 1
+
+  for _ = 1, 9 do
+    local nearer, further = (2 * low + high) / 3, (low + 2 * high) / 3
+
+    if gapToSegment(start, motion, nearer, radiusSquared, from, to) < gapToSegment(start, motion, further, radiusSquared, from, to) then
+      high = further
+    else
+      low = nearer
+    end
+  end
+
+  local closest = (low + high) * 0.5
+  if gapToSegment(start, motion, closest, radiusSquared, from, to) > 0 then return nil, Zero end
+
+  low, high = 0, closest
+
+  for _ = 1, 13 do
+    local middle = (low + high) * 0.5
+
+    if gapToSegment(start, motion, middle, radiusSquared, from, to) <= 0 then
+      high = middle
+    else
+      low = middle
+    end
+  end
+
+  local _, centre, nearest = gapToSegment(start, motion, high, radiusSquared, from, to)
+
+  return high, unit(centre - nearest, Up)
+end
+
+--- Sweeps a sphere at a sphere. One that starts overlapping is left to the contacts.
+function geometry.sweepSphereAtSphere(start: vector, finish: vector, radius: number, centre: vector, targetRadius: number): (number?, vector)
+  local motion = finish - start
+  local from = start - centre
+  local reach = radius + targetRadius
+  local outside = vector.dot(from, from) - reach * reach
+  if outside <= 0 then return nil, Zero end
+
+  local squared = vector.dot(motion, motion)
+  if squared <= Tiny then return nil, Zero end
+
+  local closing = vector.dot(from, motion)
+  if closing >= 0 then return nil, Zero end
+
+  local under = closing * closing - squared * outside
+  if under < 0 then return nil, Zero end
+
+  local fraction = (-closing - math.sqrt(under)) / squared
+  if fraction < 0 or fraction > 1 then return nil, Zero end
+
+  return fraction, unit(start + motion * fraction - centre, Up)
+end
+
+--- Sweeps a sphere at a box: as a point at the box grown by the radius, so its corners are
+--- square where the true ones are round. One that starts inside is left to the contacts.
+function geometry.sweepSphereAtBox(
+  start: vector,
+  finish: vector,
+  radius: number,
+  boxAt: vector,
+  turn: vector,
+  turnW: number,
+  half: vector
+): (number?, vector)
+  local from, to = unrotate(turn, turnW, start - boxAt), unrotate(turn, turnW, finish - boxAt)
+  local grown = vector.create(half.x + radius, half.y + radius, half.z + radius)
+  if math.abs(from.x) <= grown.x and math.abs(from.y) <= grown.y and math.abs(from.z) <= grown.z then return nil, Zero end
+
+  local through, enter = segmentInBox(from, to, grown)
+  if not through or enter < 0 or enter > 1 then return nil, Zero end
+
+  local point = from + (to - from) * enter
+  local toX, toY, toZ = math.abs(math.abs(point.x) - grown.x), math.abs(math.abs(point.y) - grown.y), math.abs(math.abs(point.z) - grown.z)
+  local normal = if toX <= toY and toX <= toZ
+    then vector.create(sideOf(point.x), 0, 0)
+    elseif toY <= toZ then vector.create(0, sideOf(point.y), 0)
+    else vector.create(0, 0, sideOf(point.z))
+
+  return enter, rotate(turn, turnW, normal)
+end
+
+return geometry

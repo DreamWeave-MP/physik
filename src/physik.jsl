@@ -3,8 +3,24 @@
 -- Hot state uses Luau's native vector value type. Cold metadata stays scalar/packed-friendly.
 
 local data = require('@dream/data')
+local geometry = require('./geometry')
 
 local M = {}
+
+-- What has moved out of this file, under the names the rest of it still calls it by.
+local clamp, safeUnit, qNormalize = geometry.clamp, geometry.unit, geometry.normalizeTurn
+local qRotate, qInvRotate, qMul, qAxes, qIntegrate = geometry.rotate, geometry.unrotate, geometry.composeTurns, geometry.axesOf, geometry.integrateTurn
+local supportBoxAxes, capsuleEndpoints = geometry.boxSupport, geometry.capsuleEnds
+local sphereSphere, sphereBox, boxBox = geometry.sphereOnSphere, geometry.sphereOnBox, geometry.boxOnBox
+local capsuleSphere, capsuleCapsule, capsuleBox = geometry.capsuleOnSphere, geometry.capsuleOnCapsule, geometry.capsuleOnBox
+local capsuleTriangle = geometry.capsuleOnTriangle
+local collidePrimitives, primitiveTriangleContact = geometry.primitiveOnPrimitive, geometry.primitiveOnTriangle
+local transformedBoundsLocal = geometry.boundsWithin
+local rayTriangleT, triangleRayNormal = geometry.rayToTriangle, geometry.triangleFacing
+local raySphere, rayAabbInterval, rayPrimitiveShape = geometry.rayToSphere, geometry.rayThroughBox, geometry.rayToPrimitive
+local sweepSphereTriangle, sweepSphereSegment = geometry.sweepSphereAtTriangle, geometry.sweepSphereAtSegment
+local sweepSphereSphere, sweepSphereBox = geometry.sweepSphereAtSphere, geometry.sweepSphereAtBox
+local sweepCapsule, SweepSkin = geometry.sweepCapsule, geometry.SweepSkin
 
 local ZERO = vector.create(0, 0, 0)
 local XAXIS = vector.create(1, 0, 0)
@@ -16,12 +32,12 @@ local HANDLE_STRIDE = 1048576 -- 20 index bits worth of exact-number handle spac
 local BODY_STATIC = 0
 local BODY_DYNAMIC = 1
 local BODY_KINEMATIC = 2
-local SHAPE_SPHERE = 1
-local SHAPE_BOX = 2
-local SHAPE_CAPSULE = 3
-local SHAPE_MESH = 4
-local SHAPE_HEIGHTFIELD = 5
-local SHAPE_COMPOUND = 6
+local SHAPE_SPHERE = 'sphere'
+local SHAPE_BOX = 'box'
+local SHAPE_CAPSULE = 'capsule'
+local SHAPE_MESH = 'mesh'
+local SHAPE_HEIGHTFIELD = 'heightfield'
+local SHAPE_COMPOUND = 'compound'
 local JOINT_DISTANCE = 1
 local JOINT_BALL = 2
 local JOINT_HINGE = 3
@@ -70,63 +86,6 @@ M.STATIC = "static"
 M.DYNAMIC = "dynamic"
 M.KINEMATIC = "kinematic"
 
-local function clamp(x, lo, hi)
-    if x < lo then return lo end
-    if x > hi then return hi end
-    return x
-end
-
-local function signnz(x)
-    if x < 0 then return -1 end
-    return 1
-end
-
-local function safeUnit(v, fallback)
-    local l2 = vector.dot(v, v)
-    if l2 <= EPS then return fallback end
-    return v / math.sqrt(l2)
-end
-
-local function qNormalize(qv, qw)
-    local n2 = vector.dot(qv, qv) + qw * qw
-    if n2 <= EPS then return ZERO, 1 end
-    local inv = 1 / math.sqrt(n2)
-    return qv * inv, qw * inv
-end
-
-local function qRotate(qv, qw, v)
-    local t = vector.cross(qv, v) * 2
-    return v + t * qw + vector.cross(qv, t)
-end
-
-local function qInvRotate(qv, qw, v)
-    local nq = -qv
-    local t = vector.cross(nq, v) * 2
-    return v + t * qw + vector.cross(nq, t)
-end
-
-
-local function qMul(av,aw,bv,bw)
-    return av*bw+bv*aw+vector.cross(av,bv),aw*bw-vector.dot(av,bv)
-end
-
-local function qAxes(qv, qw)
-    local x, y, z = qv.X, qv.Y, qv.Z
-    local xx, yy, zz = x*x, y*y, z*z
-    local xy, xz, yz = x*y, x*z, y*z
-    local wx, wy, wz = qw*x, qw*y, qw*z
-    return
-        vector.create(1 - 2*(yy + zz), 2*(xy + wz), 2*(xz - wy)),
-        vector.create(2*(xy - wz), 1 - 2*(xx + zz), 2*(yz + wx)),
-        vector.create(2*(xz + wy), 2*(yz - wx), 1 - 2*(xx + yy))
-end
-
-local function qIntegrate(qv, qw, omega, dt)
-    local half = 0.5 * dt
-    local nv = qv + (omega * qw + vector.cross(omega, qv)) * half
-    local nw = qw - vector.dot(omega, qv) * half
-    return qNormalize(nv, nw)
-end
 
 local function makeHandle(i, generation)
     return generation * HANDLE_STRIDE + i
@@ -461,165 +420,6 @@ local function applyInvInertia(self,i,v)
     return a0*(vector.dot(v,a0)*ii.X)+a1*(vector.dot(v,a1)*ii.Y)+a2*(vector.dot(v,a2)*ii.Z)
 end
 
-local function supportBox(center, qv, qw, half, dir)
-    local a0, a1, a2 = qAxes(qv, qw)
-    return center
-        + a0 * (if vector.dot(dir, a0) >= 0 then half.X else -half.X)
-        + a1 * (if vector.dot(dir, a1) >= 0 then half.Y else -half.Y)
-        + a2 * (if vector.dot(dir, a2) >= 0 then half.Z else -half.Z)
-end
-
-local function supportBoxAxes(center,a0,a1,a2,half,dir)
-    return center
-        + a0 * (if vector.dot(dir,a0)>=0 then half.X else -half.X)
-        + a1 * (if vector.dot(dir,a1)>=0 then half.Y else -half.Y)
-        + a2 * (if vector.dot(dir,a2)>=0 then half.Z else -half.Z)
-end
-
-local function closestPointSegment(p, a, b)
-    local ab = b - a
-    local d = vector.dot(ab, ab)
-    if d <= EPS then return a end
-    local t = clamp(vector.dot(p - a, ab) / d, 0, 1)
-    return a + ab * t
-end
-
-local function closestSegmentSegment(p1, q1, p2, q2)
-    local d1 = q1 - p1
-    local d2 = q2 - p2
-    local r = p1 - p2
-    local a = vector.dot(d1, d1)
-    local e = vector.dot(d2, d2)
-    local f = vector.dot(d2, r)
-    local s, t
-    if a <= EPS and e <= EPS then
-        return p1, p2
-    elseif a <= EPS then
-        s = 0
-        t = clamp(f / e, 0, 1)
-    else
-        local c = vector.dot(d1, r)
-        if e <= EPS then
-            t = 0
-            s = clamp(-c / a, 0, 1)
-        else
-            local b = vector.dot(d1, d2)
-            local denom = a*e - b*b
-            if math.abs(denom) > EPS then s = clamp((b*f - c*e) / denom, 0, 1) else s = 0 end
-            t = (b*s + f) / e
-            if t < 0 then
-                t = 0
-                s = clamp(-c / a, 0, 1)
-            elseif t > 1 then
-                t = 1
-                s = clamp((b - c) / a, 0, 1)
-            end
-        end
-    end
-    return p1 + d1*s, p2 + d2*t
-end
-
-local function sphereSphere(pa, ra, pb, rb, margin)
-    local d = pb - pa
-    margin=margin or 0
-    local rr = ra + rb
-    local detect=rr+margin
-    local d2 = vector.dot(d, d)
-    if d2 >= detect*detect then return false end
-    local dist = math.sqrt(math.max(d2, EPS))
-    local n = if d2 > EPS then d / dist else YAXIS
-    local penetration = rr - dist
-    local point = pa + n * (ra - penetration * 0.5)
-    return true, n, point, penetration
-end
-
-local function sphereBox(sp, radius, bp, bqv, bqw, half, margin)
-    local rel = qInvRotate(bqv, bqw, sp - bp)
-    local closest = vector.create(
-        clamp(rel.X, -half.X, half.X),
-        clamp(rel.Y, -half.Y, half.Y),
-        clamp(rel.Z, -half.Z, half.Z)
-    )
-    local d = rel - closest -- box -> sphere in box-local space.
-    local d2 = vector.dot(d, d)
-    margin=margin or 0
-    local detect=radius+margin
-    if d2 > detect*detect then return false end
-    local nLocal, penetration, pointLocal
-    if d2 > EPS then
-        local dist = math.sqrt(d2)
-        nLocal = -(d / dist) -- sphere -> box
-        penetration = radius - dist
-        pointLocal = closest
-    else
-        local dx = half.X - math.abs(rel.X)
-        local dy = half.Y - math.abs(rel.Y)
-        local dz = half.Z - math.abs(rel.Z)
-        if dx <= dy and dx <= dz then
-            local outward = vector.create(signnz(rel.X), 0, 0)
-            nLocal = -outward
-            penetration = radius + dx
-            pointLocal = rel + outward * dx
-        elseif dy <= dz then
-            local outward = vector.create(0, signnz(rel.Y), 0)
-            nLocal = -outward
-            penetration = radius + dy
-            pointLocal = rel + outward * dy
-        else
-            local outward = vector.create(0, 0, signnz(rel.Z))
-            nLocal = -outward
-            penetration = radius + dz
-            pointLocal = rel + outward * dz
-        end
-    end
-    return true, qRotate(bqv, bqw, nLocal), bp + qRotate(bqv, bqw, pointLocal), penetration
-end
-
--- The fifteen axes two boxes can be apart along: each box's three, then the nine crosses of one
--- of each. Kept between calls, and filled a stage at a time, since most pairs are apart on an
--- early axis.
-local BoxAxes = table.create(15, ZERO)
-
-local function boxBox(ap,a0,a1,a2,ah,bp,b0,b1,b2,bh,margin)
-    local d=bp-ap
-    local bestPen,bestAxis,bestFeature=math.huge,nil,0
-    local axes=BoxAxes
-    local slack=-(margin or 0)
-    local ahx,ahy,ahz,bhx,bhy,bhz=ah.X,ah.Y,ah.Z,bh.X,bh.Y,bh.Z
-
-    axes[1],axes[2],axes[3],axes[4],axes[5],axes[6]=a0,a1,a2,b0,b1,b2
-
-    for feature=1,15 do
-        if feature==7 then
-            axes[7],axes[8],axes[9]=vector.cross(a0,b0),vector.cross(a0,b1),vector.cross(a0,b2)
-            axes[10],axes[11],axes[12]=vector.cross(a1,b0),vector.cross(a1,b1),vector.cross(a1,b2)
-            axes[13],axes[14],axes[15]=vector.cross(a2,b0),vector.cross(a2,b1),vector.cross(a2,b2)
-        end
-
-        -- One axis: how far the boxes reach along it, against how far apart their centres are.
-        local axis=axes[feature]
-        local l2=vector.dot(axis,axis)
-        if l2<=1e-10 then continue end
-
-        local n=if math.abs(l2-1)<1e-5 then axis else axis/math.sqrt(l2)
-        local ra=ahx*math.abs(vector.dot(n,a0))+ahy*math.abs(vector.dot(n,a1))+ahz*math.abs(vector.dot(n,a2))
-        local rb=bhx*math.abs(vector.dot(n,b0))+bhy*math.abs(vector.dot(n,b1))+bhz*math.abs(vector.dot(n,b2))
-        local dn=vector.dot(d,n)
-        local pen=ra+rb-math.abs(dn)
-        if pen<=slack then return false end
-
-        if pen<bestPen then
-            bestPen=pen
-            bestAxis=if dn>=0 then n else -n
-            bestFeature=feature
-        end
-    end
-
-    local n=bestAxis or safeUnit(d,YAXIS)
-    local sa=supportBoxAxes(ap,a0,a1,a2,ah,n)
-    local sb=supportBoxAxes(bp,b0,b1,b2,bh,-n)
-    return true,n,(sa+sb)*0.5,bestPen,bestFeature
-end
 
 local function axisAt(a0,a1,a2,i)
     if i==1 then return a0 elseif i==2 then return a1 else return a2 end
@@ -764,299 +564,6 @@ local function emitFaceManifold(self,a,b,n,feature,bestPen)
     if i4~=0 then self:_addContact(a,b,n,points[i4],depths[i4]) end
 end
 
-local function capsuleEndpoints(p, qv, qw, hh)
-    local axis = qRotate(qv, qw, YAXIS)
-    local d = axis * hh
-    return p - d, p + d
-end
-
-local function capsuleSphere(cp, cqv, cqw, cr, chh, sp, sr, margin)
-    local a,b = capsuleEndpoints(cp,cqv,cqw,chh)
-    local q = closestPointSegment(sp,a,b)
-    return sphereSphere(q,cr,sp,sr,margin)
-end
-
-local function capsuleCapsule(ap,aqv,aqw,ar,ahh,bp,bqv,bqw,br,bhh,margin)
-    local a0,a1 = capsuleEndpoints(ap,aqv,aqw,ahh)
-    local b0,b1 = capsuleEndpoints(bp,bqv,bqw,bhh)
-    local ca,cb = closestSegmentSegment(a0,a1,b0,b1)
-    return sphereSphere(ca,ar,cb,br,margin)
-end
-
-local function closestPointAabbLocal(p,h)
-    return vector.create(clamp(p.X,-h.X,h.X),clamp(p.Y,-h.Y,h.Y),clamp(p.Z,-h.Z,h.Z))
-end
-
-local function segmentAabbInterval(a,b,h)
-    local d=b-a
-    local tmin,tmax=0,1
-    local p,dp,lo,hi,inv,t1,t2
-
-    p,dp,lo,hi=a.X,d.X,-h.X,h.X
-    if math.abs(dp)<=EPS then
-        if p<lo or p>hi then return false end
-    else
-        inv=1/dp;t1=(lo-p)*inv;t2=(hi-p)*inv
-        if t1>t2 then t1,t2=t2,t1 end
-        if t1>tmin then tmin=t1 end
-        if t2<tmax then tmax=t2 end
-        if tmin>tmax then return false end
-    end
-
-    p,dp,lo,hi=a.Y,d.Y,-h.Y,h.Y
-    if math.abs(dp)<=EPS then
-        if p<lo or p>hi then return false end
-    else
-        inv=1/dp;t1=(lo-p)*inv;t2=(hi-p)*inv
-        if t1>t2 then t1,t2=t2,t1 end
-        if t1>tmin then tmin=t1 end
-        if t2<tmax then tmax=t2 end
-        if tmin>tmax then return false end
-    end
-
-    p,dp,lo,hi=a.Z,d.Z,-h.Z,h.Z
-    if math.abs(dp)<=EPS then
-        if p<lo or p>hi then return false end
-    else
-        inv=1/dp;t1=(lo-p)*inv;t2=(hi-p)*inv
-        if t1>t2 then t1,t2=t2,t1 end
-        if t1>tmin then tmin=t1 end
-        if t2<tmax then tmax=t2 end
-        if tmin>tmax then return false end
-    end
-    return true,tmin,tmax
-end
-
-local function considerSegmentEdge(a,b,e0,e1,bestD,bestS,bestB)
-    local s,e=closestSegmentSegment(a,b,e0,e1)
-    local dv=s-e
-    local d2=vector.dot(dv,dv)
-    if d2<bestD then return d2,s,e end
-    return bestD,bestS,bestB
-end
-
-local function closestSegmentAabbLocal(a,b,h)
-    local hit,t0,t1=segmentAabbInterval(a,b,h)
-    if hit then
-        local s=a+(b-a)*((t0+t1)*0.5)
-        local dx=h.X-math.abs(s.X)
-        local dy=h.Y-math.abs(s.Y)
-        local dz=h.Z-math.abs(s.Z)
-        if dx<=dy and dx<=dz then
-            local out=vector.create(signnz(s.X),0,0)
-            return s,s+out*dx,true,out,dx
-        elseif dy<=dz then
-            local out=vector.create(0,signnz(s.Y),0)
-            return s,s+out*dy,true,out,dy
-        else
-            local out=vector.create(0,0,signnz(s.Z))
-            return s,s+out*dz,true,out,dz
-        end
-    end
-
-    local qa=closestPointAabbLocal(a,h)
-    local da=a-qa
-    local bestD=vector.dot(da,da)
-    local bestS,bestB=a,qa
-    local qb=closestPointAabbLocal(b,h)
-    local db=b-qb
-    local d2=vector.dot(db,db)
-    if d2<bestD then bestD,bestS,bestB=d2,b,qb end
-
-    local hx,hy,hz=h.X,h.Y,h.Z
-    -- X-parallel edges.
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create(-hx,-hy,-hz),vector.create(hx,-hy,-hz),bestD,bestS,bestB)
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create(-hx,-hy, hz),vector.create(hx,-hy, hz),bestD,bestS,bestB)
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create(-hx, hy,-hz),vector.create(hx, hy,-hz),bestD,bestS,bestB)
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create(-hx, hy, hz),vector.create(hx, hy, hz),bestD,bestS,bestB)
-    -- Y-parallel edges.
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create(-hx,-hy,-hz),vector.create(-hx,hy,-hz),bestD,bestS,bestB)
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create(-hx,-hy, hz),vector.create(-hx,hy, hz),bestD,bestS,bestB)
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create( hx,-hy,-hz),vector.create( hx,hy,-hz),bestD,bestS,bestB)
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create( hx,-hy, hz),vector.create( hx,hy, hz),bestD,bestS,bestB)
-    -- Z-parallel edges.
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create(-hx,-hy,-hz),vector.create(-hx,-hy,hz),bestD,bestS,bestB)
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create(-hx, hy,-hz),vector.create(-hx, hy,hz),bestD,bestS,bestB)
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create( hx,-hy,-hz),vector.create( hx,-hy,hz),bestD,bestS,bestB)
-    bestD,bestS,bestB=considerSegmentEdge(a,b,vector.create( hx, hy,-hz),vector.create( hx, hy,hz),bestD,bestS,bestB)
-    return bestS,bestB,false,nil,math.sqrt(bestD)
-end
-
-local function capsuleBox(cp,cqv,cqw,cr,chh,bp,bqv,bqw,bh,margin)
-    local wa,wb=capsuleEndpoints(cp,cqv,cqw,chh)
-    local a=qInvRotate(bqv,bqw,wa-bp)
-    local b=qInvRotate(bqv,bqw,wb-bp)
-    local spine,boxPoint,inside,outward,measure=closestSegmentAabbLocal(a,b,bh)
-    margin=margin or 0
-    local nLocal,penetration
-    if inside then
-        nLocal=-outward
-        penetration=cr+measure
-    else
-        local delta=spine-boxPoint -- box -> capsule spine
-        local d2=vector.dot(delta,delta)
-        local detect=cr+margin
-        if d2>detect*detect then return false end
-        local dist=math.sqrt(math.max(d2,0))
-        if dist>EPS then nLocal=-(delta/dist) else nLocal=YAXIS end
-        penetration=cr-dist
-    end
-    local normal=qRotate(bqv,bqw,nLocal)
-    local point=bp+qRotate(bqv,bqw,boxPoint)
-    return true,normal,point,penetration
-end
-
-
-local function closestPointTriangle(p,a,b,c)
-    local ab,ac=p and (b-a),c-a
-    local ap=p-a
-    local d1,d2=vector.dot(ab,ap),vector.dot(ac,ap)
-    if d1<=0 and d2<=0 then return a end
-    local bp=p-b
-    local d3,d4=vector.dot(ab,bp),vector.dot(ac,bp)
-    if d3>=0 and d4<=d3 then return b end
-    local vc=d1*d4-d3*d2
-    if vc<=0 and d1>=0 and d3<=0 then
-        local v=d1/(d1-d3)
-        return a+ab*v
-    end
-    local cp=p-c
-    local d5,d6=vector.dot(ab,cp),vector.dot(ac,cp)
-    if d6>=0 and d5<=d6 then return c end
-    local vb=d5*d2-d1*d6
-    if vb<=0 and d2>=0 and d6<=0 then
-        local w=d2/(d2-d6)
-        return a+ac*w
-    end
-    local va=d3*d6-d5*d4
-    if va<=0 and (d4-d3)>=0 and (d5-d6)>=0 then
-        local w=(d4-d3)/((d4-d3)+(d5-d6))
-        return b+(c-b)*w
-    end
-    local denom=1/(va+vb+vc)
-    local v=vb*denom
-    local w=vc*denom
-    return a+ab*v+ac*w
-end
-
-local function pointInTriangle(p,a,b,c,n)
-    local c0=vector.cross(b-a,p-a)
-    local c1=vector.cross(c-b,p-b)
-    local c2=vector.cross(a-c,p-c)
-    local d0,d1,d2=vector.dot(c0,n),vector.dot(c1,n),vector.dot(c2,n)
-    return (d0>=-1e-7 and d1>=-1e-7 and d2>=-1e-7) or (d0<=1e-7 and d1<=1e-7 and d2<=1e-7)
-end
-
-local function closestSegmentTriangle(s0,s1,a,b,c)
-    local n=vector.cross(b-a,c-a)
-    local n2=vector.dot(n,n)
-    if n2>EPS then
-        local d=s1-s0
-        local denom=vector.dot(n,d)
-        if math.abs(denom)>EPS then
-            local t=vector.dot(n,a-s0)/denom
-            if t>=0 and t<=1 then
-                local p=s0+d*t
-                if pointInTriangle(p,a,b,c,n) then return p,p end
-            end
-        end
-    end
-    local bestS=s0
-    local bestT=closestPointTriangle(s0,a,b,c)
-    local bestD=vector.dot(bestT-bestS,bestT-bestS)
-    local q=closestPointTriangle(s1,a,b,c)
-    local d2=vector.dot(q-s1,q-s1)
-    if d2<bestD then bestD,bestS,bestT=d2,s1,q end
-    local p0,p1=closestSegmentSegment(s0,s1,a,b)
-    d2=vector.dot(p1-p0,p1-p0); if d2<bestD then bestD,bestS,bestT=d2,p0,p1 end
-    p0,p1=closestSegmentSegment(s0,s1,b,c)
-    d2=vector.dot(p1-p0,p1-p0); if d2<bestD then bestD,bestS,bestT=d2,p0,p1 end
-    p0,p1=closestSegmentSegment(s0,s1,c,a)
-    d2=vector.dot(p1-p0,p1-p0); if d2<bestD then bestS,bestT=p0,p1 end
-    return bestS,bestT
-end
-
-local function sphereTriangle(sp,r,a,b,c,margin)
-    local q=closestPointTriangle(sp,a,b,c)
-    local d=q-sp
-    local d2=vector.dot(d,d)
-    local detect=r+(margin or 0)
-    if d2>detect*detect then return false end
-    local dist=math.sqrt(math.max(d2,EPS))
-    local n
-    if d2>EPS then n=d/dist else
-        local tn=safeUnit(vector.cross(b-a,c-a),YAXIS)
-        local center=(a+b+c)/3
-        n=if vector.dot(center-sp,tn)>=0 then tn else -tn
-    end
-    return true,n,q,r-dist
-end
-
-local function capsuleTriangle(cp,cqv,cqw,r,hh,a,b,c,margin)
-    local s0,s1=capsuleEndpoints(cp,cqv,cqw,hh)
-    local ps,pt=closestSegmentTriangle(s0,s1,a,b,c)
-    local d=pt-ps
-    local d2=vector.dot(d,d)
-    local detect=r+(margin or 0)
-    if d2>detect*detect then return false end
-    local dist=math.sqrt(math.max(d2,EPS))
-    local n
-    if d2>EPS then n=d/dist else
-        local tn=safeUnit(vector.cross(b-a,c-a),YAXIS)
-        local center=(a+b+c)/3
-        n=if vector.dot(center-cp,tn)>=0 then tn else -tn
-    end
-    return true,n,pt,r-dist
-end
-
-local function triBoxAxis(axis,a,b,c,h,bestPen,bestAxis,margin)
-    local l2=vector.dot(axis,axis)
-    if l2<=1e-10 then return true,bestPen,bestAxis end
-    local n=if math.abs(l2-1)<1e-5 then axis else axis/math.sqrt(l2)
-    local pa,pb,pc=vector.dot(a,n),vector.dot(b,n),vector.dot(c,n)
-    local tmin,tmax=math.min(pa,pb,pc),math.max(pa,pb,pc)
-    local r=h.X*math.abs(n.X)+h.Y*math.abs(n.Y)+h.Z*math.abs(n.Z)
-    local overlap=math.min(r,tmax)-math.max(-r,tmin)
-    if overlap<=-(margin or 0) then return false,bestPen,bestAxis end
-    if overlap<bestPen then
-        bestPen=overlap
-        local center=(tmin+tmax)*0.5
-        bestAxis=if center>=0 then n else -n
-    end
-    return true,bestPen,bestAxis
-end
-
-local function boxTriangle(bp,bqv,bqw,h,wa,wb,wc,margin)
-    local a=qInvRotate(bqv,bqw,wa-bp)
-    local b=qInvRotate(bqv,bqw,wb-bp)
-    local c=qInvRotate(bqv,bqw,wc-bp)
-    local e0,e1,e2=b-a,c-b,a-c
-    local bestPen,bestAxis=math.huge,nil
-    local ok
-    ok,bestPen,bestAxis=triBoxAxis(XAXIS,a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(YAXIS,a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(ZAXIS,a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e0,e1),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e0,XAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e0,YAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e0,ZAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e1,XAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e1,YAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e1,ZAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e2,XAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e2,YAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    ok,bestPen,bestAxis=triBoxAxis(vector.cross(e2,ZAXIS),a,b,c,h,bestPen,bestAxis,margin);if not ok then return false end
-    local localPoint=closestPointTriangle(ZERO,a,b,c)
-    -- A triangle has zero thickness, so the minimum SAT interval overlap can be nearly zero
-    -- even while a box has crossed the triangle plane. SAT decides overlap; the triangle
-    -- plane supplies the physically useful surface normal and support penetration depth.
-    local triN=safeUnit(vector.cross(b-a,c-a),bestAxis or YAXIS)
-    local planeD=(vector.dot(a,triN)+vector.dot(b,triN)+vector.dot(c,triN))/3
-    if planeD<0 then triN=-triN;planeD=-planeD end
-    local radius=h.X*math.abs(triN.X)+h.Y*math.abs(triN.Y)+h.Z*math.abs(triN.Z)
-    local planePen=radius-planeD
-    return true,qRotate(bqv,bqw,triN),bp+qRotate(bqv,bqw,localPoint),planePen
-end
 
 --- The three corners of a mesh's triangle, in the mesh's own space.
 local function meshTriangle({indices, vertices}, triangle: number): (vector, vector, vector)
@@ -1073,178 +580,7 @@ local function heightVertex({heights, width, origin, cellSizeX, cellSizeZ}, colu
   return vector.create(origin.X + column * cellSizeX, origin.Y + height, origin.Z + row * cellSizeZ)
 end
 
-local function transformedBoundsLocal(qv,qw,p,mn,mx)
-    local lmn=vector.create(math.huge,math.huge,math.huge)
-    local lmx=vector.create(-math.huge,-math.huge,-math.huge)
-    for xi=0,1 do for yi=0,1 do for zi=0,1 do
-        local v=vector.create(if xi==0 then mn.X else mx.X,if yi==0 then mn.Y else mx.Y,if zi==0 then mn.Z else mx.Z)
-        local l=qInvRotate(qv,qw,v-p)
-        lmn=vector.create(math.min(lmn.X,l.X),math.min(lmn.Y,l.Y),math.min(lmn.Z,l.Z))
-        lmx=vector.create(math.max(lmx.X,l.X),math.max(lmx.Y,l.Y),math.max(lmx.Z,l.Z))
-    end end end
-    return lmn,lmx
-end
 
-
-local function collidePrimitives(sa,ap,aqv,aqw,sb,bp,bqv,bqw,margin)
-    local ok,n,p,pen
-    if sa.kind==SHAPE_SPHERE and sb.kind==SHAPE_SPHERE then
-        return sphereSphere(ap,sa.radius,bp,sb.radius,margin)
-    elseif sa.kind==SHAPE_SPHERE and sb.kind==SHAPE_BOX then
-        return sphereBox(ap,sa.radius,bp,bqv,bqw,sb.halfExtents,margin)
-    elseif sa.kind==SHAPE_BOX and sb.kind==SHAPE_SPHERE then
-        ok,n,p,pen=sphereBox(bp,sb.radius,ap,aqv,aqw,sa.halfExtents,margin);if ok then n=-n end;return ok,n,p,pen
-    elseif sa.kind==SHAPE_BOX and sb.kind==SHAPE_BOX then
-        local a0,a1,a2=qAxes(aqv,aqw);local b0,b1,b2=qAxes(bqv,bqw)
-        ok,n,p,pen=boxBox(ap,a0,a1,a2,sa.halfExtents,bp,b0,b1,b2,sb.halfExtents,margin);return ok,n,p,pen
-    elseif sa.kind==SHAPE_CAPSULE and sb.kind==SHAPE_SPHERE then
-        return capsuleSphere(ap,aqv,aqw,sa.radius,sa.halfHeight,bp,sb.radius,margin)
-    elseif sa.kind==SHAPE_SPHERE and sb.kind==SHAPE_CAPSULE then
-        ok,n,p,pen=capsuleSphere(bp,bqv,bqw,sb.radius,sb.halfHeight,ap,sa.radius,margin);if ok then n=-n end;return ok,n,p,pen
-    elseif sa.kind==SHAPE_CAPSULE and sb.kind==SHAPE_CAPSULE then
-        return capsuleCapsule(ap,aqv,aqw,sa.radius,sa.halfHeight,bp,bqv,bqw,sb.radius,sb.halfHeight,margin)
-    elseif sa.kind==SHAPE_CAPSULE and sb.kind==SHAPE_BOX then
-        return capsuleBox(ap,aqv,aqw,sa.radius,sa.halfHeight,bp,bqv,bqw,sb.halfExtents,margin)
-    elseif sa.kind==SHAPE_BOX and sb.kind==SHAPE_CAPSULE then
-        ok,n,p,pen=capsuleBox(bp,bqv,bqw,sb.radius,sb.halfHeight,ap,aqv,aqw,sa.halfExtents,margin);if ok then n=-n end;return ok,n,p,pen
-    end
-    return false
-end
-
-local function primitiveTriangleContact(shape,p,qv,qw,a,b,c,margin)
-    if shape.kind==SHAPE_SPHERE then return sphereTriangle(p,shape.radius,a,b,c,margin) end
-    if shape.kind==SHAPE_CAPSULE then return capsuleTriangle(p,qv,qw,shape.radius,shape.halfHeight,a,b,c,margin) end
-    if shape.kind==SHAPE_BOX then return boxTriangle(p,qv,qw,shape.halfExtents,a,b,c,margin) end
-    return false
-end
-
-local function rayTriangleT(origin,dir,maxDist,a,b,c)
-    local e1,e2=b-a,c-a
-    local p=vector.cross(dir,e2)
-    local det=vector.dot(e1,p)
-    if math.abs(det)<1e-9 then return nil end
-    local inv=1/det
-    local tvec=origin-a
-    local u=vector.dot(tvec,p)*inv
-    if u<0 or u>1 then return nil end
-    local q=vector.cross(tvec,e1)
-    local v=vector.dot(dir,q)*inv
-    if v<0 or u+v>1 then return nil end
-    local t=vector.dot(e2,q)*inv
-    if t<0 or t>maxDist then return nil end
-    return t
-end
-
-local function triangleRayNormal(a,b,c,dir)
-    local n=safeUnit(vector.cross(b-a,c-a),YAXIS)
-    if vector.dot(n,dir)>0 then n=-n end
-    return n
-end
-
-local function rayTriangle(origin,dir,maxDist,a,b,c)
-    local t=rayTriangleT(origin,dir,maxDist,a,b,c)
-    if not t then return nil end
-    return t,triangleRayNormal(a,b,c,dir),origin+dir*t
-end
-
-
-local function sphereTriangleGap(startPos,motion,t,r2,a,b,c)
-    local p=startPos+motion*t
-    local q=closestPointTriangle(p,a,b,c)
-    local d=p-q
-    return vector.dot(d,d)-r2,p,q
-end
-
-local function sweepSphereTriangle(startPos,endPos,radius,a,b,c)
-    local q0=closestPointTriangle(startPos,a,b,c)
-    local d0=startPos-q0
-    local r2=radius*radius
-    if vector.dot(d0,d0)<=r2 then return nil end
-    local motion=endPos-startPos
-    local lo,hi=0,1
-    for _=1,10 do
-        local aT=(2*lo+hi)/3
-        local bT=(lo+2*hi)/3
-        local ga=sphereTriangleGap(startPos,motion,aT,r2,a,b,c)
-        local gb=sphereTriangleGap(startPos,motion,bT,r2,a,b,c)
-        if ga<gb then hi=bT else lo=aT end
-    end
-    local tMin=(lo+hi)*0.5
-    if sphereTriangleGap(startPos,motion,tMin,r2,a,b,c)>0 then return nil end
-    lo,hi=0,tMin
-    for _=1,14 do
-        local mid=(lo+hi)*0.5
-        if sphereTriangleGap(startPos,motion,mid,r2,a,b,c)<=0 then hi=mid else lo=mid end
-    end
-    local t=hi
-    local _,p,q=sphereTriangleGap(startPos,motion,t,r2,a,b,c)
-    return t,safeUnit(p-q,safeUnit(vector.cross(b-a,c-a),YAXIS))
-end
-
-local function sphereSegmentGap(startPos,motion,t,r2,a,b)
-    local p=startPos+motion*t
-    local q=closestPointSegment(p,a,b)
-    local d=p-q
-    return vector.dot(d,d)-r2,p,q
-end
-
-local function sweepSphereSegment(startPos,endPos,radius,a,b)
-    local q0=closestPointSegment(startPos,a,b)
-    local d0=startPos-q0
-    local r2=radius*radius
-    if vector.dot(d0,d0)<=r2 then return nil end
-    local motion=endPos-startPos
-    local lo,hi=0,1
-    for _=1,9 do
-        local aT=(2*lo+hi)/3
-        local bT=(lo+2*hi)/3
-        if sphereSegmentGap(startPos,motion,aT,r2,a,b)<sphereSegmentGap(startPos,motion,bT,r2,a,b) then hi=bT else lo=aT end
-    end
-    local tMin=(lo+hi)*0.5
-    if sphereSegmentGap(startPos,motion,tMin,r2,a,b)>0 then return nil end
-    lo,hi=0,tMin
-    for _=1,13 do local mid=(lo+hi)*0.5;if sphereSegmentGap(startPos,motion,mid,r2,a,b)<=0 then hi=mid else lo=mid end end
-    local t=hi
-    local _,p,q=sphereSegmentGap(startPos,motion,t,r2,a,b)
-    return t,safeUnit(p-q,YAXIS)
-end
-
-local function sweepSphereSphere(a,b,radius,center,targetRadius)
-    local d=b-a
-    local m=a-center
-    local rr=radius+targetRadius
-    local c=vector.dot(m,m)-rr*rr
-    if c<=0 then return nil end -- already overlapping: leave this to the discrete solver.
-    local aa=vector.dot(d,d)
-    if aa<=EPS then return nil end
-    local bb=vector.dot(m,d)
-    if bb>=0 then return nil end
-    local disc=bb*bb-aa*c
-    if disc<0 then return nil end
-    local t=(-bb-math.sqrt(disc))/aa
-    if t<0 or t>1 then return nil end
-    local hit=a+d*t
-    return t,safeUnit(hit-center,YAXIS)
-end
-
-local function sweepSphereBox(a,b,radius,bp,bqv,bqw,bh)
-    local la=qInvRotate(bqv,bqw,a-bp)
-    local lb=qInvRotate(bqv,bqw,b-bp)
-    local h=vector.create(bh.X+radius,bh.Y+radius,bh.Z+radius)
-    local inside=math.abs(la.X)<=h.X and math.abs(la.Y)<=h.Y and math.abs(la.Z)<=h.Z
-    if inside then return nil end
-    local hit,t0=segmentAabbInterval(la,lb,h)
-    if not hit or t0<0 or t0>1 then return nil end
-    local p=la+(lb-la)*t0
-    local dx=math.abs(math.abs(p.X)-h.X)
-    local dy=math.abs(math.abs(p.Y)-h.Y)
-    local dz=math.abs(math.abs(p.Z)-h.Z)
-    local nLocal
-    if dx<=dy and dx<=dz then nLocal=vector.create(signnz(p.X),0,0)
-    elseif dy<=dz then nLocal=vector.create(0,signnz(p.Y),0)
-    else nLocal=vector.create(0,0,signnz(p.Z)) end
-    return t0,qRotate(bqv,bqw,nLocal)
-end
 
 function World:_check(handle)
     assert(type(handle) == "number", "physik: body handle must be a number")
@@ -3548,65 +2884,6 @@ function World:step(dt,substeps)
     return self.contactCount
 end
 
-local function raySphere(origin,dir,maxDist,center,radius)
-    local m=origin-center
-    local b=vector.dot(m,dir)
-    local c=vector.dot(m,m)-radius*radius
-    if c>0 and b>0 then return nil end
-    local discr=b*b-c
-    if discr<0 then return nil end
-    local t=-b-math.sqrt(discr)
-    if t<0 then t=0 end
-    if t>maxDist then return nil end
-    local p=origin+dir*t
-    return t,safeUnit(p-center,-dir),p
-end
-
-local function rayCenteredSlab(o,d,h,tmin,tmax,axis,hitAxis,hitSign)
-    if math.abs(d)<EPS then return math.abs(o)<=h,tmin,tmax,hitAxis,hitSign end
-    local inv=1/d
-    local t1=(-h-o)*inv
-    local t2=(h-o)*inv
-    local sign=-1
-    if t1>t2 then t1,t2=t2,t1;sign=1 end
-    if t1>tmin then tmin=t1;hitAxis=axis;hitSign=sign end
-    if t2<tmax then tmax=t2 end
-    return tmin<=tmax,tmin,tmax,hitAxis,hitSign
-end
-
-local function rayBox(origin,dir,maxDist,center,qv,qw,half)
-    local o=qInvRotate(qv,qw,origin-center)
-    local d=qInvRotate(qv,qw,dir)
-    local tmin,tmax=0,maxDist
-    local hitAxis,hitSign=1,1
-    local ok
-    ok,tmin,tmax,hitAxis,hitSign=rayCenteredSlab(o.X,d.X,half.X,tmin,tmax,1,hitAxis,hitSign);if not ok then return nil end
-    ok,tmin,tmax,hitAxis,hitSign=rayCenteredSlab(o.Y,d.Y,half.Y,tmin,tmax,2,hitAxis,hitSign);if not ok then return nil end
-    ok,tmin,tmax,hitAxis,hitSign=rayCenteredSlab(o.Z,d.Z,half.Z,tmin,tmax,3,hitAxis,hitSign);if not ok then return nil end
-    if tmin<0 or tmin>maxDist then return nil end
-    local nl=if hitAxis==1 then vector.create(hitSign,0,0) elseif hitAxis==2 then vector.create(0,hitSign,0) else vector.create(0,0,hitSign)
-    return tmin,qRotate(qv,qw,nl),origin+dir*tmin
-end
-
-local function rayRangeSlab(o,d,lo,hi,tmin,tmax)
-    if math.abs(d)<EPS then return o>=lo and o<=hi,tmin,tmax end
-    local inv=1/d
-    local a,b=(lo-o)*inv,(hi-o)*inv
-    if a>b then a,b=b,a end
-    if a>tmin then tmin=a end
-    if b<tmax then tmax=b end
-    return tmin<=tmax,tmin,tmax
-end
-
-local function rayAabbInterval(origin,dir,maxDist,mn,mx)
-    local tmin,tmax=0,maxDist
-    local ok
-    ok,tmin,tmax=rayRangeSlab(origin.X,dir.X,mn.X,mx.X,tmin,tmax);if not ok then return nil end
-    ok,tmin,tmax=rayRangeSlab(origin.Y,dir.Y,mn.Y,mx.Y,tmin,tmax);if not ok then return nil end
-    ok,tmin,tmax=rayRangeSlab(origin.Z,dir.Z,mn.Z,mx.Z,tmin,tmax);if not ok then return nil end
-    return tmin,tmax
-end
-
 function World:_rayMeshTriangleT(shape,t,origin,dir,bestT,epoch)
     if self.meshMarks[t]==epoch then return nil end
     self.meshMarks[t]=epoch
@@ -3690,20 +2967,6 @@ function World:_rayHeightfield(i,origin,dir,maxDist)
     return bestT,qRotate(self.qv[i],self.qw[i],bestN),origin+dir*bestT
 end
 
-
-local function rayPrimitiveShape(shape,p,qv,qw,origin,dir,maxDist)
-    if shape.kind==SHAPE_SPHERE then return raySphere(origin,dir,maxDist,p,shape.radius) end
-    if shape.kind==SHAPE_BOX then return rayBox(origin,dir,maxDist,p,qv,qw,shape.halfExtents) end
-    local a,b=capsuleEndpoints(p,qv,qw,shape.halfHeight)
-    local m=(a+b)*0.5
-    local ta,na,pa=raySphere(origin,dir,maxDist,a,shape.radius)
-    local tm,nm,pm=raySphere(origin,dir,maxDist,m,shape.radius)
-    local tb,nb,pb=raySphere(origin,dir,maxDist,b,shape.radius)
-    local t,n,pt=ta,na,pa
-    if tm and (not t or tm<t) then t,n,pt=tm,nm,pm end
-    if tb and (not t or tb<t) then t,n,pt=tb,nb,pb end
-    return t,n,pt
-end
 
 function World:_rayCompound(i,origin,dir,maxDist)
     local shape=self.shape[i]
@@ -4028,8 +3291,6 @@ function World:sphereCastBatchSoA(starts,ends,radii,masks,ignoreHandles,out)
     return out,count
 end
 
--- How near a swept capsule comes to what it meets before it is said to touch it.
-local SweepSkin = 1e-3
 
 --- Gathers the triangles of a mesh or a heightfield that a ball round `centre` could touch, in
 --- world space, three corners each. Returns how many triangles.
@@ -4114,58 +3375,6 @@ local function gatherTriangles(self, geom: number, centre: vector, reach: number
   return count // 3
 end
 
---- Sweeps an upright capsule along `motion` at a primitive, or at a triangle when `target` is
---- nil, no further than the fraction `limit`. Returns the fraction at which they touch, the
---- normal there, which points at the capsule, and the point on what was met; or nil.
----
---- Both are convex, so the capsule can close on the other no faster than it moves along the line
---- between their nearest points: it is advanced by the gap over that speed until there is no gap,
---- and is past it for good once it is not closing. A capsule that starts inside is met at once,
---- unless it is on its way out.
-local function sweepCapsule(
-  capsule,
-  start: vector,
-  motion: vector,
-  length: number,
-  limit: number,
-  target,
-  at: vector?,
-  turn: vector?,
-  turnW: number?,
-  first: vector?,
-  second: vector?,
-  third: vector?
-): (number?, vector?, vector?)
-  local fraction = 0
-  local normal, point
-
-  for _ = 1, 32 do
-    local centre = start + motion * fraction
-    local reach = length * (limit - fraction) + SweepSkin
-    local met, depth
-
-    if target then
-      met, normal, point, depth = collidePrimitives(capsule, centre, ZERO, 1, target, at, turn, turnW, reach)
-    else
-      met, normal, point, depth = capsuleTriangle(centre, ZERO, 1, capsule.radius, capsule.halfHeight, first, second, third, reach)
-    end
-
-    if not met then return nil end
-
-    -- Motion along a surface is not into it, to within what the arithmetic can tell.
-    local closing = vector.dot(motion, normal)
-    if closing <= length * 1e-4 then return nil end
-    if -depth <= SweepSkin then return fraction, ZERO - normal, point end
-
-    fraction += (-depth - SweepSkin * 0.5) / closing
-    if fraction >= limit then return nil end
-  end
-
-  -- Thirty-two advances and still closing on it: it is no nearer than this, which is safe to
-  -- take as where they meet.
-  return fraction, ZERO - normal, point
-end
-
 function World:_capsuleCastRaw(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
   assert(
     typeof(startPos) == 'vector'
@@ -4228,7 +3437,7 @@ function World:_capsuleCastAmong(handles, count, startPos, motion, length, radiu
       for corner = 1, gathered * 3, 3 do
         local limit = fraction or bestFraction
         local nearer, facing, touched = sweepCapsule(
-          capsule, startPos, motion, length, limit, nil, nil, nil, nil, triangles[corner], triangles[corner + 1], triangles[corner + 2]
+          radius, halfHeight, startPos, motion, length, limit, nil, ZERO, ZERO, 1, triangles[corner], triangles[corner + 1], triangles[corner + 2]
         )
 
         if nearer then
@@ -4241,7 +3450,8 @@ function World:_capsuleCastAmong(handles, count, startPos, motion, length, radiu
       for piece = 1, target.count do
         local pieceTurn, pieceTurnW = qMul(turn, turnW, target.qv[piece], target.qw[piece])
         local nearer, facing, touched = sweepCapsule(
-          capsule,
+          radius,
+          halfHeight,
           startPos,
           motion,
           length,
@@ -4249,7 +3459,10 @@ function World:_capsuleCastAmong(handles, count, startPos, motion, length, radiu
           target.shapes[piece],
           at + qRotate(turn, turnW, target.positions[piece]),
           pieceTurn,
-          pieceTurnW
+          pieceTurnW,
+          ZERO,
+          ZERO,
+          ZERO
         )
 
         if nearer then
@@ -4257,7 +3470,7 @@ function World:_capsuleCastAmong(handles, count, startPos, motion, length, radiu
         end
       end
     else
-      fraction, normal, point = sweepCapsule(capsule, startPos, motion, length, bestFraction, target, pos[body], qv[body], qw[body])
+      fraction, normal, point = sweepCapsule(radius, halfHeight, startPos, motion, length, bestFraction, target, pos[body], qv[body], qw[body], ZERO, ZERO, ZERO)
     end
 
     if fraction and fraction < bestFraction then

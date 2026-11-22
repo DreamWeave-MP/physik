@@ -1,0 +1,14 @@
+--!strict
+-- The shapes physik collides, as types. Only types: nothing here runs, and a module that needs
+-- one of them costs nothing to require it.
+
+export type Sphere = { kind: 'sphere', radius: number }
+
+export type Box = { kind: 'box', halfExtents: vector }
+
+--- Its axis runs along its own Y, `halfHeight` each way from its middle.
+export type Capsule = { kind: 'capsule', radius: number, halfHeight: number }
+
+export type Primitive = Sphere | Box | Capsule
+
+return {}
