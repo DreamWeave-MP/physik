@@ -1326,6 +1326,7 @@ function World:addBody(desc)
     self:_updateAabb(i)
     self.gridValid=false
     self.gridTopologyDirty=true
+    if kind==BODY_STATIC then self.stillDirty=true end
     if self.ccd[i] then self.ccdCount+=1 end
     return makeHandle(i,self.generation[i])
 end
@@ -1338,6 +1339,7 @@ function World:removeBody(handle)
     end
     self.alive[i] = false
     self.aliveCount -= 1
+    if self.bodyType[i]==BODY_STATIC then self.stillDirty=true end
     if self.ccd[i] then self.ccdCount-=1 end
     self.free[#self.free+1] = i
     self.userData[i] = nil
@@ -1373,6 +1375,7 @@ function World:setPosition(handle, p, wake)
     local i = self:_check(handle)
     self.pos[i] = p
     self.gridValid=false
+    if self.bodyType[i]==BODY_STATIC then self.stillDirty=true end
     if wake ~= false then self:wake(handle) end
 end
 
@@ -1381,6 +1384,7 @@ function World:setRotation(handle,q,wake)
     self.qv[i],self.qw[i]=qNormalize(q.v,q.w)
     self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.qv[i],self.qw[i])
     self.gridValid=false
+    if self.bodyType[i]==BODY_STATIC then self.stillDirty=true end
     if wake~=false then self:wake(handle) end
 end
 
@@ -1422,6 +1426,7 @@ function World:shiftOrigin(delta)
   end
 
   self.gridValid = false
+  self.stillDirty = true
 
   return self
 end
@@ -2029,10 +2034,77 @@ function World:_rebuildGridPairs()
   self.gridPairCount = pairCount
 end
 
+--- Makes a tree of the boxes round `members`, which are bodies, and returns its root: a node,
+--- or the one body there is, negated. A node halves its bodies along the axis their centres are
+--- spread furthest on.
+local function buildStill(self, members: { number }): number
+  if #members == 1 then return -members[1] end
+
+  local {aabbMin, aabbMax} = self
+  local low, high = aabbMin[members[1]], aabbMax[members[1]]
+  local least, most = low + high, low + high
+
+  for _, body in members do
+    local bodyLow, bodyHigh = aabbMin[body], aabbMax[body]
+    local centre = bodyLow + bodyHigh
+
+    low, high = vector.min(low, bodyLow), vector.max(high, bodyHigh)
+    least, most = vector.min(least, centre), vector.max(most, centre)
+  end
+
+  local spread = most - least
+  local axis = if spread.X >= spread.Y and spread.X >= spread.Z then 'X' elseif spread.Y >= spread.Z then 'Y' else 'Z'
+
+  -- Bodies whose centres are level, or are not numbers, stay in the order of their slots.
+  table.sort(members, function(first: number, second: number)
+    local firstCentre, secondCentre = aabbMin[first][axis] + aabbMax[first][axis], aabbMin[second][axis] + aabbMax[second][axis]
+    if firstCentre < secondCentre then return true end
+    if secondCentre < firstCentre then return false end
+
+    return first < second
+  end)
+
+  local node = self.stillNodeCount + 1
+  local half = #members // 2
+
+  self.stillNodeCount = node
+  self.stillLow[node], self.stillHigh[node] = low, high
+  self.stillLeft[node] = buildStill(self, table.move(members, 1, half, 1, {}))
+  self.stillRight[node] = buildStill(self, table.move(members, half + 1, #members, 1, {}))
+
+  return node
+end
+
+--- Builds the tree of the oversized bodies that are static. A level is mostly these, and they
+--- neither move nor touch each other, so they are kept out of every step's sweep and found by
+--- what does move.
+function World:_rebuildStill()
+  local {gridLarge: large, bodyType, stillLarge} = self
+  local members = {}
+
+  table.clear(stillLarge)
+
+  for _, body in large do
+    if bodyType[body] ~= BODY_STATIC then continue end
+
+    self:_updateAabb(body)
+    stillLarge[body] = true
+    table.insert(members, body)
+  end
+
+  self.stillNodeCount = 0
+  self.stillRoot = if #members == 0 then 0 else buildStill(self, members)
+  self.stillDirty = false
+end
+
 function World:_buildGridIndex(refreshAabbs)
   local {gridHeads: heads, gridKeys: keys, gridNext: nextIn, gridLarge: large, gridOccupied: occupied} = self
   local {alive, sphereRadius: radii, pos, aabbMin, aabbMax, gridKey, gridX, gridY, gridZ} = self
+  local {bodyType, gridLargeMoving: moving} = self
   local cellSize, margin = self.broadphaseCellSize, self.contactMargin
+
+  -- A static body is where it was, and as big, unless something has said otherwise.
+  local stillMoved = self.stillDirty
 
   -- Most coherent worlds keep bodies in the same broad-phase cells for many frames. Validate
   -- membership first; when topology is unchanged, retain bucket chains and occupied-neighbor
@@ -2041,7 +2113,7 @@ function World:_buildGridIndex(refreshAabbs)
     local same = true
 
     for body = 1, self.high do
-      if not alive[body] then continue end
+      if not alive[body] or not (stillMoved or bodyType[body] ~= BODY_STATIC) then continue end
 
       local radius = radii[body]
       local width, height, depth
@@ -2079,6 +2151,8 @@ function World:_buildGridIndex(refreshAabbs)
     end
 
     if same then
+      if stillMoved then self:_rebuildStill() end
+
       self.gridValid = true
       return false
     end
@@ -2086,7 +2160,7 @@ function World:_buildGridIndex(refreshAabbs)
 
   if refreshAabbs and (not self.gridTopologyReady or self.gridTopologyDirty) then
     for body = 1, self.high do
-      if alive[body] and not radii[body] then self:_updateAabb(body) end
+      if alive[body] and not radii[body] and (stillMoved or bodyType[body] ~= BODY_STATIC) then self:_updateAabb(body) end
     end
   end
 
@@ -2094,6 +2168,7 @@ function World:_buildGridIndex(refreshAabbs)
   table.clear(heads)
   table.clear(keys)
   table.clear(large)
+  table.clear(moving)
   buffer.fill(occupied, 0, 0)
 
   local {gridKeyX: columns, gridKeyY: rows, gridKeyZ: layers} = self
@@ -2123,6 +2198,8 @@ function World:_buildGridIndex(refreshAabbs)
     if not key then
       gridKey[body] = nil
       table.insert(large, body)
+      if bodyType[body] ~= BODY_STATIC then table.insert(moving, body) end
+
       continue
     end
 
@@ -2149,6 +2226,8 @@ function World:_buildGridIndex(refreshAabbs)
   self.gridTopologyReady = true
   self.gridTopologyDirty = false
   self:_rebuildGridPairs()
+  if stillMoved then self:_rebuildStill() end
+
   self.gridValid = true
 
   return true
@@ -2201,7 +2280,70 @@ function World:_collideGrid()
   -- Bodies wider than one grid cell stay out of the hash grid. Pair anything involving
   -- them with a coherent X sweep instead of the old O(L^2) fallback. Small-small pairs
   -- are skipped here because the grid already emitted them.
-  local {gridLarge: large, alive, gridKey} = self
+  local {gridLargeMoving: large, alive, gridKey, bodyType, stillLarge} = self
+  local root = self.stillRoot
+
+  -- The oversized bodies that are static are in a tree, and everything that is not static looks
+  -- itself up in it.
+  if root ~= 0 then
+    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = self
+    local {sphereRadius: radii, pos, aabbMin, aabbMax} = self
+    local margin = self.contactMargin
+
+    for body = 1, self.high do
+      if not alive[body] or bodyType[body] == BODY_STATIC then continue end
+
+      -- One body is no tree, and the pair is tested on its own bounds.
+      if root < 0 then
+        tryPair(self, -root, body)
+        continue
+      end
+
+      local low, high
+      local radius = radii[body]
+
+      if radius then
+        local reach = radius + margin
+        local centre = pos[body]
+        low, high = centre - vector.create(reach, reach, reach), centre + vector.create(reach, reach, reach)
+      else
+        low, high = aabbMin[body], aabbMax[body]
+      end
+
+      local entry, top = root, 0
+
+      while true do
+        if entry < 0 then
+          tryPair(self, -entry, body)
+        else
+          local nodeLow, nodeHigh = lows[entry], highs[entry]
+
+          if
+            not (
+              low.X > nodeHigh.X
+              or high.X < nodeLow.X
+              or low.Y > nodeHigh.Y
+              or high.Y < nodeLow.Y
+              or low.Z > nodeHigh.Z
+              or high.Z < nodeLow.Z
+            )
+          then
+            top += 1
+            stack[top] = rights[entry]
+            entry = lefts[entry]
+            continue
+          end
+        end
+
+        if top == 0 then break end
+
+        entry = stack[top]
+        top -= 1
+      end
+    end
+  end
+
+  -- What is left is the oversized bodies that can move, against each other and what is in the grid.
   local largeCount = #large
   if largeCount == 0 then return end
 
@@ -2210,7 +2352,9 @@ function World:_collideGrid()
       local first = large[index]
 
       for second = 1, self.high do
-        if alive[second] and second ~= first and (gridKey[second] or second > first) then tryPair(self, first, second) end
+        if alive[second] and second ~= first and not stillLarge[second] and (gridKey[second] or second > first) then
+          tryPair(self, first, second)
+        end
       end
     end
 
@@ -2231,14 +2375,14 @@ function World:_collideGrid()
 
   for position = 1, count do
     local first = order[position]
-    if not alive[first] then continue end
+    if not alive[first] or stillLarge[first] then continue end
 
     local reach = aabbMax[first].X
     local firstLarge = not gridKey[first]
 
     for after = position + 1, count do
       local second = order[after]
-      if not alive[second] then continue end
+      if not alive[second] or stillLarge[second] then continue end
       if aabbMin[second].X > reach then break end
       if firstLarge or not gridKey[second] then tryPair(self, first, second) end
     end
@@ -3371,11 +3515,40 @@ function World:_raycastRaw(origin, direction, maxDistance, mask)
   local bestDistance = maxDistance
   local bestBody, bestNormal, bestPoint
 
-  for _, body in self.gridLarge do
+  for _, body in self.gridLargeMoving do
     local distance, normal, point = raycastBody(self, body, origin, dir, bestDistance, mask)
 
     if distance and distance < bestDistance then
       bestDistance, bestBody, bestNormal, bestPoint = distance, body, normal, point
+    end
+  end
+
+  -- The static ones, through their tree. Of two struck at one distance the lower slot is the
+  -- hit, as it was when they were tested in the order of their slots.
+  local entry = self.stillRoot
+
+  if entry ~= 0 then
+    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = self
+    local top = 0
+
+    while true do
+      if entry < 0 then
+        local distance, normal, point = raycastBody(self, -entry, origin, dir, bestDistance, mask)
+
+        if distance and (distance < bestDistance or (distance == bestDistance and bestBody and -entry < bestBody)) then
+          bestDistance, bestBody, bestNormal, bestPoint = distance, -entry, normal, point
+        end
+      elseif rayAabbInterval(origin, dir, bestDistance, lows[entry], highs[entry]) then
+        top += 1
+        stack[top] = rights[entry]
+        entry = lefts[entry]
+        continue
+      end
+
+      if top == 0 then break end
+
+      entry = stack[top]
+      top -= 1
     end
   end
 
@@ -3701,10 +3874,52 @@ local function queryAabbGrid(
   local count = 0
 
   -- Oversized bodies are outside the grid and are normally few.
-  for _, body in self.gridLarge do
+  for _, body in self.gridLargeMoving do
     if alive[body] and bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(self, body, low, high) then
       count += 1
       out[count] = makeHandle(body, generation[body])
+    end
+  end
+
+  -- The static ones, through their tree.
+  local entry = self.stillRoot
+
+  if entry ~= 0 then
+    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = self
+    local top = 0
+
+    while true do
+      if entry < 0 then
+        local body = -entry
+
+        if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(self, body, low, high) then
+          count += 1
+          out[count] = makeHandle(body, generation[body])
+        end
+      else
+        local nodeLow, nodeHigh = lows[entry], highs[entry]
+
+        if
+          not (
+            low.X > nodeHigh.X
+            or high.X < nodeLow.X
+            or low.Y > nodeHigh.Y
+            or high.Y < nodeLow.Y
+            or low.Z > nodeHigh.Z
+            or high.Z < nodeLow.Z
+          )
+        then
+          top += 1
+          stack[top] = rights[entry]
+          entry = lefts[entry]
+          continue
+        end
+      end
+
+      if top == 0 then break end
+
+      entry = stack[top]
+      top -= 1
     end
   end
 
@@ -3877,6 +4092,7 @@ function World:applyTransforms(data,wake)
         if ang and ang[n] then self.angVel[i]=ang[n] end
         self.prevPos[i]=self.pos[i]
         self:_updateAabb(i)
+        if self.bodyType[i]==BODY_STATIC then self.stillDirty=true end
         if wake~=false and self.bodyType[i]==BODY_DYNAMIC then self.sleeping[i]=false;self.sleepTime[i]=0 end
     end
     -- Topology is unchanged, but authoritative teleports invalidate persistent anchors and query cells.
@@ -4023,6 +4239,8 @@ function M.newWorld(opts)
     w.gridOccupied = buffer.create(GridFilterSize)
     w.gridDenseKeys={};w.gridPairA={};w.gridPairB={};w.gridDenseCount=0;w.gridPairCount=0
     w.gridTopologyReady=false;w.gridTopologyDirty=true
+    w.stillDirty=true;w.gridLargeMoving={};w.stillLarge={};w.stillRoot=0
+    w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={}
     w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
     w.frame=0
     w.cacheEpoch=0
