@@ -1,8 +1,53 @@
-# physik 0.3.2 benchmarks
+# physik benchmarks
+
+Measured with `bench/bench.jsl`, which checks what every workload computes, to the bit, before and after it times it. The numbers in `docs/README.md` and `docs/PROFILE.md` are older, from another machine and another Jess, and are not comparable with these.
+
+## 0.4.0: a level
+
+Measured on 2026-11-23, on an Intel(R) Core(TM) i7-10870H CPU @ 2.20GHz (16 threads), with Jess 0.3.0, a verified release build. Base is 0.3.2 (`53ac396`) and head is 0.4.0, each the least of three runs, taken turn about so that the machine's drift, which is some 10% from one minute to the next, falls on both.
+
+0.4.0 is for worlds that are mostly static: a game's level, with a few things moving in it and a heap of things that have stopped. The level workloads are new with it: 1,024 static boxes, a floor of slabs with pillars and crates on them and a room in the middle.
+
+Microseconds per call.
+
+| Workload | 0.3.2 | 0.4.0 | 0.3.2 / 0.4.0 |
+| --- | ---: | ---: | ---: |
+| level: 1,024 static boxes and nothing moving, 60 steps | 214,362.2 | 135.8 | 1,579 |
+| level: 256 rays among 1,024 static boxes | 25,048.3 | 1,256.9 | 19.9 |
+| step: 1,000 spheres asleep on the floor, 1 step | 1,063.4 | 167.7 | 6.34 |
+| step: 250 boxes tumbling in the grid, 30 steps | 150,888.4 | 128,678.3 | 1.17 |
+| step: 250 boxes tumbling wider than a cell, 30 steps | 159,207.7 | 144,364.4 | 1.10 |
+| step: 256 compounds of three pieces, 30 steps | 245,646.9 | 230,786.8 | 1.06 |
+| step: 1,000 spheres piled in the grid, 60 steps | 329,661.5 | 340,055.4 | 0.97 |
+| step: 1,000 spheres piled in the grid with contact events, 60 steps | 346,854.2 | 365,046.2 | 0.95 |
+| step: 5,000 spheres drifting far apart with contact events, drained, 30 steps | 75,791.3 | 80,005.2 | 0.95 |
+| build: add 5,000 bodies of every primitive, then remove every other one | 9,519.9 | 10,009.8 | 0.95 |
+| step: 2,000 spheres swept and pruned from scattered, 1 step | 3,611.0 | 3,882.6 | 0.93 |
+
+Every other step and query workload reads 0.97 to 1.02, which is the floor. Every workload 0.3.2 had still computes what 0.3.2 computed, to the bit.
+
+The level workloads 0.3.2 cannot be held to, as 0.4.0 runs them:
+
+| Workload | 0.4.0 | A unit |
+| --- | ---: | --- |
+| level: 48 boxes thrown among 1,024 static ones and taken out again, 60 steps | 13,296.4 | 222 a step |
+| level: 48 boxes asleep among 1,024 static ones, 60 steps | 355.1 | 5.9 a step |
+| level: 256 capsules swept among 1,024 static boxes | 2,430.2 | 9.5 a sweep |
+| level: a character run 240 steps among 1,024 static boxes | 3,276.2 | 13.7 a move |
+
+**What moved, and why.**
+
+- *A level that costs nothing, 1,579x (`b1262c9`, `153ed04`).* 0.3.2 refreshed the bounds of every body every step and swept every body wider than a cell against every other, which for a level is its walls against its walls: 3.6 ms a step for a thousand boxes with nothing happening. The static bodies are now in a tree that is built when one changes, and a step visits only the bodies that can move.
+- *Rays through a level, 20x (`b1262c9`, `acc6804`).* A ray tested every body wider than a cell, one after another. It walks the tree, nearer half first.
+- *Bodies asleep, 6.3x (`9ab4796`, `3136296`).* Two bodies at rest keep their contacts from the step before, and a step in which nothing has stirred does nothing but notice. What is left is a look at each sleeping body to see that it is still asleep where it was.
+- *Boxes, 1.10x to 1.17x (`1e0ccd6`).* Two boxes' fifteen axes are tested in one loop, where each was a call of fifteen arguments returning four.
+- *A world with a past (`3b6bd58`, `3136296`).* Not a time, but the reason the thrown workload cannot be run on 0.3.2: a body's slot, taken again, was listed once more in the sweep's order for every body that had held it, so its pairs were offered twice, then three times. 0.3.2 computes 16,573 contacts there where a new world has 2,539, and a world that had had twelve boxes thrown into it and taken out forty times stepped seventeen times slower than a new one. A slot is now listed once, and freed slots are given out lowest first, so a world that has had bodies taken out of it steps exactly as a new one does. The workload holds it to that.
+
+**What it cost.** Three to seven hundredths on worlds where nothing rests and nothing is static but a floor: every pair is asked whether both its bodies are at rest, and every body whether it is asleep where it was. A world of awake spheres pays that and gets nothing for it. `stats().candidates` no longer counts a pair at rest that does not touch, which is why 0.3.2 cannot be held to the sleeping workload either: it counts 71 where 0.4.0 counts 62.
+
+## 0.3.2: the move onto l3i 2.0
 
 The move onto l3i 2.0, measured as an A/B with `bench/bench.jsl`. The numbers in `docs/README.md` and `docs/PROFILE.md` are older, from another machine and another Jess, and are not comparable with these.
-
-## On l3i 2.0
 
 Measured on 2026-10-12, at the end of the run started on 2026-10-11, on an Intel(R) Core(TM) i7-10870H CPU @ 2.20GHz (16 threads), with Jess 0.1.0 on l3i 2.0.2, a verified release build, by
 
