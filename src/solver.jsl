@@ -1,0 +1,865 @@
+--!strict
+--!native
+-- The solver: what the bodies do about touching. Each step it moves them, and once what
+-- touches has been found it gathers the bodies into islands, wakes what has been disturbed,
+-- pushes each pair apart along its contacts and holds each joint together, a few times over,
+-- and puts to sleep the islands that have come to rest.
+--
+-- A contact is solved as an impulse along its normal, which only pushes, and two along its
+-- tangents, which rub: no more than the friction allows for how hard the normal one pushes.
+-- What each contact came to is kept for the next step to start from.
+local broadphase = require './broadphase'
+local geometry = require './geometry'
+local worlds = require './world'
+
+local solver = {}
+
+type State = worlds.State
+
+local Zero = vector.zero
+local AxisX, AxisY, AxisZ = vector.create(1, 0, 0), vector.create(0, 1, 0), vector.create(0, 0, 1)
+
+-- Under this a squared length, or a mass, is nothing.
+local Tiny = 1e-8
+
+local HandleStride = worlds.HandleStride
+
+-- What a pair of bodies did this step, as `writeContactEvents` says it.
+local EventEnter, EventStay, EventExit = 1, 2, 3
+
+solver.ContactEvent = table.freeze({ enter = EventEnter, stay = EventStay, exit = EventExit })
+
+-- A pair's entry in the contact cache: these numbers first, then five to a contact, which are
+-- an anchor in each body, the normal, and the impulses along the normal and across it.
+local CacheCount = 1
+local CacheEpoch = 2
+local CacheFirstGeneration = 3
+local CacheSecondGeneration = 4
+local CacheMatchEpoch = 5
+local CacheUsedMask = 6
+local CacheHeader = 6
+local CacheStride = 5
+
+--- The key of a pair whose first slot is the lower, which a contact's always is.
+local function pairKey(first: number, second: number): number
+  return first * HandleStride + second
+end
+
+--- How a body's spin answers a twist: the twist over the body's inertia, which is about its own
+--- axes. A sphere's is the same about every axis, so how it is turned cancels.
+local function spinFrom(state: State, body: number, twist: vector): vector
+  if state.inverseMass[body] == 0 then return Zero end
+
+  local inertia = state.inverseInertia[body]
+  if math.abs(inertia.x - inertia.y) < 1e-12 and math.abs(inertia.x - inertia.z) < 1e-12 then return twist * inertia.x end
+
+  local axis0, axis1, axis2 = state.axis0[body], state.axis1[body], state.axis2[body]
+
+  return axis0 * (vector.dot(twist, axis0) * inertia.x)
+    + axis1 * (vector.dot(twist, axis1) * inertia.y)
+    + axis2 * (vector.dot(twist, axis2) * inertia.z)
+end
+
+--- How fast a point of a body is moving, `arm` from its middle. A sleeping body's is still.
+local function pointVelocity(state: State, body: number, arm: vector): vector
+  if state.sleeping[body] then return Zero end
+
+  return state.velocity[body] + vector.cross(state.spin[body], arm)
+end
+
+--- How readily a point of a body, `arm` from its middle, gives way along an axis: one over the
+--- mass an impulse there would have to move. Nothing for a body that does not move.
+local function giveAlong(state: State, body: number, arm: vector, axis: vector): number
+  if state.inverseMass[body] == 0 or state.sleeping[body] then return 0 end
+
+  return state.inverseMass[body] + vector.dot(axis, vector.cross(spinFrom(state, body, vector.cross(arm, axis)), arm))
+end
+
+--- As `giveAlong`, and also the spin an impulse of one along the axis would give the body,
+--- which the solver keeps so as not to work it out again every time round.
+local function contactAxisResponse(state: State, body: number, arm: vector, axis: vector): (number, vector)
+  if state.inverseMass[body] == 0 or state.sleeping[body] then return 0, Zero end
+
+  local twist = vector.cross(arm, axis)
+  local turning = if vector.dot(twist, twist) > Tiny then spinFrom(state, body, twist) else Zero
+
+  return state.inverseMass[body] + vector.dot(axis, vector.cross(turning, arm)), turning
+end
+
+--- Two directions across a normal, at right angles to it and to each other. They start from
+--- whichever axis the normal is least along, and are kept for the whole solve, so that what an
+--- impulse along each would do can be worked out once.
+local function contactTangents(normal: vector): (vector, vector)
+  local alongX, alongY, alongZ = math.abs(normal.x), math.abs(normal.y), math.abs(normal.z)
+  local least = if alongX <= alongY and alongX <= alongZ then AxisX elseif alongY <= alongZ then AxisY else AxisZ
+  local across = vector.cross(normal, least)
+  local squared = vector.dot(across, across)
+  local first = if squared <= Tiny then AxisX else across / math.sqrt(squared)
+
+  return first, vector.cross(normal, first)
+end
+
+--- Gives two bodies an impulse, equal and opposite, at a point `firstArm` from the first's middle
+--- and `secondArm` from the second's.
+local function applyPairImpulse(state: State, first: number, second: number, firstArm: vector, secondArm: vector, impulse: vector)
+  local {inverseMass, sleeping, velocity, spin} = state
+
+  if inverseMass[first] > 0 and not sleeping[first] then
+    local twist = vector.cross(firstArm, impulse)
+
+    velocity[first] -= impulse * inverseMass[first]
+    if vector.dot(twist, twist) > Tiny then spin[first] -= spinFrom(state, first, twist) end
+  end
+
+  if inverseMass[second] > 0 and not sleeping[second] then
+    local twist = vector.cross(secondArm, impulse)
+
+    velocity[second] += impulse * inverseMass[second]
+    if vector.dot(twist, twist) > Tiny then spin[second] += spinFrom(state, second, twist) end
+  end
+end
+
+--- Pulls two points together along one axis: as a spring would, by an impulse that takes off
+--- the speed they part at and a share of how far apart they are.
+local function solvePointAxis(
+  state: State,
+  first: number,
+  second: number,
+  firstArm: vector,
+  secondArm: vector,
+  apart: vector,
+  axis: vector,
+  stiffness: number,
+  damping: number,
+  duration: number
+)
+  local give = giveAlong(state, first, firstArm, axis) + giveAlong(state, second, secondArm, axis)
+  if give <= Tiny then return end
+
+  local parting = vector.dot(pointVelocity(state, second, secondArm) - pointVelocity(state, first, firstArm), axis)
+  local bias = vector.dot(apart, axis) * stiffness / math.max(duration, 1e-5)
+
+  applyPairImpulse(state, first, second, firstArm, secondArm, axis * (-(parting + bias + damping * parting) / give))
+end
+
+--- How readily a body turns about an axis.
+local function turnAbout(state: State, body: number, axis: vector): number
+  if state.inverseMass[body] == 0 or state.sleeping[body] then return 0 end
+
+  return vector.dot(axis, spinFrom(state, body, axis))
+end
+
+--- Gives two bodies a twist, equal and opposite.
+local function applyPairTwist(state: State, first: number, second: number, twist: vector)
+  local {inverseMass, sleeping, spin} = state
+
+  if inverseMass[first] > 0 and not sleeping[first] then spin[first] -= spinFrom(state, first, twist) end
+  if inverseMass[second] > 0 and not sleeping[second] then spin[second] += spinFrom(state, second, twist) end
+end
+
+--- Brings two bodies' spins about one axis together, and the two hinge axes into line about it.
+local function alignAbout(state: State, first: number, second: number, axis: vector, askew: vector, stiffness: number)
+  local give = turnAbout(state, first, axis) + turnAbout(state, second, axis)
+  if give <= Tiny then return end
+
+  local turning = state.spin[second] - state.spin[first]
+
+  applyPairTwist(state, first, second, axis * (-(vector.dot(turning, axis) + vector.dot(askew, axis) * stiffness) / give))
+end
+
+--- Holds every joint together, once. A joint whose body has gone is dropped.
+local function solveJoints(state: State, duration: number)
+  local {joints, alive, generation, inverseMass, sleeping, position, turn, turnW, spin} = state
+
+  for id = 1, state.nextJoint - 1 do
+    local joint = joints[id]
+    if not joint then continue end
+
+    local first, second = joint.first, joint.second
+
+    if
+      not alive[first]
+      or not alive[second]
+      or generation[first] ~= joint.firstGeneration
+      or generation[second] ~= joint.secondGeneration
+    then
+      worlds.dropJoint(state, id)
+      continue
+    end
+
+    if (inverseMass[first] == 0 or sleeping[first]) and (inverseMass[second] == 0 or sleeping[second]) then continue end
+
+    local firstArm = geometry.rotate(turn[first], turnW[first], joint.firstAnchor)
+    local secondArm = geometry.rotate(turn[second], turnW[second], joint.secondAnchor)
+    local firstAt, secondAt = position[first] + firstArm, position[second] + secondArm
+
+    if joint.kind == 'distance' then
+      local between = secondAt - firstAt
+      local length = vector.magnitude(between)
+      local along = if length > Tiny then between / length else AxisY
+      local parting = pointVelocity(state, second, secondArm) - pointVelocity(state, first, firstArm)
+      local give = giveAlong(state, first, firstArm, along) + giveAlong(state, second, secondArm, along)
+
+      if give > Tiny then
+        local closing = vector.dot(parting, along)
+        local bias = ((length - joint.rest) * joint.stiffness) / math.max(duration, 1e-5)
+
+        applyPairImpulse(state, first, second, firstArm, secondArm, along * (-(closing + bias + joint.damping * closing) / give))
+      end
+
+      continue
+    end
+
+    -- A ball and a hinge both keep the two points together, along each axis in turn.
+    local apart = secondAt - firstAt
+
+    solvePointAxis(state, first, second, firstArm, secondArm, apart, AxisX, joint.stiffness, joint.damping, duration)
+    solvePointAxis(state, first, second, firstArm, secondArm, apart, AxisY, joint.stiffness, joint.damping, duration)
+    solvePointAxis(state, first, second, firstArm, secondArm, apart, AxisZ, joint.stiffness, joint.damping, duration)
+
+    if joint.kind ~= 'hinge' then continue end
+
+    -- A hinge also keeps the two bodies' axes in line: about the two directions across the hinge.
+    local firstAxis = geometry.rotate(turn[first], turnW[first], joint.firstAxis)
+    local secondAxis = geometry.rotate(turn[second], turnW[second], joint.secondAxis)
+    local hinge = geometry.unit(firstAxis + secondAxis, firstAxis)
+    local across1, across2 = contactTangents(hinge)
+    local askew = vector.cross(firstAxis, secondAxis)
+    local stiffness = joint.angularStiffness / math.max(duration, 1e-5)
+
+    alignAbout(state, first, second, across1, askew, stiffness)
+    alignAbout(state, first, second, across2, askew, stiffness)
+
+    -- And its motor turns them about the hinge, with no more than it is allowed to.
+    local motorSpeed = joint.motorSpeed
+    if not motorSpeed or joint.maxMotorTorque <= 0 then continue end
+
+    local give = turnAbout(state, first, hinge) + turnAbout(state, second, hinge)
+    if give <= Tiny then continue end
+
+    local held = joint.motorImpulse
+    local limit = joint.maxMotorTorque * duration
+    local now = geometry.clamp(held + (motorSpeed - vector.dot(spin[second] - spin[first], hinge)) / give, -limit, limit)
+
+    joint.motorImpulse = now
+    applyPairTwist(state, first, second, hinge * (now - held))
+  end
+end
+
+--- The root of the island a body is in, shortening the way to it for the next time.
+local function unionRoot(parent: { number }, body: number): number
+  local above = parent[body]
+
+  while above ~= body do
+    local further = parent[above]
+
+    parent[body] = further
+    body = above
+    above = further
+  end
+
+  return body
+end
+
+--- Joins two bodies' islands: the smaller under the larger.
+local function unionBodies(parent: { number }, size: { number }, first: number, second: number)
+  local firstRoot, secondRoot = unionRoot(parent, first), unionRoot(parent, second)
+  if firstRoot == secondRoot then return end
+
+  if size[firstRoot] < size[secondRoot] then
+    firstRoot, secondRoot = secondRoot, firstRoot
+  end
+
+  parent[secondRoot] = firstRoot
+  size[firstRoot] += size[secondRoot]
+end
+
+local function buildIslands(state: State)
+  local {islandParent: parent, islandSize: size, islandAwake: awake, islandRoots: roots} = state
+  local {alive, bodyType, sensor, sleeping, generation, joints, contactFirst: firsts, contactSecond: seconds} = state
+  local movers = broadphase.movers(state)
+
+  for _, body in movers do
+    local dynamic = bodyType[body] == 'dynamic'
+
+    parent[body] = if dynamic then body else 0
+    size[body] = if dynamic then 1 else 0
+  end
+
+  for contact = 1, state.contactCount do
+    local first, second = firsts[contact], seconds[contact]
+    if sensor[first] or sensor[second] then continue end
+    if bodyType[first] ~= 'dynamic' or bodyType[second] ~= 'dynamic' then continue end
+
+    unionBodies(parent, size, first, second)
+  end
+
+  for id = 1, state.nextJoint - 1 do
+    local joint = joints[id]
+    if not joint then continue end
+
+    local first, second = joint.first, joint.second
+    if not alive[first] or not alive[second] then continue end
+    if generation[first] ~= joint.firstGeneration or generation[second] ~= joint.secondGeneration then continue end
+    if bodyType[first] ~= 'dynamic' or bodyType[second] ~= 'dynamic' then continue end
+
+    unionBodies(parent, size, first, second)
+  end
+
+  table.clear(roots)
+  local count = 0
+
+  for _, body in movers do
+    awake[body] = false
+  end
+
+  for _, body in movers do
+    if parent[body] == 0 then continue end
+
+    local root = unionRoot(parent, body)
+    parent[body] = root
+
+    if root == body then
+      count += 1
+      roots[count] = root
+    end
+
+    if not sleeping[body] then awake[root] = true end
+  end
+
+  -- Wake is an island property: an explicit impulse or meaningful impact on one member
+  -- wakes every dynamically-connected member before solving.
+  for _, body in movers do
+    local root = parent[body]
+    if root ~= 0 and awake[root] then sleeping[body] = false end
+  end
+
+  state.islandCount = count
+end
+
+--- Seeds a contact with the impulses of the cached contact nearest its anchors, if the pair
+--- touched last step and one of its cached contacts faces the same way.
+local function matchCachedContact(state: State, contact: number, firstAnchor: vector, secondAnchor: vector, tangent1: vector, tangent2: vector)
+  if not state.warmStarting or state.contactBias[contact] > 0 then return end
+
+  local first, second = state.contactFirst[contact], state.contactSecond[contact]
+  local entry = state.contactCache[pairKey(first, second)]
+  local epoch = state.cacheEpoch
+  if not entry or entry[CacheEpoch] ~= epoch - 1 then return end
+  if entry[CacheFirstGeneration] ~= state.generation[first] or entry[CacheSecondGeneration] ~= state.generation[second] then return end
+
+  if entry[CacheMatchEpoch] ~= epoch then
+    entry[CacheMatchEpoch] = epoch
+    entry[CacheUsedMask] = 0
+  end
+
+  local best, nearest = 0, state.manifoldMatchDistance * state.manifoldMatchDistance * 2
+  local normal = state.contactNormal[contact]
+  local used = entry[CacheUsedMask] :: number
+
+  for slot = 1, entry[CacheCount] :: number do
+    local record = CacheHeader + (slot - 1) * CacheStride
+    if bit32.band(used, bit32.lshift(1, slot - 1)) ~= 0 or not (vector.dot(entry[record + 3] :: vector, normal) > 0.85) then continue end
+
+    local firstOffset, secondOffset = firstAnchor - (entry[record + 1] :: vector), secondAnchor - (entry[record + 2] :: vector)
+    local distance = vector.dot(firstOffset, firstOffset) + vector.dot(secondOffset, secondOffset)
+
+    if distance < nearest then
+      nearest = distance
+      best = slot
+    end
+  end
+
+  if best == 0 then return end
+
+  local record = CacheHeader + (best - 1) * CacheStride
+  local factor = state.warmStartFactor
+  local tangent = (entry[record + 5] :: vector) * factor
+
+  entry[CacheUsedMask] = bit32.bor(used, bit32.lshift(1, best - 1))
+  state.normalImpulse[contact] = (entry[record + 4] :: number) * factor
+  state.tangentImpulse1[contact] = vector.dot(tangent, tangent1)
+  state.tangentImpulse2[contact] = vector.dot(tangent, tangent2)
+  state.warmStartedCount += 1
+end
+
+local function storeContactCache(state: State)
+  local {contactCache: cache, activeContacts: active, cacheEpoch: epoch, generation, position, turn, turnW} = state
+  local {contactFirst: firsts, contactSecond: seconds, contactPoint: points, contactNormal: normals, firstAnchor: firstAnchors, secondAnchor: secondAnchors} = state
+  local {tangent1: tangents1, tangent2: tangents2} = state
+  local {normalImpulse: normalImpulses, tangentImpulse1: tangentImpulses1, tangentImpulse2: tangentImpulses2} = state
+
+  for index = 1, state.activeContactCount do
+    local contact = active[index]
+    local first, second = firsts[contact], seconds[contact]
+    local key = pairKey(first, second)
+    local entry = cache[key]
+
+    -- Room for the header and four contacts, the header at nothing.
+    if not entry then
+      local fresh: { number | vector } = table.create(CacheHeader + 4 * CacheStride, 0 :: number | vector)
+
+      entry = fresh
+      cache[key] = fresh
+    end
+
+    if entry[CacheEpoch] ~= epoch then
+      entry[CacheEpoch] = epoch
+      entry[CacheCount] = 0
+      entry[CacheFirstGeneration] = generation[first]
+      entry[CacheSecondGeneration] = generation[second]
+    end
+
+    local count = entry[CacheCount] :: number
+    if count >= 4 then continue end
+
+    local record = CacheHeader + count * CacheStride
+    local point = points[contact]
+
+    entry[CacheCount] = count + 1
+    entry[record + 1] = firstAnchors[contact] or geometry.unrotate(turn[first], turnW[first], point - position[first])
+    entry[record + 2] = secondAnchors[contact] or geometry.unrotate(turn[second], turnW[second], point - position[second])
+    entry[record + 3] = normals[contact]
+    entry[record + 4] = normalImpulses[contact]
+    entry[record + 5] = tangents1[contact] * tangentImpulses1[contact] + tangents2[contact] * tangentImpulses2[contact]
+  end
+
+  if epoch % 64 ~= 0 then return end
+
+  for key, entry in cache do
+    if epoch - (entry[CacheEpoch] :: number) > 2 then cache[key] = nil end
+  end
+end
+
+local function buildContactEvents(state: State)
+  local epoch = state.contactEventEpoch + 1
+  state.contactEventEpoch = epoch
+
+  local {contactPairSeen: seen, contactPairActive: touching, contactPairsBefore: previous, contactPairsNow: current} = state
+  local {contactPairFirst: pairA, contactPairSecond: pairB, contactPairSensor: pairSensor} = state
+  local {sensor, eventFirst: eventA, eventSecond: eventB, eventKind, eventSensor, contactFirst: firsts, contactSecond: seconds} = state
+  local eventCount = 0
+
+  table.clear(current)
+
+  for contact = 1, state.contactCount do
+    local first, second = firsts[contact], seconds[contact]
+    local key = pairKey(first, second)
+    if seen[key] == epoch then continue end
+
+    local sensed = sensor[first] or sensor[second]
+
+    -- Every pair first seen this step is an event, so the events so far count the pairs too.
+    seen[key] = epoch
+    eventCount += 1
+    current[eventCount] = key
+    pairA[key], pairB[key], pairSensor[key] = first, second, sensed
+    eventA[eventCount], eventB[eventCount], eventSensor[eventCount] = first, second, sensed
+    eventKind[eventCount] = if touching[key] then EventStay else EventEnter
+    touching[key] = true
+  end
+
+  for index = 1, #previous do
+    local key = previous[index]
+    previous[index] = nil
+    if seen[key] == epoch or not touching[key] then continue end
+
+    local first, second = pairA[key], pairB[key]
+
+    if first and second then
+      eventCount += 1
+      eventA[eventCount], eventB[eventCount] = first, second
+      eventKind[eventCount] = EventExit
+      eventSensor[eventCount] = pairSensor[key] == true
+    end
+
+    touching[key], pairA[key], pairB[key], pairSensor[key] = nil, nil, nil, nil
+  end
+
+  state.contactPairsBefore, state.contactPairsNow = current, previous
+  state.contactEventCount = eventCount
+end
+
+local function wakeContacts(state: State)
+  local {sensor, sleeping, bodyType, velocity: velocities, spin: spins, sleepTime, contactFirst: firsts, contactSecond: seconds, contactDepth: depths} = state
+  local speed, depth = state.wakeSpeed * state.wakeSpeed, state.wakePenetration
+
+  for contact = 1, state.contactCount do
+    local first, second = firsts[contact], seconds[contact]
+    if sensor[first] or sensor[second] then continue end
+
+    local firstAsleep = sleeping[first]
+    if firstAsleep == sleeping[second] then continue end
+
+    local sleeper, mover = second, first
+    if firstAsleep then sleeper, mover = first, second end
+    if bodyType[sleeper] ~= 'dynamic' then continue end
+
+    local velocity, spin = velocities[mover], spins[mover]
+
+    if vector.dot(velocity, velocity) > speed or vector.dot(spin, spin) > speed or depths[contact] > depth then
+      sleeping[sleeper] = false
+      sleepTime[sleeper] = 0
+    end
+  end
+end
+
+local function prepareContacts(state: State, duration: number)
+  state.warmStartedCount = 0
+  local {sensor, inverseMass, sleeping, position, turn, turnW, friction, restitution, velocity: velocities, spin: spins} = state
+  local {activeContacts: active, contactSolved: actives, contactFirst: firsts, contactSecond: seconds, contactPoint: points, contactNormal: normals, contactDepth: depths} = state
+  local {firstArm: firstArms, secondArm: secondArms, firstAnchor: firstAnchors, secondAnchor: secondAnchors} = state
+  local {normalMass: normalMasses, firstNormalTurn: firstNormalTurns, secondNormalTurn: secondNormalTurns} = state
+  local {tangent1: tangents1, tangent2: tangents2, tangentMass1: tangentMasses1, tangentMass2: tangentMasses2} = state
+  local {firstTangentTurn1: firstTangentTurns1, secondTangentTurn1: secondTangentTurns1} = state
+  local {firstTangentTurn2: firstTangentTurns2, secondTangentTurn2: secondTangentTurns2} = state
+  local {contactFriction: frictions, contactBounce: restitutions, contactBias: biases} = state
+  local {normalImpulse: normalImpulses, tangentImpulse1: tangentImpulses1, tangentImpulse2: tangentImpulses2} = state
+  local {baumgarte, maxDepenetrationVelocity} = state
+  local biasSlop, pace = math.max(state.penetrationSlop, state.baumgarteSlop), math.max(duration, 1e-5)
+  local activeCount = 0
+
+  for contact = 1, state.contactCount do
+    local first, second = firsts[contact], seconds[contact]
+    local firstMoves, secondMoves = inverseMass[first] > 0 and not sleeping[first], inverseMass[second] > 0 and not sleeping[second]
+    local solved = not (sensor[first] or sensor[second]) and (firstMoves or secondMoves)
+    actives[contact] = solved
+
+    if not solved then
+      normalMasses[contact] = 0
+      tangentMasses1[contact] = 0
+      tangentMasses2[contact] = 0
+      continue
+    end
+
+    activeCount += 1
+    active[activeCount] = contact
+
+    local point, normal = points[contact], normals[contact]
+    local firstArm, secondArm = point - position[first], point - position[second]
+    local firstAnchor = geometry.unrotate(turn[first], turnW[first], firstArm)
+    local secondAnchor = geometry.unrotate(turn[second], turnW[second], secondArm)
+
+    firstArms[contact], secondArms[contact] = firstArm, secondArm
+    firstAnchors[contact], secondAnchors[contact] = firstAnchor, secondAnchor
+
+    local firstInverse, firstTurn = contactAxisResponse(state, first, firstArm, normal)
+    local secondInverse, secondTurn = contactAxisResponse(state, second, secondArm, normal)
+    local inverse = firstInverse + secondInverse
+
+    normalMasses[contact] = if inverse > Tiny then 1 / inverse else 0
+    firstNormalTurns[contact], secondNormalTurns[contact] = firstTurn, secondTurn
+
+    local tangent1, tangent2 = contactTangents(normal)
+    tangents1[contact], tangents2[contact] = tangent1, tangent2
+
+    firstInverse, firstTurn = contactAxisResponse(state, first, firstArm, tangent1)
+    secondInverse, secondTurn = contactAxisResponse(state, second, secondArm, tangent1)
+    inverse = firstInverse + secondInverse
+    tangentMasses1[contact] = if inverse > Tiny then 1 / inverse else 0
+    firstTangentTurns1[contact], secondTangentTurns1[contact] = firstTurn, secondTurn
+
+    firstInverse, firstTurn = contactAxisResponse(state, first, firstArm, tangent2)
+    secondInverse, secondTurn = contactAxisResponse(state, second, secondArm, tangent2)
+    inverse = firstInverse + secondInverse
+    tangentMasses2[contact] = if inverse > Tiny then 1 / inverse else 0
+    firstTangentTurns2[contact], secondTangentTurns2[contact] = firstTurn, secondTurn
+
+    frictions[contact] = math.sqrt(friction[first] * friction[second])
+    restitutions[contact] = math.max(restitution[first], restitution[second])
+    biases[contact] = math.min(math.max(depths[contact] - biasSlop, 0) * baumgarte / pace, maxDepenetrationVelocity)
+    matchCachedContact(state, contact, firstAnchor, secondAnchor, tangent1, tangent2)
+  end
+
+  for index = #active, activeCount + 1, -1 do
+    active[index] = nil
+  end
+
+  state.activeContactCount = activeCount
+
+  -- Seed this frame's solve with last frame's accumulated impulses. This is done after
+  -- every contact mass is prepared, so a warm start never changes the effective mass basis.
+  for index = 1, activeCount do
+    local contact = active[index]
+    local normalImpulse = normalImpulses[contact]
+    local tangentImpulse1, tangentImpulse2 = tangentImpulses1[contact], tangentImpulses2[contact]
+    if normalImpulse == 0 and tangentImpulse1 == 0 and tangentImpulse2 == 0 then continue end
+
+    local first, second = firsts[contact], seconds[contact]
+    local linear = normals[contact] * normalImpulse + tangents1[contact] * tangentImpulse1 + tangents2[contact] * tangentImpulse2
+
+    if inverseMass[first] > 0 and not sleeping[first] then
+      velocities[first] -= linear * inverseMass[first]
+      spins[first] -= firstNormalTurns[contact] * normalImpulse
+        + firstTangentTurns1[contact] * tangentImpulse1
+        + firstTangentTurns2[contact] * tangentImpulse2
+    end
+
+    if inverseMass[second] > 0 and not sleeping[second] then
+      velocities[second] += linear * inverseMass[second]
+      spins[second] += secondNormalTurns[contact] * normalImpulse
+        + secondTangentTurns1[contact] * tangentImpulse1
+        + secondTangentTurns2[contact] * tangentImpulse2
+    end
+  end
+end
+
+local function solveContacts(state: State, duration: number)
+  local {alive, sleeping, inverseMass, velocity: velocities, spin: spins, restitutionThreshold, activeContacts: active} = state
+  local {contactFirst: firsts, contactSecond: seconds, contactNormal: normals, firstArm: firstArms, secondArm: secondArms} = state
+  local {normalMass: normalMasses, firstNormalTurn: firstNormalTurns, secondNormalTurn: secondNormalTurns} = state
+  local {tangent1: tangents1, tangent2: tangents2, tangentMass1: tangentMasses1, tangentMass2: tangentMasses2} = state
+  local {firstTangentTurn1: firstTangentTurns1, secondTangentTurn1: secondTangentTurns1} = state
+  local {firstTangentTurn2: firstTangentTurns2, secondTangentTurn2: secondTangentTurns2} = state
+  local {contactFriction: frictions, contactBounce: restitutions, contactBias: biases} = state
+  local {normalImpulse: normalImpulses, tangentImpulse1: tangentImpulses1, tangentImpulse2: tangentImpulses2} = state
+
+  for iteration = 1, state.velocityIterations do
+    for index = 1, state.activeContactCount do
+      local contact = active[index]
+      local first, second = firsts[contact], seconds[contact]
+      if not alive[first] or not alive[second] then continue end
+
+      local normal = normals[contact]
+      local firstArm, secondArm = firstArms[contact], secondArms[contact]
+      local firstMoves, secondMoves = inverseMass[first] > 0 and not sleeping[first], inverseMass[second] > 0 and not sleeping[second]
+      local firstVelocity = if sleeping[first] then Zero else velocities[first] + vector.cross(spins[first], firstArm)
+      local secondVelocity = if sleeping[second] then Zero else velocities[second] + vector.cross(spins[second], secondArm)
+      local normalMass = normalMasses[contact]
+
+      if normalMass > 0 then
+        local approach = vector.dot(secondVelocity - firstVelocity, normal)
+        local bounce = if iteration == 1 and approach < -restitutionThreshold then -restitutions[contact] * approach else 0
+        local held = normalImpulses[contact]
+        local impulse = math.max(held + (math.max(bounce, biases[contact]) - approach) * normalMass, 0)
+        local change = impulse - held
+
+        normalImpulses[contact] = impulse
+
+        if change ~= 0 then
+          if firstMoves then
+            velocities[first] -= normal * (inverseMass[first] * change)
+            spins[first] -= firstNormalTurns[contact] * change
+          end
+
+          if secondMoves then
+            velocities[second] += normal * (inverseMass[second] * change)
+            spins[second] += secondNormalTurns[contact] * change
+          end
+        end
+      end
+
+      local tangentMass1, tangentMass2 = tangentMasses1[contact], tangentMasses2[contact]
+      if not (tangentMass1 > 0 or tangentMass2 > 0) then continue end
+
+      firstVelocity = if sleeping[first] then Zero else velocities[first] + vector.cross(spins[first], firstArm)
+      secondVelocity = if sleeping[second] then Zero else velocities[second] + vector.cross(spins[second], secondArm)
+
+      local slip = secondVelocity - firstVelocity
+      local tangent1, tangent2 = tangents1[contact], tangents2[contact]
+      local held1, held2 = tangentImpulses1[contact], tangentImpulses2[contact]
+      local impulse1, impulse2 = held1 - vector.dot(slip, tangent1) * tangentMass1, held2 - vector.dot(slip, tangent2) * tangentMass2
+      local limit = frictions[contact] * normalImpulses[contact]
+      local size = impulse1 * impulse1 + impulse2 * impulse2
+
+      if size > limit * limit and size > Tiny then
+        local scale = limit / math.sqrt(size)
+        impulse1, impulse2 = impulse1 * scale, impulse2 * scale
+      end
+
+      local change1, change2 = impulse1 - held1, impulse2 - held2
+      tangentImpulses1[contact], tangentImpulses2[contact] = impulse1, impulse2
+      if change1 == 0 and change2 == 0 then continue end
+
+      local linear = tangent1 * change1 + tangent2 * change2
+
+      if firstMoves then
+        velocities[first] -= linear * inverseMass[first]
+        spins[first] -= firstTangentTurns1[contact] * change1 + firstTangentTurns2[contact] * change2
+      end
+
+      if secondMoves then
+        velocities[second] += linear * inverseMass[second]
+        spins[second] += secondTangentTurns1[contact] * change1 + secondTangentTurns2[contact] * change2
+      end
+    end
+
+    solveJoints(state, duration)
+  end
+end
+
+local function correctPositions(state: State)
+  local {sleeping, inverseMass, position, positionIterations: iterations, penetrationSlop: slop, activeContacts: active} = state
+  local {contactFirst: firsts, contactSecond: seconds, contactNormal: normals, contactDepth: depths} = state
+  local percent = state.positionCorrection / iterations
+
+  for _ = 1, iterations do
+    for index = 1, state.activeContactCount do
+      local contact = active[index]
+      local first, second = firsts[contact], seconds[contact]
+      local firstInverse = if sleeping[first] then 0 else inverseMass[first]
+      local secondInverse = if sleeping[second] then 0 else inverseMass[second]
+      local inverse = firstInverse + secondInverse
+      if inverse <= Tiny then continue end
+
+      local depth = math.max(depths[contact] - slop, 0)
+      if depth <= 0 then continue end
+
+      local correction = normals[contact] * (depth * percent / inverse)
+      if firstInverse > 0 then position[first] -= correction * firstInverse end
+      if secondInverse > 0 then position[second] += correction * secondInverse end
+    end
+  end
+end
+
+local function integrate(state: State, duration: number)
+  local {bodyType, sleeping, inverseMass, swept: ccd, position, previousPosition: prevPos, velocity: velocities, spin: spins, force, torque, turn, turnW} = state
+  local {gravity, linearDamping, angularDamping} = state
+
+  for _, body in broadphase.movers(state) do
+    local kind = bodyType[body]
+
+    if kind == 'kinematic' then
+      local spin = spins[body]
+
+      position[body] += velocities[body] * duration
+      if vector.dot(spin, spin) > Tiny then turn[body], turnW[body] = geometry.integrateTurn(turn[body], turnW[body], spin, duration) end
+    end
+
+    if kind ~= 'dynamic' then continue end
+
+    if sleeping[body] then
+      force[body], torque[body] = Zero, Zero
+      continue
+    end
+
+    if ccd[body] then prevPos[body] = position[body] end
+
+    local velocity = (velocities[body] + (gravity + force[body] * inverseMass[body]) * duration) * (1 / (1 + linearDamping[body] * duration))
+    local twist = torque[body]
+    if vector.dot(twist, twist) > Tiny then spins[body] += spinFrom(state, body, twist) * duration end
+
+    local spin = spins[body] * (1 / (1 + angularDamping[body] * duration))
+
+    velocities[body], spins[body] = velocity, spin
+    position[body] += velocity * duration
+    if vector.dot(spin, spin) > Tiny then turn[body], turnW[body] = geometry.integrateTurn(turn[body], turnW[body], spin, duration) end
+
+    force[body], torque[body] = Zero, Zero
+  end
+end
+
+
+local function sleepIndependent(state: State, duration: number)
+  if not state.allowSleep then return end
+
+  local {bodyType, sleeping, velocity: velocities, spin: spins, sleepTime, sleepDelay} = state
+  local linear, angular = state.sleepLinear * state.sleepLinear, state.sleepAngular * state.sleepAngular
+  local count = 0
+
+  for _, body in broadphase.movers(state) do
+    if bodyType[body] ~= 'dynamic' then continue end
+
+    count += 1
+    if sleeping[body] then continue end
+
+    local velocity, spin = velocities[body], spins[body]
+
+    if vector.dot(velocity, velocity) >= linear or vector.dot(spin, spin) >= angular then
+      sleepTime[body] = 0
+      continue
+    end
+
+    local rested = sleepTime[body] + duration
+    sleepTime[body] = rested
+
+    if rested >= sleepDelay then
+      sleeping[body] = true
+      velocities[body], spins[body] = Zero, Zero
+    end
+  end
+
+  state.islandCount = count
+end
+
+local function sleep(state: State, duration: number)
+  if not state.allowSleep then return end
+
+  local {islandParent: parent, islandCanSleep: canSleep, islandLeastRest: leastRest, islandRoots: roots} = state
+  local {velocity: velocities, spin: spins, sleepTime, sleeping, sleepDelay} = state
+  local linear, angular = state.sleepLinear * state.sleepLinear, state.sleepAngular * state.sleepAngular
+  local movers = broadphase.movers(state)
+
+  for _, root in roots do
+    canSleep[root] = true
+    leastRest[root] = math.huge
+  end
+
+  for _, body in movers do
+    local root = parent[body]
+    if root == 0 then continue end
+
+    local velocity, spin = velocities[body], spins[body]
+    if vector.dot(velocity, velocity) >= linear or vector.dot(spin, spin) >= angular then canSleep[root] = false end
+  end
+
+  for _, body in movers do
+    local root = parent[body]
+    if root == 0 then continue end
+
+    if not canSleep[root] then
+      sleepTime[body] = 0
+      sleeping[body] = false
+      continue
+    end
+
+    local rested = sleepTime[body] + duration
+    sleepTime[body] = rested
+    if rested < leastRest[root] then leastRest[root] = rested end
+  end
+
+  for _, body in movers do
+    local root = parent[body]
+
+    if root ~= 0 and canSleep[root] and leastRest[root] >= sleepDelay then
+      sleeping[body] = true
+      velocities[body], spins[body] = Zero, Zero
+    end
+  end
+end
+
+
+--- Changes a dynamic body's spin at once.
+function solver.applyAngularImpulse(state: State, handle: number, impulse: vector)
+  local body = worlds.slotOf(state, handle)
+  if state.bodyType[body] ~= 'dynamic' then return end
+
+  state.spin[body] += spinFrom(state, body, impulse)
+  state.sleeping[body] = false
+  state.sleepTime[body] = 0
+end
+
+--- Changes a dynamic body's velocity at once, and its spin when the impulse is at a point.
+function solver.applyImpulse(state: State, handle: number, impulse: vector, point: vector?)
+  local body = worlds.slotOf(state, handle)
+  if state.bodyType[body] ~= 'dynamic' then return end
+
+  state.velocity[body] += impulse * state.inverseMass[body]
+  if point then state.spin[body] += spinFrom(state, body, vector.cross(point - state.position[body], impulse)) end
+
+  state.sleeping[body] = false
+  state.sleepTime[body] = 0
+end
+
+solver.integrate = integrate
+solver.buildContactEvents = buildContactEvents
+solver.wakeContacts = wakeContacts
+solver.buildIslands = buildIslands
+solver.prepareContacts = prepareContacts
+solver.solveContacts = solveContacts
+solver.storeContactCache = storeContactCache
+solver.correctPositions = correctPositions
+solver.sleepIndependent = sleepIndependent
+solver.sleep = sleep
+
+return solver
