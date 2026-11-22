@@ -476,23 +476,6 @@ local function supportBoxAxes(center,a0,a1,a2,half,dir)
         + a2 * (if vector.dot(dir,a2)>=0 then half.Z else -half.Z)
 end
 
-local function testBoxAxis(axis,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,feature,margin)
-    local l2=vector.dot(axis,axis)
-    if l2<=1e-10 then return true,bestPen,bestAxis,bestFeature end
-    local n=if math.abs(l2-1)<1e-5 then axis else axis/math.sqrt(l2)
-    local ra=ah.X*math.abs(vector.dot(n,a0))+ah.Y*math.abs(vector.dot(n,a1))+ah.Z*math.abs(vector.dot(n,a2))
-    local rb=bh.X*math.abs(vector.dot(n,b0))+bh.Y*math.abs(vector.dot(n,b1))+bh.Z*math.abs(vector.dot(n,b2))
-    local dn=vector.dot(d,n)
-    local pen=ra+rb-math.abs(dn)
-    if pen<=-(margin or 0) then return false,bestPen,bestAxis,bestFeature end
-    if pen<bestPen then
-        bestPen=pen
-        bestAxis=if dn>=0 then n else -n
-        bestFeature=feature
-    end
-    return true,bestPen,bestAxis,bestFeature
-end
-
 local function closestPointSegment(p, a, b)
     local ab = b - a
     local d = vector.dot(ab, ab)
@@ -592,26 +575,45 @@ local function sphereBox(sp, radius, bp, bqv, bqw, half, margin)
     return true, qRotate(bqv, bqw, nLocal), bp + qRotate(bqv, bqw, pointLocal), penetration
 end
 
+-- The fifteen axes two boxes can be apart along: each box's three, then the nine crosses of one
+-- of each. Kept between calls, and filled a stage at a time, since most pairs are apart on an
+-- early axis.
+local BoxAxes = table.create(15, ZERO)
+
 local function boxBox(ap,a0,a1,a2,ah,bp,b0,b1,b2,bh,margin)
     local d=bp-ap
     local bestPen,bestAxis,bestFeature=math.huge,nil,0
-    local ok
+    local axes=BoxAxes
+    local slack=-(margin or 0)
+    local ahx,ahy,ahz,bhx,bhy,bhz=ah.X,ah.Y,ah.Z,bh.X,bh.Y,bh.Z
 
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(a0,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,1,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(a1,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,2,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(a2,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,3,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(b0,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,4,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(b1,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,5,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(b2,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,6,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a0,b0),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,7,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a0,b1),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,8,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a0,b2),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,9,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a1,b0),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,10,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a1,b1),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,11,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a1,b2),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,12,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a2,b0),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,13,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a2,b1),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,14,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a2,b2),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,15,margin); if not ok then return false end
+    axes[1],axes[2],axes[3],axes[4],axes[5],axes[6]=a0,a1,a2,b0,b1,b2
+
+    for feature=1,15 do
+        if feature==7 then
+            axes[7],axes[8],axes[9]=vector.cross(a0,b0),vector.cross(a0,b1),vector.cross(a0,b2)
+            axes[10],axes[11],axes[12]=vector.cross(a1,b0),vector.cross(a1,b1),vector.cross(a1,b2)
+            axes[13],axes[14],axes[15]=vector.cross(a2,b0),vector.cross(a2,b1),vector.cross(a2,b2)
+        end
+
+        -- One axis: how far the boxes reach along it, against how far apart their centres are.
+        local axis=axes[feature]
+        local l2=vector.dot(axis,axis)
+        if l2<=1e-10 then continue end
+
+        local n=if math.abs(l2-1)<1e-5 then axis else axis/math.sqrt(l2)
+        local ra=ahx*math.abs(vector.dot(n,a0))+ahy*math.abs(vector.dot(n,a1))+ahz*math.abs(vector.dot(n,a2))
+        local rb=bhx*math.abs(vector.dot(n,b0))+bhy*math.abs(vector.dot(n,b1))+bhz*math.abs(vector.dot(n,b2))
+        local dn=vector.dot(d,n)
+        local pen=ra+rb-math.abs(dn)
+        if pen<=slack then return false end
+
+        if pen<bestPen then
+            bestPen=pen
+            bestAxis=if dn>=0 then n else -n
+            bestFeature=feature
+        end
+    end
 
     local n=bestAxis or safeUnit(d,YAXIS)
     local sa=supportBoxAxes(ap,a0,a1,a2,ah,n)
