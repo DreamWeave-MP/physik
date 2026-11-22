@@ -849,6 +849,60 @@ function geometry.primitiveOnTriangle(
   return capsuleOnTriangle(at, turn, turnW, shape.radius, shape.halfHeight, first, second, third, margin)
 end
 
+--- A triangle of a body at `at` turned by a rotation, in the world: its three corners.
+function geometry.placeTriangle(
+  at: vector,
+  turn: vector,
+  turnW: number,
+  first: vector,
+  second: vector,
+  third: vector
+): (vector, vector, vector)
+  return at + rotate(turn, turnW, first), at + rotate(turn, turnW, second), at + rotate(turn, turnW, third)
+end
+
+--- A piece of a compound body in the world: where it is and how it is turned.
+function geometry.placePiece(
+  at: vector,
+  turn: vector,
+  turnW: number,
+  pieceAt: vector,
+  pieceTurn: vector,
+  pieceTurnW: number
+): (vector, vector, number)
+  local placedTurn, placedTurnW = composeTurns(turn, turnW, pieceTurn, pieceTurnW)
+
+  return at + rotate(turn, turnW, pieceAt), placedTurn, placedTurnW
+end
+
+--- A primitive and a triangle of a body at `groundAt` turned by a rotation, the triangle given
+--- in that body's own space. The normal is from the primitive to the triangle.
+function geometry.primitiveOnPlacedTriangle(
+  shape: types.Primitive,
+  at: vector,
+  turn: vector,
+  turnW: number,
+  groundAt: vector,
+  groundTurn: vector,
+  groundTurnW: number,
+  first: vector,
+  second: vector,
+  third: vector,
+  margin: number?
+): (boolean, vector, vector, number)
+  local worldFirst = groundAt + rotate(groundTurn, groundTurnW, first)
+  local worldSecond = groundAt + rotate(groundTurn, groundTurnW, second)
+  local worldThird = groundAt + rotate(groundTurn, groundTurnW, third)
+
+  if shape.kind == 'sphere' then return sphereOnTriangle(at, shape.radius, worldFirst, worldSecond, worldThird, margin) end
+
+  if shape.kind == 'box' then
+    return boxOnTriangle(at, turn, turnW, shape.halfExtents, worldFirst, worldSecond, worldThird, margin)
+  end
+
+  return capsuleOnTriangle(at, turn, turnW, shape.radius, shape.halfHeight, worldFirst, worldSecond, worldThird, margin)
+end
+
 -- How near a swept capsule comes to what it meets before it is said to touch it.
 local SweepSkin = 1e-3
 

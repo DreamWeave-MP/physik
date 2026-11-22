@@ -1,0 +1,577 @@
+--!strict
+--!native
+-- The narrow phase: what a pair of bodies that may touch does touch. Each pair it is offered
+-- becomes no contacts or a few, added to the world's list: a point, a normal from the first
+-- body to the second, and how deeply they overlap there.
+local cells = require './cells'
+local geometry = require './geometry'
+local shapes = require './shape'
+local types = require './types'
+local worlds = require './world'
+
+local narrowphase = {}
+
+type State = worlds.State
+
+local function addContact(state: State, first: number, second: number, normal: vector, point: vector, depth: number)
+  local contact = state.contactCount + 1
+
+  state.contactCount = contact
+  state.contactFirst[contact], state.contactSecond[contact] = first, second
+  state.contactNormal[contact], state.contactPoint[contact], state.contactDepth[contact] = normal, point, depth
+  state.normalImpulse[contact] = 0
+  state.tangentImpulse1[contact] = 0
+  state.tangentImpulse2[contact] = 0
+end
+
+--- Keeps a contact of a body against ground or against pieces, among at most four: one at a
+--- point already held replaces it if it is deeper, and a fifth replaces the shallowest if it is
+--- deeper than that.
+local function keepContact(state: State, normal: vector, point: vector, depth: number)
+  local {meshNormals: normals, meshPoints: points, meshDepths: depths} = state
+  local count = state.meshContactCount
+
+  for held = 1, count do
+    local apart = points[held] - point
+
+    if vector.dot(apart, apart) < 1e-6 then
+      if depth > depths[held] then
+        normals[held], points[held], depths[held] = normal, point, depth
+      end
+
+      return
+    end
+  end
+
+  if count < 4 then
+    count += 1
+    state.meshContactCount = count
+    normals[count], points[count], depths[count] = normal, point, depth
+
+    return
+  end
+
+  local shallowest = 1
+
+  for held = 2, 4 do
+    if depths[held] < depths[shallowest] then shallowest = held end
+  end
+
+  if depth > depths[shallowest] then
+    normals[shallowest], points[shallowest], depths[shallowest] = normal, point, depth
+  end
+end
+
+--- Adds the contacts that have been kept as the pair's.
+local function addKept(state: State, first: number, second: number)
+  local {meshNormals: normals, meshPoints: points, meshDepths: depths} = state
+
+  for held = 1, state.meshContactCount do
+    addContact(state, first, second, normals[held], points[held], depths[held])
+  end
+end
+
+--- Places a compound body's pieces in the world, each one's centre and rotation, in the three
+--- lists given. Returns how many pieces there are.
+local function placePieces(
+  state: State,
+  body: number,
+  compound: types.Compound,
+  centres: { vector },
+  turns: { vector },
+  turnWs: { number }
+): number
+  local at, turn, turnW = state.position[body], state.turn[body], state.turnW[body]
+  local {positions, turns: pieceTurns, turnWs: pieceTurnWs, count} = compound
+
+  for piece = 1, count do
+    centres[piece], turns[piece], turnWs[piece] =
+      geometry.placePiece(at, turn, turnW, positions[piece], pieceTurns[piece], pieceTurnWs[piece])
+  end
+
+  return count
+end
+
+--- Tests a body, a primitive or a compound, against one triangle of ground, given in the
+--- ground's own space, and keeps what it finds. `flip` is for a pair whose ground is its first
+--- body: the normal is then from the ground.
+local function againstTriangle(
+  state: State,
+  body: number,
+  ground: number,
+  first: vector,
+  second: vector,
+  third: vector,
+  flip: boolean
+)
+  local shape = state.shape[body]
+  local margin = state.contactMargin
+
+  if shape.kind == 'compound' then
+    local at, turn, turnW = state.position[body], state.turn[body], state.turnW[body]
+    local worldFirst, worldSecond, worldThird =
+      geometry.placeTriangle(state.position[ground], state.turn[ground], state.turnW[ground], first, second, third)
+
+    for piece = 1, shape.count do
+      local pieceAt, pieceTurn, pieceTurnW =
+        geometry.placePiece(at, turn, turnW, shape.positions[piece], shape.turns[piece], shape.turnWs[piece])
+      local met, normal, point, depth =
+        geometry.primitiveOnTriangle(shape.shapes[piece], pieceAt, pieceTurn, pieceTurnW, worldFirst, worldSecond, worldThird, margin)
+
+      if met then keepContact(state, if flip then -normal else normal, point, depth) end
+    end
+
+    return
+  end
+
+  local met, normal, point, depth = geometry.primitiveOnPlacedTriangle(
+    shape :: types.Primitive,
+    state.position[body],
+    state.turn[body],
+    state.turnW[body],
+    state.position[ground],
+    state.turn[ground],
+    state.turnW[ground],
+    first,
+    second,
+    third,
+    margin
+  )
+
+  if met then keepContact(state, if flip then -normal else normal, point, depth) end
+end
+
+--- Tests a body against the triangles of a mesh its bounds reach, each once.
+local function againstMesh(state: State, body: number, ground: number, mesh: types.Mesh, flip: boolean)
+  local low, high =
+    geometry.boundsWithin(state.turn[ground], state.turnW[ground], state.position[ground], state.boundsLow[body], state.boundsHigh[body])
+  local cellSize = mesh.cellSize
+  local firstColumn, firstRow, firstLayer = math.floor(low.x / cellSize), math.floor(low.y / cellSize), math.floor(low.z / cellSize)
+  local lastColumn, lastRow, lastLayer = math.floor(high.x / cellSize), math.floor(high.y / cellSize), math.floor(high.z / cellSize)
+  local marks = state.meshMarks
+  local epoch = state.meshMarkEpoch + 1
+
+  state.meshMarkEpoch = epoch
+
+  -- Too many cells to walk: every triangle, which is fewer.
+  if (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1) > state.meshQueryCellLimit then
+    for triangle = 0, mesh.triangleCount - 1 do
+      if marks[triangle] == epoch then continue end
+
+      marks[triangle] = epoch
+
+      local first, second, third = shapes.meshTriangle(mesh, triangle)
+
+      againstTriangle(state, body, ground, first, second, third, flip)
+    end
+
+    return
+  end
+
+  local {heads, nextNode, nodeTriangle} = mesh
+
+  for column = firstColumn, lastColumn do
+    for row = firstRow, lastRow do
+      for layer = firstLayer, lastLayer do
+        local key = cells.pack(column, row, layer)
+        local node = key and heads[key] or 0
+
+        while node ~= 0 do
+          local triangle = nodeTriangle[node]
+
+          if marks[triangle] ~= epoch then
+            marks[triangle] = epoch
+
+            local first, second, third = shapes.meshTriangle(mesh, triangle)
+
+            againstTriangle(state, body, ground, first, second, third, flip)
+          end
+
+          node = nextNode[node]
+        end
+      end
+    end
+  end
+
+  for _, triangle in mesh.overflow do
+    if marks[triangle] == epoch then continue end
+
+    marks[triangle] = epoch
+
+    local first, second, third = shapes.meshTriangle(mesh, triangle)
+
+    againstTriangle(state, body, ground, first, second, third, flip)
+  end
+end
+
+--- Tests a body against the two triangles of each square of a heightfield its bounds reach.
+local function againstHeightfield(state: State, body: number, ground: number, field: types.Heightfield, flip: boolean)
+  local low, high =
+    geometry.boundsWithin(state.turn[ground], state.turnW[ground], state.position[ground], state.boundsLow[body], state.boundsHigh[body])
+  local origin = field.origin
+  local firstColumn = geometry.clamp(math.floor((low.x - origin.x) / field.cellSizeX), 0, field.width - 2)
+  local lastColumn = geometry.clamp(math.floor((high.x - origin.x) / field.cellSizeX), 0, field.width - 2)
+  local firstRow = geometry.clamp(math.floor((low.z - origin.z) / field.cellSizeZ), 0, field.depth - 2)
+  local lastRow = geometry.clamp(math.floor((high.z - origin.z) / field.cellSizeZ), 0, field.depth - 2)
+
+  for row = firstRow, lastRow do
+    for column = firstColumn, lastColumn do
+      local near, across = shapes.heightVertex(field, column, row), shapes.heightVertex(field, column + 1, row + 1)
+
+      againstTriangle(state, body, ground, near, shapes.heightVertex(field, column + 1, row), across, flip)
+      againstTriangle(state, body, ground, near, across, shapes.heightVertex(field, column, row + 1), flip)
+    end
+  end
+end
+
+--- A pair of which one is a mesh or a heightfield. Two of those do not collide.
+local function narrowGround(state: State, first: number, second: number)
+  local firstKind, secondKind = state.shape[first].kind, state.shape[second].kind
+  local firstIsGround = firstKind == 'mesh' or firstKind == 'heightfield'
+  if firstIsGround and (secondKind == 'mesh' or secondKind == 'heightfield') then return end
+
+  local body, ground = first, second
+  if firstIsGround then
+    body, ground = second, first
+  end
+
+  -- The triangles under a body are found from its bounds, and a sphere's are not kept as it
+  -- moves: the grid asks no more of a sphere than its centre.
+  if state.sphereRadius[body] then worlds.refreshBounds(state, body) end
+
+  state.meshContactCount = 0
+
+  local shape = state.shape[ground]
+
+  if shape.kind == 'mesh' then
+    againstMesh(state, body, ground, shape, firstIsGround)
+  elseif shape.kind == 'heightfield' then
+    againstHeightfield(state, body, ground, shape, firstIsGround)
+  end
+
+  addKept(state, first, second)
+end
+
+--- A pair of which at least one is a compound: every piece of one against every piece of the
+--- other, a primitive standing as its own one piece. A side's pieces are placed once, not once
+--- for each piece they are tested against.
+local function narrowPieces(state: State, first: number, second: number)
+  local {shape, position, turn, turnW, contactMargin: margin} = state
+  local {firstPieceCentres: firstCentres, firstPieceTurns: firstTurns, firstPieceTurnWs: firstTurnWs} = state
+  local {secondPieceCentres: secondCentres, secondPieceTurns: secondTurns, secondPieceTurnWs: secondTurnWs} = state
+  local firstShape, secondShape = shape[first], shape[second]
+  local firstPieces: { types.Primitive }?, secondPieces: { types.Primitive }? = nil, nil
+  local firstCount, secondCount = 1, 1
+
+  if firstShape.kind == 'compound' then
+    firstPieces = firstShape.shapes
+    firstCount = placePieces(state, first, firstShape, firstCentres, firstTurns, firstTurnWs)
+  else
+    firstCentres[1], firstTurns[1], firstTurnWs[1] = position[first], turn[first], turnW[first]
+  end
+
+  if secondShape.kind == 'compound' then
+    secondPieces = secondShape.shapes
+    secondCount = placePieces(state, second, secondShape, secondCentres, secondTurns, secondTurnWs)
+  else
+    secondCentres[1], secondTurns[1], secondTurnWs[1] = position[second], turn[second], turnW[second]
+  end
+
+  state.meshContactCount = 0
+
+  for firstPiece = 1, firstCount do
+    local firstPrimitive = if firstPieces then firstPieces[firstPiece] else firstShape :: types.Primitive
+    local firstCentre, firstTurn, firstTurnW = firstCentres[firstPiece], firstTurns[firstPiece], firstTurnWs[firstPiece]
+
+    for secondPiece = 1, secondCount do
+      local met, normal, point, depth = geometry.primitiveOnPrimitive(
+        firstPrimitive,
+        firstCentre,
+        firstTurn,
+        firstTurnW,
+        if secondPieces then secondPieces[secondPiece] else secondShape :: types.Primitive,
+        secondCentres[secondPiece],
+        secondTurns[secondPiece],
+        secondTurnWs[secondPiece],
+        margin
+      )
+
+      if met then keepContact(state, normal, point, depth) end
+    end
+  end
+
+  addKept(state, first, second)
+end
+
+--- One of three axes, by number.
+local function axisAt(axis0: vector, axis1: vector, axis2: vector, which: number): vector
+  if which == 1 then return axis0 end
+  if which == 2 then return axis1 end
+
+  return axis2
+end
+
+--- A box's half extent along one of its axes, by number.
+local function extentAt(half: vector, which: number): number
+  if which == 1 then return half.x end
+  if which == 2 then return half.y end
+
+  return half.z
+end
+
+--- The two axes of a box that are not the one numbered, and its half extents along them.
+local function axesAcross(axis0: vector, axis1: vector, axis2: vector, half: vector, which: number): (vector, vector, number, number)
+  if which == 1 then return axis1, axis2, half.y, half.z end
+  if which == 2 then return axis0, axis2, half.x, half.z end
+
+  return axis0, axis1, half.x, half.y
+end
+
+--- Clips a polygon by one side of a face: keeps what is within `limit` of `origin` along
+--- `axis`, on the side `side` says, and returns how many corners are left.
+local function clipSide(
+  input: { vector },
+  count: number,
+  output: { vector },
+  origin: vector,
+  axis: vector,
+  limit: number,
+  side: number
+): number
+  if count <= 0 then return 0 end
+
+  local kept = 0
+  local before = input[count]
+  local beforeInside = limit - side * vector.dot(before - origin, axis)
+  local beforeIn = beforeInside >= -1e-6
+
+  for index = 1, count do
+    local corner = input[index]
+    local inside = limit - side * vector.dot(corner - origin, axis)
+    local cornerIn = inside >= -1e-6
+
+    -- Crossing the side: the point of the edge that is on it.
+    if cornerIn ~= beforeIn then
+      local span = beforeInside - inside
+
+      kept += 1
+      output[kept] = before + (corner - before) * (if math.abs(span) > 1e-8 then beforeInside / span else 0)
+    end
+
+    if cornerIn then
+      kept += 1
+      output[kept] = corner
+    end
+
+    before, beforeInside, beforeIn = corner, inside, cornerIn
+  end
+
+  return kept
+end
+
+--- Two boxes that overlap least along a face of one: the face of the other that most nearly
+--- faces it is clipped to its sides, and the corners left that are in or near the face are the
+--- contacts, up to four. `feature` says whose face: 1 to 3 the first's, 4 to 6 the second's.
+local function faceManifold(state: State, first: number, second: number, normal: vector, feature: number, least: number)
+  local {position, axis0: axes0, axis1: axes1, axis2: axes2, shape} = state
+  local reference, incident, which, outward = first, second, feature, normal
+
+  if feature > 3 then
+    reference, incident, which, outward = second, first, feature - 3, -normal
+  end
+
+  local referenceHalf = (shape[reference] :: types.Box).halfExtents
+  local reference0, reference1, reference2 = axes0[reference], axes1[reference], axes2[reference]
+  local referenceAxis = axisAt(reference0, reference1, reference2, which)
+
+  -- The normal is already the right way, but it is the face's own axis that the face is on.
+  outward = referenceAxis * (if vector.dot(outward, referenceAxis) >= 0 then 1 else -1)
+
+  local faceCentre = position[reference] + outward * extentAt(referenceHalf, which)
+  local across, along, acrossHalf, alongHalf = axesAcross(reference0, reference1, reference2, referenceHalf, which)
+
+  -- The other box's face: the one whose axis is most nearly along the normal.
+  local incidentHalf = (shape[incident] :: types.Box).halfExtents
+  local incident0, incident1, incident2 = axes0[incident], axes1[incident], axes2[incident]
+  local facing0, facing1, facing2 = vector.dot(outward, incident0), vector.dot(outward, incident1), vector.dot(outward, incident2)
+  local most0, most1, most2 = math.abs(facing0), math.abs(facing1), math.abs(facing2)
+  local incidentWhich = if most0 >= most1 and most0 >= most2 then 1 elseif most1 >= most2 then 2 else 3
+  local incidentFacing = if incidentWhich == 1 then facing0 elseif incidentWhich == 2 then facing1 else facing2
+  local incidentOut = axisAt(incident0, incident1, incident2, incidentWhich) * (if incidentFacing > 0 then -1 else 1)
+  local incidentCentre = position[incident] + incidentOut * extentAt(incidentHalf, incidentWhich)
+  local side, up, sideHalf, upHalf = axesAcross(incident0, incident1, incident2, incidentHalf, incidentWhich)
+  local from, to = state.clipFrom, state.clipTo
+
+  from[1] = incidentCentre + side * sideHalf + up * upHalf
+  from[2] = incidentCentre - side * sideHalf + up * upHalf
+  from[3] = incidentCentre - side * sideHalf - up * upHalf
+  from[4] = incidentCentre + side * sideHalf - up * upHalf
+
+  local corners = clipSide(from, 4, to, faceCentre, across, acrossHalf, 1)
+
+  corners = clipSide(to, corners, from, faceCentre, across, acrossHalf, -1)
+  corners = clipSide(from, corners, to, faceCentre, along, alongHalf, 1)
+  corners = clipSide(to, corners, from, faceCentre, along, alongHalf, -1)
+
+  local points, depths = state.manifoldPoints, state.manifoldDepths
+  local slop = state.manifoldSlop
+  local near = math.max(slop, state.contactMargin)
+  local count = 0
+
+  for index = 1, corners do
+    local corner = from[index]
+    local above = vector.dot(corner - faceCentre, outward)
+
+    if above > near then continue end
+
+    count += 1
+    points[count] = corner - outward * (above * 0.5)
+    depths[count] = math.max(math.max(-above, 0), math.min(least, slop))
+  end
+
+  -- Nothing left of the face: the one point between the two boxes' nearest corners.
+  if count == 0 then
+    local onFirst = geometry.boxSupport(position[first], axes0[first], axes1[first], axes2[first], (shape[first] :: types.Box).halfExtents, normal)
+    local onSecond =
+      geometry.boxSupport(position[second], axes0[second], axes1[second], axes2[second], (shape[second] :: types.Box).halfExtents, -normal)
+
+    addContact(state, first, second, normal, (onFirst + onSecond) * 0.5, least)
+
+    return
+  end
+
+  if count <= 4 then
+    for index = 1, count do
+      addContact(state, first, second, normal, points[index], depths[index])
+    end
+
+    return
+  end
+
+  -- More than four, of a face clipped to an octagon: the deepest, the one furthest from it,
+  -- the one that makes the widest triangle with those two, and the one furthest from all three.
+  local deepest = 1
+
+  for index = 2, count do
+    if depths[index] > depths[deepest] then deepest = index end
+  end
+
+  local deepestPoint = points[deepest]
+  local furthest = if deepest == 1 then 2 else 1
+  local best = -1
+
+  for index = 1, count do
+    if index == deepest then continue end
+
+    local apart = points[index] - deepestPoint
+    local squared = vector.dot(apart, apart)
+
+    if squared > best then
+      best, furthest = squared, index
+    end
+  end
+
+  local furthestPoint = points[furthest]
+  local edge = furthestPoint - deepestPoint
+  local widest = 0
+
+  best = -1
+
+  for index = 1, count do
+    if index == deepest or index == furthest then continue end
+
+    local lean = vector.cross(edge, points[index] - deepestPoint)
+    local area = vector.dot(lean, lean)
+
+    if area > best then
+      best, widest = area, index
+    end
+  end
+
+  if widest == 0 then widest = if furthest ~= 1 and deepest ~= 1 then 1 else 3 end
+
+  local widestPoint = points[widest]
+  local last = 0
+
+  best = -1
+
+  for index = 1, count do
+    if index == deepest or index == furthest or index == widest then continue end
+
+    local fromDeepest, fromFurthest, fromWidest = points[index] - deepestPoint, points[index] - furthestPoint, points[index] - widestPoint
+    local nearest = math.min(vector.dot(fromDeepest, fromDeepest), vector.dot(fromFurthest, fromFurthest), vector.dot(fromWidest, fromWidest))
+
+    if nearest > best then
+      best, last = nearest, index
+    end
+  end
+
+  addContact(state, first, second, normal, points[deepest], depths[deepest])
+  addContact(state, first, second, normal, points[furthest], depths[furthest])
+  addContact(state, first, second, normal, points[widest], depths[widest])
+  if last ~= 0 then addContact(state, first, second, normal, points[last], depths[last]) end
+end
+
+--- Finds what a pair of bodies touches and adds it to the world's contacts. The lower slot is
+--- always the first, so that a contact matches the one kept for it from the step before.
+function narrowphase.pair(state: State, first: number, second: number)
+  local shape = state.shape
+  local firstShape, secondShape = shape[first], shape[second]
+  local firstKind, secondKind = firstShape.kind, secondShape.kind
+
+  if firstKind == 'mesh' or firstKind == 'heightfield' or secondKind == 'mesh' or secondKind == 'heightfield' then
+    narrowGround(state, first, second)
+
+    return
+  end
+
+  if firstKind == 'compound' or secondKind == 'compound' then
+    narrowPieces(state, first, second)
+
+    return
+  end
+
+  local {position, turn, turnW, contactMargin: margin} = state
+  local met: boolean, normal: vector, point: vector, depth: number
+
+  -- Two boxes are given the axes each body keeps, and a face against a face is several contacts.
+  if firstShape.kind == 'box' and secondShape.kind == 'box' then
+    local feature
+
+    met, normal, point, depth, feature = geometry.boxOnBox(
+      position[first],
+      state.axis0[first],
+      state.axis1[first],
+      state.axis2[first],
+      firstShape.halfExtents,
+      position[second],
+      state.axis0[second],
+      state.axis1[second],
+      state.axis2[second],
+      secondShape.halfExtents,
+      margin
+    )
+
+    if met and feature <= 6 then
+      faceManifold(state, first, second, normal, feature, depth)
+
+      return
+    end
+  else
+    met, normal, point, depth = geometry.primitiveOnPrimitive(
+      firstShape :: types.Primitive,
+      position[first],
+      turn[first],
+      turnW[first],
+      secondShape :: types.Primitive,
+      position[second],
+      turn[second],
+      turnW[second],
+      margin
+    )
+  end
+
+  if met then addContact(state, first, second, normal, point, depth) end
+end
+
+return narrowphase
