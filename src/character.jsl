@@ -373,4 +373,19 @@ function character.fits(self: Character, position: vector): boolean
   return count == 0
 end
 
+--- Makes the character `height` tall, its soles where they are: which is how it crouches and
+--- stands. It is made shorter at once, and taller only where there is room for it. Returns
+--- whether it is now that tall: false means it was to stand and something is over it.
+function character.setHeight(self: Character, height: number): boolean
+  local wanted = math.max(height, self.radius * 2)
+  local was = self.height
+
+  self.height = wanted
+  if wanted <= was or character.fits(self, self.position) then return true end
+
+  self.height = was
+
+  return false
+end
+
 return character
