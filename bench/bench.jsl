@@ -154,7 +154,7 @@ local function rotation(random: Random)
 end
 
 local function weigh(value: vector): number
-  return value.X + 2 * value.Y + 3 * value.Z
+  return value.x + 2 * value.y + 3 * value.z
 end
 
 local transforms = {}
@@ -850,7 +850,7 @@ local function level(options): World
 
     for _ = 1, 3 do
       local half = vector.create(random(0.2, 1.2), random(0.5, 2), random(0.2, 1.2))
-      local rise = if room then 6 else half.Y
+      local rise = if room then 6 else half.y
 
       world:addBody({
         type = 'static',
@@ -930,8 +930,8 @@ do
 
     for index = 1, 256 do
       local direction = directions[index]
-      local start = vector.create(origins[index].X, 0.95, origins[index].Z)
-      local hit = world:capsuleCast(start, start + vector.create(direction.X, 0, direction.Z) * 12, 0.4, 0.5)
+      local start = vector.create(origins[index].x, 0.95, origins[index].z)
+      local hit = world:capsuleCast(start, start + vector.create(direction.x, 0, direction.z) * 12, 0.4, 0.5)
 
       if hit then
         met += 1

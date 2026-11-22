@@ -114,16 +114,16 @@ local World = {}
 World.__index = World
 
 local function applyInvInertia(self,i,v)
-    if self.invMass[i]==0 then return ZERO end
-    local ii=self.invInertia[i]
+    if self.inverseMass[i]==0 then return ZERO end
+    local ii=self.inverseInertia[i]
     -- Spheres are isotropic, so orientation cancels completely.
-    if math.abs(ii.X-ii.Y)<1e-12 and math.abs(ii.X-ii.Z)<1e-12 then return v*ii.X end
+    if math.abs(ii.x-ii.y)<1e-12 and math.abs(ii.x-ii.z)<1e-12 then return v*ii.x end
     local a0,a1,a2=self.axis0[i],self.axis1[i],self.axis2[i]
     if a0==nil then
-        a0,a1,a2=qAxes(self.qv[i],self.qw[i])
+        a0,a1,a2=qAxes(self.turn[i],self.turnW[i])
         self.axis0[i],self.axis1[i],self.axis2[i]=a0,a1,a2
     end
-    return a0*(vector.dot(v,a0)*ii.X)+a1*(vector.dot(v,a1)*ii.Y)+a2*(vector.dot(v,a2)*ii.Z)
+    return a0*(vector.dot(v,a0)*ii.x)+a1*(vector.dot(v,a1)*ii.y)+a2*(vector.dot(v,a2)*ii.z)
 end
 
 
@@ -132,13 +132,13 @@ local function axisAt(a0,a1,a2,i)
 end
 
 local function extentAt(h,i)
-    if i==1 then return h.X elseif i==2 then return h.Y else return h.Z end
+    if i==1 then return h.x elseif i==2 then return h.y else return h.z end
 end
 
 local function otherAxes(a0,a1,a2,h,i)
-    if i==1 then return a1,a2,h.Y,h.Z end
-    if i==2 then return a0,a2,h.X,h.Z end
-    return a0,a1,h.X,h.Y
+    if i==1 then return a1,a2,h.y,h.z end
+    if i==2 then return a0,a2,h.x,h.z end
+    return a0,a1,h.x,h.y
 end
 
 local function clipPlane(input,count,output,origin,axis,limit,sign)
@@ -174,7 +174,7 @@ local function emitFaceManifold(self,a,b,n,feature,bestPen)
         ref,inc,refIndex,refOut=b,a,feature-3,-n
     end
 
-    local rp=self.pos[ref]
+    local rp=self.position[ref]
     local ra0,ra1,ra2=self.axis0[ref],self.axis1[ref],self.axis2[ref]
     local rh=self.shape[ref].halfExtents
     local refAxis=axisAt(ra0,ra1,ra2,refIndex)
@@ -184,7 +184,7 @@ local function emitFaceManifold(self,a,b,n,feature,bestPen)
     local refCenter=rp+refOut*extentAt(rh,refIndex)
     local ru,rv,reu,rev=otherAxes(ra0,ra1,ra2,rh,refIndex)
 
-    local ip=self.pos[inc]
+    local ip=self.position[inc]
     local ia0,ia1,ia2=self.axis0[inc],self.axis1[inc],self.axis2[inc]
     local ih=self.shape[inc].halfExtents
     local d0,d1,d2=vector.dot(refOut,ia0),vector.dot(refOut,ia1),vector.dot(refOut,ia2)
@@ -196,7 +196,7 @@ local function emitFaceManifold(self,a,b,n,feature,bestPen)
     local faceCenter=ip+incOut*extentAt(ih,incIndex)
     local iu,iv,ieu,iev=otherAxes(ia0,ia1,ia2,ih,incIndex)
 
-    local ca,cb=self.clipA,self.clipB
+    local ca,cb=self.clipFrom,self.clipTo
     ca[1]=faceCenter+iu*ieu+iv*iev
     ca[2]=faceCenter-iu*ieu+iv*iev
     ca[3]=faceCenter-iu*ieu-iv*iev
@@ -220,8 +220,8 @@ local function emitFaceManifold(self,a,b,n,feature,bestPen)
         end
     end
     if m==0 then
-        local sa=supportBoxAxes(self.pos[a],self.axis0[a],self.axis1[a],self.axis2[a],self.shape[a].halfExtents,n)
-        local sb=supportBoxAxes(self.pos[b],self.axis0[b],self.axis1[b],self.axis2[b],self.shape[b].halfExtents,-n)
+        local sa=supportBoxAxes(self.position[a],self.axis0[a],self.axis1[a],self.axis2[a],self.shape[a].halfExtents,n)
+        local sb=supportBoxAxes(self.position[b],self.axis0[b],self.axis1[b],self.axis2[b],self.shape[b].halfExtents,-n)
         self:_addContact(a,b,n,(sa+sb)*0.5,bestPen)
         return
     end
@@ -343,15 +343,15 @@ function World:addBody(desc)
     self.bodyType[i] = kind
     self.shape[i] = shape
     self.sphereRadius[i] = shape.kind == SHAPE_SPHERE and shape.radius
-    self.pos[i] = desc.position or ZERO
-    self.linVel[i] = desc.velocity or ZERO
-    self.angVel[i] = desc.angularVelocity or ZERO
+    self.position[i] = desc.position or ZERO
+    self.velocity[i] = desc.velocity or ZERO
+    self.spin[i] = desc.angularVelocity or ZERO
     self.force[i] = ZERO
     self.torque[i] = ZERO
-    self.qv[i], self.qw[i] = turn, turnW
-    self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.qv[i],self.qw[i])
-    self.invMass[i] = if kind == BODY_DYNAMIC and mass > EPS then 1/mass else 0
-    self.invInertia[i] = if kind == BODY_DYNAMIC then inertiaFor(shape,mass) else ZERO
+    self.turn[i], self.turnW[i] = turn, turnW
+    self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.turn[i],self.turnW[i])
+    self.inverseMass[i] = if kind == BODY_DYNAMIC and mass > EPS then 1/mass else 0
+    self.inverseInertia[i] = if kind == BODY_DYNAMIC then inertiaFor(shape,mass) else ZERO
     self.friction[i] = desc.friction or 0.6
     self.restitution[i] = desc.restitution or 0.05
     self.linearDamping[i] = desc.linearDamping or 0.02
@@ -359,27 +359,27 @@ function World:addBody(desc)
     self.group[i] = desc.group or 1
     self.mask[i] = if desc.mask == nil then 0xffffffff else desc.mask
     self.userData[i] = desc.userData
-    self.ccd[i] = desc.ccd == true
+    self.swept[i] = desc.ccd == true
     self.sensor[i] = desc.sensor == true
-    self.prevPos[i] = self.pos[i]
+    self.previousPosition[i] = self.position[i]
     self.sleeping[i] = false
     self.sleepTime[i] = 0
-    self.aabbMin[i] = ZERO
-    self.aabbMax[i] = ZERO
+    self.boundsLow[i] = ZERO
+    self.boundsHigh[i] = ZERO
     self:_updateAabb(i)
     self.gridValid=false
     self.gridTopologyDirty=true
     self.gridKey[i]=nil
-    self.rest[i],self.seenPos[i]=false,nil
+    self.rest[i],self.seenPosition[i]=false,nil
     self.changed=true
-    self.nearEpoch[i]=0
+    self.nearEpochs[i]=0
     if kind==BODY_STATIC then
         self.stillDirty=true
         table.insert(self.unsettled,i)
     else
         self.moversDirty=true
     end
-    if self.ccd[i] then self.ccdCount+=1 end
+    if self.swept[i] then self.sweptCount+=1 end
     return makeHandle(i,self.generation[i])
 end
 
@@ -394,7 +394,7 @@ function World:removeBody(handle)
     self.rest[i] = false
     self.changed = true
     if self.bodyType[i]==BODY_STATIC then self.stillDirty=true else self.moversDirty=true end
-    if self.ccd[i] then self.ccdCount-=1 end
+    if self.swept[i] then self.sweptCount-=1 end
     -- The free slots are a heap with the lowest on top, which is the next one taken: a world
     -- that has had bodies taken out of it then gives the same slots to the same bodies as a new
     -- one, and steps as a new one does.
@@ -410,11 +410,11 @@ function World:removeBody(handle)
     self.userData[i] = nil
     self.sleeping[i] = false
     -- A destroyed slot must not turn into a "stay" event if the numeric slot is reused.
-    for k=1,#self.contactPairPrev do
-        local key=self.contactPairPrev[k]
-        if self.contactPairA[key]==i or self.contactPairB[key]==i then
+    for k=1,#self.contactPairsBefore do
+        local key=self.contactPairsBefore[k]
+        if self.contactPairFirst[key]==i or self.contactPairSecond[key]==i then
             self.contactPairActive[key]=nil
-            self.contactPairA[key]=nil;self.contactPairB[key]=nil;self.contactPairSensor[key]=nil
+            self.contactPairFirst[key]=nil;self.contactPairSecond[key]=nil;self.contactPairSensor[key]=nil
         end
     end
     self.gridValid=false
@@ -446,10 +446,10 @@ function World:getBody(handle)
     return {
         handle = handle,
         type = if self.bodyType[i] == BODY_STATIC then "static" elseif self.bodyType[i] == BODY_KINEMATIC then "kinematic" else "dynamic",
-        position = self.pos[i],
-        rotation = { turn = self.qv[i], turnW = self.qw[i] },
-        velocity = self.linVel[i],
-        angularVelocity = self.angVel[i],
+        position = self.position[i],
+        rotation = { turn = self.turn[i], turnW = self.turnW[i] },
+        velocity = self.velocity[i],
+        angularVelocity = self.spin[i],
         sleeping = self.sleeping[i],
         sensor = self.sensor[i],
         userData = self.userData[i],
@@ -458,7 +458,7 @@ end
 
 function World:setPosition(handle, p, wake)
     local i = self:_check(handle)
-    self.pos[i] = p
+    self.position[i] = p
     self.gridValid=false
     if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
     if wake ~= false then self:wake(handle) end
@@ -466,8 +466,8 @@ end
 
 function World:setRotation(handle,q,wake)
     local i=self:_check(handle)
-    self.qv[i],self.qw[i]=qNormalize(q.turn,q.turnW)
-    self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.qv[i],self.qw[i])
+    self.turn[i],self.turnW[i]=qNormalize(q.turn,q.turnW)
+    self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.turn[i],self.turnW[i])
     self.gridValid=false
     if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
     if wake~=false then self:wake(handle) end
@@ -478,24 +478,24 @@ function World:driveKinematic(handle,targetPosition,targetRotation,dt)
     local i=self:_check(handle)
     assert(self.bodyType[i]==BODY_KINEMATIC,"physik.driveKinematic: body must be kinematic")
     assert(typeof(targetPosition)=="vector" and type(dt)=="number" and dt>0,"physik.driveKinematic: target position must be a vector and dt > 0")
-    self.linVel[i]=(targetPosition-self.pos[i])/dt
+    self.velocity[i]=(targetPosition-self.position[i])/dt
     if targetRotation then
         assert(type(targetRotation)=="table" and typeof(targetRotation.turn)=="vector" and type(targetRotation.turnW)=="number","physik.driveKinematic: rotation must come from physik.quat/axisAngle")
         local tv,tw=qNormalize(targetRotation.turn,targetRotation.turnW)
-        local dv,dw=qMul(tv,tw,-self.qv[i],self.qw[i])
+        local dv,dw=qMul(tv,tw,-self.turn[i],self.turnW[i])
         if dw<0 then dv,dw=-dv,-dw end
         dw=clamp(dw,-1,1)
         local angle=2*math.acos(dw)
         local s2=math.max(1-dw*dw,0)
-        if angle>1e-7 and s2>1e-12 then self.angVel[i]=dv*(angle/(math.sqrt(s2)*dt)) else self.angVel[i]=ZERO end
+        if angle>1e-7 and s2>1e-12 then self.spin[i]=dv*(angle/(math.sqrt(s2)*dt)) else self.spin[i]=ZERO end
     else
-        self.angVel[i]=ZERO
+        self.spin[i]=ZERO
     end
 end
 
 function World:shiftOrigin(delta)
   assert(typeof(delta) == 'vector', 'physik.shiftOrigin: delta must be a vector')
-  local {alive, pos, prevPos, aabbMin, aabbMax, cp: points} = self
+  local {alive, position: pos, previousPosition: prevPos, boundsLow: aabbMin, boundsHigh: aabbMax, contactPoint: points} = self
 
   for body = 1, self.high do
     if not alive[body] then continue end
@@ -518,14 +518,14 @@ end
 
 function World:setVelocity(handle, v)
     local i = self:_check(handle)
-    self.linVel[i] = v
+    self.velocity[i] = v
     self.sleeping[i] = false
     self.sleepTime[i] = 0
 end
 
 function World:setAngularVelocity(handle, v)
     local i = self:_check(handle)
-    self.angVel[i] = v
+    self.spin[i] = v
     self.sleeping[i] = false
     self.sleepTime[i] = 0
 end
@@ -548,7 +548,7 @@ function World:applyForceAtPoint(handle, f, point)
     local i = self:_check(handle)
     if self.bodyType[i] ~= BODY_DYNAMIC then return end
     self.force[i] += f
-    self.torque[i] += vector.cross(point - self.pos[i], f)
+    self.torque[i] += vector.cross(point - self.position[i], f)
     self.sleeping[i] = false
     self.sleepTime[i] = 0
 end
@@ -564,7 +564,7 @@ end
 function World:applyAngularImpulse(handle, impulse)
     local i=self:_check(handle)
     if self.bodyType[i]~=BODY_DYNAMIC then return end
-    self.angVel[i]+=applyInvInertia(self,i,impulse)
+    self.spin[i]+=applyInvInertia(self,i,impulse)
     self.sleeping[i]=false
     self.sleepTime[i]=0
 end
@@ -572,9 +572,9 @@ end
 function World:applyImpulse(handle, impulse, point)
     local i = self:_check(handle)
     if self.bodyType[i] ~= BODY_DYNAMIC then return end
-    self.linVel[i] += impulse * self.invMass[i]
+    self.velocity[i] += impulse * self.inverseMass[i]
     if point ~= nil then
-        self.angVel[i] += applyInvInertia(self,i,vector.cross(point-self.pos[i],impulse))
+        self.spin[i] += applyInvInertia(self,i,vector.cross(point-self.position[i],impulse))
     end
     self.sleeping[i] = false
     self.sleepTime[i] = 0
@@ -585,8 +585,8 @@ function World:addDistanceJoint(aHandle,bHandle,opts)
     opts = opts or {}
     local la = opts.localAnchorA or ZERO
     local lb = opts.localAnchorB or ZERO
-    local wa = self.pos[a] + qRotate(self.qv[a],self.qw[a],la)
-    local wb = self.pos[b] + qRotate(self.qv[b],self.qw[b],lb)
+    local wa = self.position[a] + qRotate(self.turn[a],self.turnW[a],la)
+    local wb = self.position[b] + qRotate(self.turn[b],self.turnW[b],lb)
     local id = self.nextJoint
     self.nextJoint += 1
     self.joints[id] = {
@@ -653,47 +653,47 @@ end
 
 function World:_updateAabb(i)
     local shape = self.shape[i]
-    local p = self.pos[i]
+    local p = self.position[i]
     if shape.kind == SHAPE_SPHERE then
         local r=shape.radius+self.contactMargin
         local e=vector.create(r,r,r)
-        self.aabbMin[i],self.aabbMax[i]=p-e,p+e
+        self.boundsLow[i],self.boundsHigh[i]=p-e,p+e
         return
     elseif shape.kind == SHAPE_BOX then
-        local a0,a1,a2=qAxes(self.qv[i],self.qw[i])
+        local a0,a1,a2=qAxes(self.turn[i],self.turnW[i])
         self.axis0[i],self.axis1[i],self.axis2[i]=a0,a1,a2
         local h = shape.halfExtents
         local e = vector.create(
-            math.abs(a0.X)*h.X + math.abs(a1.X)*h.Y + math.abs(a2.X)*h.Z,
-            math.abs(a0.Y)*h.X + math.abs(a1.Y)*h.Y + math.abs(a2.Y)*h.Z,
-            math.abs(a0.Z)*h.X + math.abs(a1.Z)*h.Y + math.abs(a2.Z)*h.Z
+            math.abs(a0.x)*h.x + math.abs(a1.x)*h.y + math.abs(a2.x)*h.z,
+            math.abs(a0.y)*h.x + math.abs(a1.y)*h.y + math.abs(a2.y)*h.z,
+            math.abs(a0.z)*h.x + math.abs(a1.z)*h.y + math.abs(a2.z)*h.z
         )
-        self.aabbMin[i],self.aabbMax[i] = p-e,p+e
+        self.boundsLow[i],self.boundsHigh[i] = p-e,p+e
     elseif shape.kind == SHAPE_CAPSULE then
-        local a0,axis,a2=qAxes(self.qv[i],self.qw[i])
+        local a0,axis,a2=qAxes(self.turn[i],self.turnW[i])
         self.axis0[i],self.axis1[i],self.axis2[i]=a0,axis,a2
         local h = shape.halfHeight
         local r = shape.radius
-        local e = vector.create(math.abs(axis.X)*h+r,math.abs(axis.Y)*h+r,math.abs(axis.Z)*h+r)
-        self.aabbMin[i],self.aabbMax[i] = p-e,p+e
+        local e = vector.create(math.abs(axis.x)*h+r,math.abs(axis.y)*h+r,math.abs(axis.z)*h+r)
+        self.boundsLow[i],self.boundsHigh[i] = p-e,p+e
     else
-        local a0,a1,a2=qAxes(self.qv[i],self.qw[i])
+        local a0,a1,a2=qAxes(self.turn[i],self.turnW[i])
         self.axis0[i],self.axis1[i],self.axis2[i]=a0,a1,a2
         local lc=(shape.localMin+shape.localMax)*0.5
         local lh=(shape.localMax-shape.localMin)*0.5
-        local wc=p+qRotate(self.qv[i],self.qw[i],lc)
+        local wc=p+qRotate(self.turn[i],self.turnW[i],lc)
         local e=vector.create(
-            math.abs(a0.X)*lh.X+math.abs(a1.X)*lh.Y+math.abs(a2.X)*lh.Z,
-            math.abs(a0.Y)*lh.X+math.abs(a1.Y)*lh.Y+math.abs(a2.Y)*lh.Z,
-            math.abs(a0.Z)*lh.X+math.abs(a1.Z)*lh.Y+math.abs(a2.Z)*lh.Z
+            math.abs(a0.x)*lh.x+math.abs(a1.x)*lh.y+math.abs(a2.x)*lh.z,
+            math.abs(a0.y)*lh.x+math.abs(a1.y)*lh.y+math.abs(a2.y)*lh.z,
+            math.abs(a0.z)*lh.x+math.abs(a1.z)*lh.y+math.abs(a2.z)*lh.z
         )
-        self.aabbMin[i],self.aabbMax[i]=wc-e,wc+e
+        self.boundsLow[i],self.boundsHigh[i]=wc-e,wc+e
     end
     local margin=self.contactMargin
     if margin>0 then
         local skin=vector.create(margin,margin,margin)
-        self.aabbMin[i]-=skin
-        self.aabbMax[i]+=skin
+        self.boundsLow[i]-=skin
+        self.boundsHigh[i]+=skin
     end
 end
 
@@ -702,10 +702,10 @@ end
 --- it ends where that would have. Returns false, having moved nothing, when a key is not a number,
 --- which the two sorts place differently.
 local function sortOrderByKeys(self, order: { number }, count: number): boolean
-  local aabbMin = self.aabbMin
+  local aabbMin = self.boundsLow
   local keys, permutation = buffer.create(count * 4), buffer.create(count * 4)
 
-  into(keys, 'f32')[for body in order => aabbMin[body].X]
+  into(keys, 'f32')[for body in order => aabbMin[body].x]
 
   -- A sum is not a number when a key is not, or when both infinities are among the keys.
   local total = data.sum(keys, 'f32', 0, count)
@@ -718,7 +718,7 @@ local function sortOrderByKeys(self, order: { number }, count: number): boolean
 end
 
 function World:_sortOrder()
-  local {order, alive, aabbMin, inOrder} = self
+  local {order, alive, boundsLow: aabbMin, inOrder} = self
   local count = #order
 
   -- Compact dead slots opportunistically.
@@ -751,10 +751,10 @@ function World:_sortOrder()
 
   for position = 2, count do
     local body = order[position]
-    local key = aabbMin[body].X
+    local key = aabbMin[body].x
     local slot = position - 1
 
-    while slot >= 1 and aabbMin[order[slot]].X > key do
+    while slot >= 1 and aabbMin[order[slot]].x > key do
       order[slot + 1] = order[slot]
       slot -= 1
     end
@@ -776,41 +776,41 @@ local applyPairImpulse
 function World:_addContact(a,b,n,p,pen)
     local c=self.contactCount+1
     self.contactCount=c
-    self.ca[c],self.cb[c]=a,b
-    self.cn[c],self.cp[c],self.cpen[c]=n,p,pen
-    self.cnormalImpulse[c]=0
-    self.ctangentImpulse1[c]=0
-    self.ctangentImpulse2[c]=0
+    self.contactFirst[c],self.contactSecond[c]=a,b
+    self.contactNormal[c],self.contactPoint[c],self.contactDepth[c]=n,p,pen
+    self.normalImpulse[c]=0
+    self.tangentImpulse1[c]=0
+    self.tangentImpulse2[c]=0
 end
 
 
 function World:_pushGeomContact(n,p,pen)
-    local count=self.geomContactCount
+    local count=self.meshContactCount
     for k=1,count do
-        if vector.dot(self.geomPoint[k]-p,self.geomPoint[k]-p)<1e-6 then
-            if pen>self.geomPen[k] then self.geomNormal[k],self.geomPoint[k],self.geomPen[k]=n,p,pen end
+        if vector.dot(self.meshPoints[k]-p,self.meshPoints[k]-p)<1e-6 then
+            if pen>self.meshDepths[k] then self.meshNormals[k],self.meshPoints[k],self.meshDepths[k]=n,p,pen end
             return
         end
     end
     if count<4 then
         count+=1
-        self.geomContactCount=count
-        self.geomNormal[count],self.geomPoint[count],self.geomPen[count]=n,p,pen
+        self.meshContactCount=count
+        self.meshNormals[count],self.meshPoints[count],self.meshDepths[count]=n,p,pen
         return
     end
     local shallow=1
-    for k=2,4 do if self.geomPen[k]<self.geomPen[shallow] then shallow=k end end
-    if pen>self.geomPen[shallow] then self.geomNormal[shallow],self.geomPoint[shallow],self.geomPen[shallow]=n,p,pen end
+    for k=2,4 do if self.meshDepths[k]<self.meshDepths[shallow] then shallow=k end end
+    if pen>self.meshDepths[shallow] then self.meshNormals[shallow],self.meshPoints[shallow],self.meshDepths[shallow]=n,p,pen end
 end
 
 function World:_testGeomTriangle(prim,geom,la,lb,lc,flip)
-    local gp,gqv,gqw=self.pos[geom],self.qv[geom],self.qw[geom]
+    local gp,gqv,gqw=self.position[geom],self.turn[geom],self.turnW[geom]
     local a=gp+qRotate(gqv,gqw,la)
     local b=gp+qRotate(gqv,gqw,lb)
     local c=gp+qRotate(gqv,gqw,lc)
     local ps=self.shape[prim]
     if ps.kind==SHAPE_COMPOUND then
-        local bp,bqv,bqw=self.pos[prim],self.qv[prim],self.qw[prim]
+        local bp,bqv,bqw=self.position[prim],self.turn[prim],self.turnW[prim]
         for k=1,ps.count do
             local cv,cw=qMul(bqv,bqw,ps.turns[k],ps.turnWs[k])
             local cp=bp+qRotate(bqv,bqw,ps.positions[k])
@@ -819,7 +819,7 @@ function World:_testGeomTriangle(prim,geom,la,lb,lc,flip)
         end
         return
     end
-    local ok,n,p,pen=primitiveTriangleContact(ps,self.pos[prim],self.qv[prim],self.qw[prim],a,b,c,self.contactMargin)
+    local ok,n,p,pen=primitiveTriangleContact(ps,self.position[prim],self.turn[prim],self.turnW[prim],a,b,c,self.contactMargin)
     if ok then if flip then n=-n end;self:_pushGeomContact(n,p,pen) end
 end
 function World:_meshTriangleOnce(prim,geom,shape,t,flip,epoch)
@@ -831,10 +831,10 @@ end
 
 function World:_narrowMesh(prim,geom,flip)
     local shape=self.shape[geom]
-    local lmn,lmx=transformedBoundsLocal(self.qv[geom],self.qw[geom],self.pos[geom],self.aabbMin[prim],self.aabbMax[prim])
+    local lmn,lmx=transformedBoundsLocal(self.turn[geom],self.turnW[geom],self.position[geom],self.boundsLow[prim],self.boundsHigh[prim])
     local cs=shape.cellSize
-    local x0,y0,z0=math.floor(lmn.X/cs),math.floor(lmn.Y/cs),math.floor(lmn.Z/cs)
-    local x1,y1,z1=math.floor(lmx.X/cs),math.floor(lmx.Y/cs),math.floor(lmx.Z/cs)
+    local x0,y0,z0=math.floor(lmn.x/cs),math.floor(lmn.y/cs),math.floor(lmn.z/cs)
+    local x1,y1,z1=math.floor(lmx.x/cs),math.floor(lmx.y/cs),math.floor(lmx.z/cs)
     local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
     self.meshMarkEpoch+=1
     local epoch=self.meshMarkEpoch
@@ -857,12 +857,12 @@ end
 
 function World:_narrowHeightfield(prim,geom,flip)
     local shape=self.shape[geom]
-    local lmn,lmx=transformedBoundsLocal(self.qv[geom],self.qw[geom],self.pos[geom],self.aabbMin[prim],self.aabbMax[prim])
+    local lmn,lmx=transformedBoundsLocal(self.turn[geom],self.turnW[geom],self.position[geom],self.boundsLow[prim],self.boundsHigh[prim])
     local o=shape.origin
-    local x0=clamp(math.floor((lmn.X-o.X)/shape.cellSizeX),0,shape.width-2)
-    local x1=clamp(math.floor((lmx.X-o.X)/shape.cellSizeX),0,shape.width-2)
-    local z0=clamp(math.floor((lmn.Z-o.Z)/shape.cellSizeZ),0,shape.depth-2)
-    local z1=clamp(math.floor((lmx.Z-o.Z)/shape.cellSizeZ),0,shape.depth-2)
+    local x0=clamp(math.floor((lmn.x-o.x)/shape.cellSizeX),0,shape.width-2)
+    local x1=clamp(math.floor((lmx.x-o.x)/shape.cellSizeX),0,shape.width-2)
+    local z0=clamp(math.floor((lmn.z-o.z)/shape.cellSizeZ),0,shape.depth-2)
+    local z1=clamp(math.floor((lmx.z-o.z)/shape.cellSizeZ),0,shape.depth-2)
     if x1<x0 or z1<z0 then return end
     for z=z0,z1 do for x=x0,x1 do
         local v00=heightVertex(shape,x,z)
@@ -886,16 +886,16 @@ function World:_narrowGeometry(a,b)
     -- moves: the grid asks no more of a sphere than its centre.
     if self.sphereRadius[prim] then self:_updateAabb(prim) end
 
-    self.geomContactCount=0
+    self.meshContactCount=0
     if self.shape[geom].kind==SHAPE_MESH then self:_narrowMesh(prim,geom,flip) else self:_narrowHeightfield(prim,geom,flip) end
-    for k=1,self.geomContactCount do self:_addContact(a,b,self.geomNormal[k],self.geomPoint[k],self.geomPen[k]) end
+    for k=1,self.meshContactCount do self:_addContact(a,b,self.meshNormals[k],self.meshPoints[k],self.meshDepths[k]) end
 end
 
 
 --- Places a compound body's pieces in the world, each one's centre and rotation, in the three
 --- lists given. Returns how many pieces there are.
 local function placePieces(self, body: number, centres: { vector }, turns: { vector }, turnWs: { number }): number
-  local centre, turn, turnW = self.pos[body], self.qv[body], self.qw[body]
+  local centre, turn, turnW = self.position[body], self.turn[body], self.turnW[body]
   local {positions, turns: pieceTurns, turnWs: pieceTurnWs, count} = self.shape[body]
 
   for piece = 1, count do
@@ -910,7 +910,7 @@ end
 --- of the other, a primitive standing as its own one piece. A side's pieces are placed once, not
 --- once for each piece they are tested against.
 function World:_narrowCompound(first, second)
-  local {shape, pos, qv, qw, contactMargin: margin} = self
+  local {shape, position: pos, turn: qv, turnW: qw, contactMargin: margin} = self
   local {firstPieceCentres: firstCentres, firstPieceTurns: firstTurns, firstPieceTurnWs: firstTurnWs} = self
   local {secondPieceCentres: secondCentres, secondPieceTurns: secondTurns, secondPieceTurnWs: secondTurnWs} = self
   local firstShape, secondShape = shape[first], shape[second]
@@ -929,7 +929,7 @@ function World:_narrowCompound(first, second)
     secondCentres[1], secondTurns[1], secondTurnWs[1] = pos[second], qv[second], qw[second]
   end
 
-  self.geomContactCount = 0
+  self.meshContactCount = 0
 
   for firstPiece = 1, firstCount do
     local firstPrimitive = if firstPieces then firstPieces[firstPiece] else firstShape
@@ -952,9 +952,9 @@ function World:_narrowCompound(first, second)
     end
   end
 
-  local {geomNormal, geomPoint, geomPen} = self
+  local {meshNormals: geomNormal, meshPoints: geomPoint, meshDepths: geomPen} = self
 
-  for index = 1, self.geomContactCount do
+  for index = 1, self.meshContactCount do
     self:_addContact(first, second, geomNormal[index], geomPoint[index], geomPen[index])
   end
 end
@@ -968,8 +968,8 @@ function World:_narrow(a,b)
         self:_narrowCompound(a,b)
         return
     end
-    local ap,bp=self.pos[a],self.pos[b]
-    local aqv,aqw,bqv,bqw=self.qv[a],self.qw[a],self.qv[b],self.qw[b]
+    local ap,bp=self.position[a],self.position[b]
+    local aqv,aqw,bqv,bqw=self.turn[a],self.turnW[a],self.turn[b],self.turnW[b]
     local ok,n,p,pen
     if sa.kind==SHAPE_SPHERE and sb.kind==SHAPE_SPHERE then
         ok,n,p,pen=sphereSphere(ap,sa.radius,bp,sb.radius,self.contactMargin)
@@ -1009,28 +1009,28 @@ local function tryPair(self, first: number, second: number)
   local rest = self.rest
   if rest[first] and rest[second] then return end
 
-  local radii, pos = self.sphereRadius, self.pos
+  local radii, pos = self.sphereRadius, self.position
   local firstRadius, secondRadius = radii[first], radii[second]
 
   if firstRadius and secondRadius then
     local reach = firstRadius + secondRadius + self.contactMargin * 2
     local between = pos[second] - pos[first]
-    if math.abs(between.X) > reach or math.abs(between.Y) > reach or math.abs(between.Z) > reach then return end
+    if math.abs(between.x) > reach or math.abs(between.y) > reach or math.abs(between.z) > reach then return end
   elseif firstRadius or secondRadius then
     local sphere, other = first, second
     if secondRadius then sphere, other = second, first end
 
     local centre, reach = pos[sphere], (firstRadius or secondRadius) + self.contactMargin
-    local low, high = self.aabbMin[other], self.aabbMax[other]
-    if centre.X + reach < low.X or centre.X - reach > high.X then return end
-    if centre.Y + reach < low.Y or centre.Y - reach > high.Y then return end
-    if centre.Z + reach < low.Z or centre.Z - reach > high.Z then return end
+    local low, high = self.boundsLow[other], self.boundsHigh[other]
+    if centre.x + reach < low.x or centre.x - reach > high.x then return end
+    if centre.y + reach < low.y or centre.y - reach > high.y then return end
+    if centre.z + reach < low.z or centre.z - reach > high.z then return end
   else
-    local low, high = self.aabbMin[first], self.aabbMax[first]
-    local otherLow, otherHigh = self.aabbMin[second], self.aabbMax[second]
-    if otherLow.X > high.X or otherHigh.X < low.X then return end
-    if otherLow.Y > high.Y or otherHigh.Y < low.Y then return end
-    if otherLow.Z > high.Z or otherHigh.Z < low.Z then return end
+    local low, high = self.boundsLow[first], self.boundsHigh[first]
+    local otherLow, otherHigh = self.boundsLow[second], self.boundsHigh[second]
+    if otherLow.x > high.x or otherHigh.x < low.x then return end
+    if otherLow.y > high.y or otherHigh.y < low.y then return end
+    if otherLow.z > high.z or otherHigh.z < low.z then return end
   end
 
   if first == second or not self.alive[first] or not self.alive[second] then return end
@@ -1055,19 +1055,19 @@ end
 
 function World:_collideSap()
   self:_sortOrder()
-  local {order, alive, aabbMin, aabbMax} = self
+  local {order, alive, boundsLow: aabbMin, boundsHigh: aabbMax} = self
   local count = #order
 
   for position = 1, count do
     local first = order[position]
     if not alive[first] then continue end
 
-    local reach = aabbMax[first].X
+    local reach = aabbMax[first].x
 
     for after = position + 1, count do
       local second = order[after]
       if not alive[second] then continue end
-      if aabbMin[second].X > reach then break end
+      if aabbMin[second].x > reach then break end
 
       tryPair(self, first, second)
     end
@@ -1078,8 +1078,8 @@ end
 --- the order the cells were first occupied.
 function World:_rebuildGridPairs()
   local {gridHeads: heads, gridKeys: keys, gridNext: nextIn, gridOccupied: occupied} = self
-  local {gridDenseKeys: dense, gridPairA: pairA, gridPairB: pairB} = self
-  local {gridKeyX: columns, gridKeyY: rows, gridKeyZ: layers} = self
+  local {gridDenseKeys: dense, gridPairFirst: pairA, gridPairSecond: pairB} = self
+  local {gridKeyColumn: columns, gridKeyRow: rows, gridKeyLayer: layers} = self
   local denseCount, pairCount = 0, 0
 
   for index = 1, #keys do
@@ -1129,7 +1129,7 @@ end
 local function buildStill(self, members: { number }): number
   if #members == 1 then return -members[1] end
 
-  local {aabbMin, aabbMax} = self
+  local {boundsLow: aabbMin, boundsHigh: aabbMax} = self
   local low, high = aabbMin[members[1]], aabbMax[members[1]]
   local least, most = low + high, low + high
 
@@ -1142,7 +1142,7 @@ local function buildStill(self, members: { number }): number
   end
 
   local spread = most - least
-  local axis = if spread.X >= spread.Y and spread.X >= spread.Z then 'X' elseif spread.Y >= spread.Z then 'Y' else 'Z'
+  local axis = if spread.x >= spread.y and spread.x >= spread.z then 'X' elseif spread.y >= spread.z then 'Y' else 'Z'
 
   -- Bodies whose centres are level, or are not numbers, stay in the order of their slots.
   table.sort(members, function(first: number, second: number)
@@ -1214,7 +1214,7 @@ end
 
 function World:_buildGridIndex(refreshAabbs, resting)
   local {gridHeads: heads, gridKeys: keys, gridNext: nextIn, gridLarge: large, gridOccupied: occupied} = self
-  local {sphereRadius: radii, pos, aabbMin, aabbMax, gridKey, gridX, gridY, gridZ} = self
+  local {sphereRadius: radii, position: pos, boundsLow: aabbMin, boundsHigh: aabbMax, gridKey, gridColumn: gridX, gridRow: gridY, gridLayer: gridZ} = self
   local cellSize, margin = self.broadphaseCellSize, self.contactMargin
   local movers = listMovers(self)
 
@@ -1243,7 +1243,7 @@ function World:_buildGridIndex(refreshAabbs, resting)
         if refreshAabbs then self:_updateAabb(body) end
 
         local low, high = aabbMin[body], aabbMax[body]
-        width, height, depth = high.X - low.X, high.Y - low.Y, high.Z - low.Z
+        width, height, depth = high.x - low.x, high.y - low.y, high.z - low.z
       end
 
       if gridKey[body] then
@@ -1255,15 +1255,15 @@ function World:_buildGridIndex(refreshAabbs, resting)
         local centre = pos[body]
 
         if
-          math.floor(centre.X / cellSize) ~= gridX[body]
-          or math.floor(centre.Y / cellSize) ~= gridY[body]
-          or math.floor(centre.Z / cellSize) ~= gridZ[body]
+          math.floor(centre.x / cellSize) ~= gridX[body]
+          or math.floor(centre.y / cellSize) ~= gridY[body]
+          or math.floor(centre.z / cellSize) ~= gridZ[body]
         then
           same = false
         end
       elseif width <= cellSize and height <= cellSize and depth <= cellSize then
         local centre = pos[body]
-        local column, row, layer = math.floor(centre.X / cellSize), math.floor(centre.Y / cellSize), math.floor(centre.Z / cellSize)
+        local column, row, layer = math.floor(centre.x / cellSize), math.floor(centre.y / cellSize), math.floor(centre.z / cellSize)
         if packCell(column, row, layer) then same = false end
       end
     end
@@ -1286,7 +1286,7 @@ function World:_buildGridIndex(refreshAabbs, resting)
   table.clear(large)
   buffer.fill(occupied, 0, 0)
 
-  local {gridKeyX: columns, gridKeyY: rows, gridKeyZ: layers} = self
+  local {gridKeyColumn: columns, gridKeyRow: rows, gridKeyLayer: layers} = self
   local smallCount, keyCount = 0, 0
 
   for _, body in movers do
@@ -1298,11 +1298,11 @@ function World:_buildGridIndex(refreshAabbs, resting)
       height, depth = width, width
     else
       local low, high = aabbMin[body], aabbMax[body]
-      width, height, depth = high.X - low.X, high.Y - low.Y, high.Z - low.Z
+      width, height, depth = high.x - low.x, high.y - low.y, high.z - low.z
     end
 
     local centre = pos[body]
-    local column, row, layer = math.floor(centre.X / cellSize), math.floor(centre.Y / cellSize), math.floor(centre.Z / cellSize)
+    local column, row, layer = math.floor(centre.x / cellSize), math.floor(centre.y / cellSize), math.floor(centre.z / cellSize)
     local key = width <= cellSize and height <= cellSize and depth <= cellSize and packCell(column, row, layer)
 
     if not key then
@@ -1346,8 +1346,8 @@ end
 
 function World:_collideGrid()
   self:_buildGridIndex(true, true)
-  local {gridHeads: heads, gridNext: nextIn, gridDenseKeys: dense, gridPairA: pairA, gridPairB: pairB} = self
-  local {sphereRadius: radii, aabbMin: lows, aabbMax: highs} = self
+  local {gridHeads: heads, gridNext: nextIn, gridDenseKeys: dense, gridPairFirst: pairA, gridPairSecond: pairB} = self
+  local {sphereRadius: radii, boundsLow: lows, boundsHigh: highs} = self
 
   -- In a heap most of the pairs a cell offers are apart, and two bodies that are not spheres are
   -- told apart here by their boxes, without the call: a sphere's box is not kept as it moves.
@@ -1374,9 +1374,9 @@ function World:_collideGrid()
 
           if not radii[other] then
             local otherLow, otherHigh = lows[other], highs[other]
-            if otherLow.X > high.X or otherHigh.X < low.X then continue end
-            if otherLow.Y > high.Y or otherHigh.Y < low.Y then continue end
-            if otherLow.Z > high.Z or otherHigh.Z < low.Z then continue end
+            if otherLow.x > high.x or otherHigh.x < low.x then continue end
+            if otherLow.y > high.y or otherHigh.y < low.y then continue end
+            if otherLow.z > high.z or otherHigh.z < low.z then continue end
           end
 
           tryPair(self, first, other)
@@ -1410,9 +1410,9 @@ function World:_collideGrid()
 
           if not radii[other] then
             local otherLow, otherHigh = lows[other], highs[other]
-            if otherLow.X > high.X or otherHigh.X < low.X then continue end
-            if otherLow.Y > high.Y or otherHigh.Y < low.Y then continue end
-            if otherLow.Z > high.Z or otherHigh.Z < low.Z then continue end
+            if otherLow.x > high.x or otherHigh.x < low.x then continue end
+            if otherLow.y > high.y or otherHigh.y < low.y then continue end
+            if otherLow.z > high.z or otherHigh.z < low.z then continue end
           end
 
           tryPair(self, first, other)
@@ -1429,10 +1429,10 @@ function World:_collideGrid()
   -- The static bodies are in a tree, and everything else looks itself up in it.
   if root ~= 0 then
     local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = self
-    local {sphereRadius: radii, pos, aabbMin, aabbMax} = self
+    local {sphereRadius: radii, position: pos, boundsLow: aabbMin, boundsHigh: aabbMax} = self
     local margin = self.contactMargin
     local rest, stillSettled = self.rest, #self.unsettled == 0
-    local {nearStill, nearLow: nearLows, nearHigh: nearHighs, nearEpoch: nearEpochs, stillEpoch: epoch} = self
+    local {nearStill, nearLows: nearLows, nearHighs: nearHighs, nearEpochs: nearEpochs, stillEpoch: epoch} = self
 
     for _, body in movers do
       -- A body at rest touches the static bodies it did, unless one of those has been moved.
@@ -1463,12 +1463,12 @@ function World:_collideGrid()
 
       if
         nearEpochs[body] ~= epoch
-        or low.X < nearLow.X
-        or low.Y < nearLow.Y
-        or low.Z < nearLow.Z
-        or high.X > nearHigh.X
-        or high.Y > nearHigh.Y
-        or high.Z > nearHigh.Z
+        or low.x < nearLow.x
+        or low.y < nearLow.y
+        or low.z < nearLow.z
+        or high.x > nearHigh.x
+        or high.y > nearHigh.y
+        or high.z > nearHigh.z
       then
         if not near then
           near = {}
@@ -1489,12 +1489,12 @@ function World:_collideGrid()
 
             if
               not (
-                low.X > nodeHigh.X
-                or high.X < nodeLow.X
-                or low.Y > nodeHigh.Y
-                or high.Y < nodeLow.Y
-                or low.Z > nodeHigh.Z
-                or high.Z < nodeLow.Z
+                low.x > nodeHigh.x
+                or high.x < nodeLow.x
+                or low.y > nodeHigh.y
+                or high.y < nodeLow.y
+                or low.z > nodeHigh.z
+                or high.z < nodeLow.z
               )
             then
               top += 1
@@ -1548,20 +1548,20 @@ function World:_collideGrid()
   end
 
   self:_sortOrder()
-  local {order, aabbMin, aabbMax} = self
+  local {order, boundsLow: aabbMin, boundsHigh: aabbMax} = self
   local count = #order
 
   for position = 1, count do
     local first = order[position]
     if not alive[first] or bodyType[first] == BODY_STATIC then continue end
 
-    local reach = aabbMax[first].X
+    local reach = aabbMax[first].x
     local firstLarge = not gridKey[first]
 
     for after = position + 1, count do
       local second = order[after]
       if not alive[second] or bodyType[second] == BODY_STATIC then continue end
-      if aabbMin[second].X > reach then break end
+      if aabbMin[second].x > reach then break end
       if firstLarge or not gridKey[second] then tryPair(self, first, second) end
     end
   end
@@ -1572,7 +1572,7 @@ end
 --- not been moved, or is asleep exactly where it was asleep at the last step: two such bodies
 --- touch as they did, so the pair is neither offered nor tested, however long a pile lies there.
 local function carryContacts(self, movers: { number })
-  local {rest, sleeping, pos, qv, qw, seenPos, seenTurn, seenTurnW} = self
+  local {rest, sleeping, position: pos, turn: qv, turnW: qw, seenPosition: seenPos, seenTurn, seenTurnW} = self
 
   local unseen = self.unseen
   local stirring, unseenCount = 0, 0
@@ -1609,8 +1609,8 @@ local function carryContacts(self, movers: { number })
   -- contacts are last step's, all of them, as they lie.
   if stirring == 0 and self.quiet and not self.changed then return true end
 
-  local {ca: bodiesA, cb: bodiesB, cn: normals, cp: points, cpen: depths} = self
-  local {cnormalImpulse: normalImpulses, ctangentImpulse1: tangentImpulses1, ctangentImpulse2: tangentImpulses2} = self
+  local {contactFirst: bodiesA, contactSecond: bodiesB, contactNormal: normals, contactPoint: points, contactDepth: depths} = self
+  local {normalImpulse: normalImpulses, tangentImpulse1: tangentImpulses1, tangentImpulse2: tangentImpulses2} = self
   local kept, pairs, lastFirst, lastSecond = 0, 0, 0, 0
 
   for contact = 1, self.contactCount do
@@ -1639,7 +1639,7 @@ end
 --- Notes where each sleeping body is, now that what it touches there is known, and takes the
 --- static bodies that had been moved to be at rest again.
 local function settle(self, movers: { number })
-  local {rest, pos, qv, qw, seenPos, seenTurn, seenTurnW, unsettled, alive, bodyType} = self
+  local {rest, position: pos, turn: qv, turnW: qw, seenPosition: seenPos, seenTurn, seenTurnW, unsettled, alive, bodyType} = self
 
   for _, body in self.unseen do
     seenPos[body], seenTurn[body], seenTurnW[body] = pos[body], qv[body], qw[body]
@@ -1677,21 +1677,21 @@ end
 
 local function pointVelocity(self,i,r)
     if self.sleeping[i] then return ZERO end
-    return self.linVel[i]+vector.cross(self.angVel[i],r)
+    return self.velocity[i]+vector.cross(self.spin[i],r)
 end
 
 impulseDenom = function(self,i,r,axis)
-    if self.invMass[i]==0 or self.sleeping[i] then return 0 end
+    if self.inverseMass[i]==0 or self.sleeping[i] then return 0 end
     local rx=vector.cross(r,axis)
     local ang=vector.cross(applyInvInertia(self,i,rx),r)
-    return self.invMass[i]+vector.dot(axis,ang)
+    return self.inverseMass[i]+vector.dot(axis,ang)
 end
 
 local function contactAxisResponse(self,i,r,axis)
-    if self.invMass[i]==0 or self.sleeping[i] then return 0,ZERO end
+    if self.inverseMass[i]==0 or self.sleeping[i] then return 0,ZERO end
     local rx=vector.cross(r,axis)
     local angular=if vector.dot(rx,rx)>EPS then applyInvInertia(self,i,rx) else ZERO
-    return self.invMass[i]+vector.dot(axis,vector.cross(angular,r)),angular
+    return self.inverseMass[i]+vector.dot(axis,vector.cross(angular,r)),angular
 end
 
 local function pairKey(a,b)
@@ -1720,7 +1720,7 @@ end
 
 function World:_buildIslands()
   local {islandParent: parent, islandSize: size, islandAwake: awake, islandRoots: roots} = self
-  local {alive, bodyType, sensor, sleeping, generation, joints, ca: bodiesA, cb: bodiesB} = self
+  local {alive, bodyType, sensor, sleeping, generation, joints, contactFirst: bodiesA, contactSecond: bodiesB} = self
   local movers = listMovers(self)
 
   for _, body in movers do
@@ -1784,9 +1784,9 @@ end
 --- Seeds a contact with the impulses of the cached contact nearest its anchors, if the pair
 --- touched last step and one of its cached contacts faces the same way.
 local function matchCachedContact(self, contact: number, firstAnchor: vector, secondAnchor: vector, tangent1: vector, tangent2: vector)
-  if not self.warmStarting or self.cbias[contact] > 0 then return end
+  if not self.warmStarting or self.contactBias[contact] > 0 then return end
 
-  local first, second = self.ca[contact], self.cb[contact]
+  local first, second = self.contactFirst[contact], self.contactSecond[contact]
   local entry = self.contactCache[pairKey(first, second)]
   local epoch = self.cacheEpoch
   if not entry or entry[CACHE_EPOCH] ~= epoch - 1 then return end
@@ -1798,7 +1798,7 @@ local function matchCachedContact(self, contact: number, firstAnchor: vector, se
   end
 
   local best, nearest = 0, self.manifoldMatchDistance * self.manifoldMatchDistance * 2
-  local normal = self.cn[contact]
+  local normal = self.contactNormal[contact]
   local used = entry[CACHE_USED_MASK] or 0
 
   for slot = 1, entry[CACHE_COUNT] or 0 do
@@ -1821,17 +1821,17 @@ local function matchCachedContact(self, contact: number, firstAnchor: vector, se
   local tangent = entry[record + 5] * factor
 
   entry[CACHE_USED_MASK] = bit32.bor(used, bit32.lshift(1, best - 1))
-  self.cnormalImpulse[contact] = entry[record + 4] * factor
-  self.ctangentImpulse1[contact] = vector.dot(tangent, tangent1)
-  self.ctangentImpulse2[contact] = vector.dot(tangent, tangent2)
+  self.normalImpulse[contact] = entry[record + 4] * factor
+  self.tangentImpulse1[contact] = vector.dot(tangent, tangent1)
+  self.tangentImpulse2[contact] = vector.dot(tangent, tangent2)
   self.warmStartedCount += 1
 end
 
 function World:_storeContactCache()
-  local {contactCache: cache, activeContacts: active, cacheEpoch: epoch, generation, pos, qv, qw} = self
-  local {ca: bodiesA, cb: bodiesB, cp: points, cn: normals, cla: firstAnchors, clb: secondAnchors} = self
-  local {ctangent1: tangents1, ctangent2: tangents2} = self
-  local {cnormalImpulse: normalImpulses, ctangentImpulse1: tangentImpulses1, ctangentImpulse2: tangentImpulses2} = self
+  local {contactCache: cache, activeContacts: active, cacheEpoch: epoch, generation, position: pos, turn: qv, turnW: qw} = self
+  local {contactFirst: bodiesA, contactSecond: bodiesB, contactPoint: points, contactNormal: normals, firstAnchor: firstAnchors, secondAnchor: secondAnchors} = self
+  local {tangent1: tangents1, tangent2: tangents2} = self
+  local {normalImpulse: normalImpulses, tangentImpulse1: tangentImpulses1, tangentImpulse2: tangentImpulses2} = self
 
   for index = 1, self.activeContactCount do
     local contact = active[index]
@@ -1878,7 +1878,7 @@ local function contactTangents(n)
     -- Pick the least-aligned cardinal axis to avoid degeneracy, then keep the
     -- basis fixed for the whole solve. This lets tangent effective mass be hoisted
     -- out of the velocity-iteration loop.
-    local ax,ay,az=math.abs(n.X),math.abs(n.Y),math.abs(n.Z)
+    local ax,ay,az=math.abs(n.x),math.abs(n.y),math.abs(n.z)
     local ref=if ax<=ay and ax<=az then XAXIS elseif ay<=az then YAXIS else ZAXIS
     local t1=safeUnit(vector.cross(n,ref),XAXIS)
     return t1,vector.cross(n,t1)
@@ -1888,9 +1888,9 @@ function World:_buildContactEvents()
   local epoch = self.contactEventEpoch + 1
   self.contactEventEpoch = epoch
 
-  local {contactPairSeen: seen, contactPairActive: touching, contactPairPrev: previous, contactPairNext: current} = self
-  local {contactPairA: pairA, contactPairB: pairB, contactPairSensor: pairSensor} = self
-  local {sensor, eventA, eventB, eventKind, eventSensor, ca: bodiesA, cb: bodiesB} = self
+  local {contactPairSeen: seen, contactPairActive: touching, contactPairsBefore: previous, contactPairsNow: current} = self
+  local {contactPairFirst: pairA, contactPairSecond: pairB, contactPairSensor: pairSensor} = self
+  local {sensor, eventFirst: eventA, eventSecond: eventB, eventKind, eventSensor, contactFirst: bodiesA, contactSecond: bodiesB} = self
   local eventCount = 0
 
   table.clear(current)
@@ -1929,12 +1929,12 @@ function World:_buildContactEvents()
     touching[key], pairA[key], pairB[key], pairSensor[key] = nil, nil, nil, nil
   end
 
-  self.contactPairPrev, self.contactPairNext = current, previous
+  self.contactPairsBefore, self.contactPairsNow = current, previous
   self.contactEventCount = eventCount
 end
 
 function World:_wakeContacts()
-  local {sensor, sleeping, bodyType, linVel, angVel, sleepTime, ca: bodiesA, cb: bodiesB, cpen: depths} = self
+  local {sensor, sleeping, bodyType, velocity: linVel, spin: angVel, sleepTime, contactFirst: bodiesA, contactSecond: bodiesB, contactDepth: depths} = self
   local speed, depth = self.wakeSpeed * self.wakeSpeed, self.wakePenetration
 
   for contact = 1, self.contactCount do
@@ -1959,15 +1959,15 @@ end
 
 function World:_prepareContacts(dt)
   self.warmStartedCount = 0
-  local {sensor, invMass, sleeping, pos, qv, qw, friction, restitution, linVel, angVel} = self
-  local {activeContacts: active, cactive: actives, ca: bodiesA, cb: bodiesB, cp: points, cn: normals, cpen: depths} = self
-  local {cra: firstArms, crb: secondArms, cla: firstAnchors, clb: secondAnchors} = self
-  local {cnormalMass: normalMasses, cnormalAngA: firstNormalTurns, cnormalAngB: secondNormalTurns} = self
-  local {ctangent1: tangents1, ctangent2: tangents2, ctangentMass1: tangentMasses1, ctangentMass2: tangentMasses2} = self
-  local {ctangentAng1A: firstTangentTurns1, ctangentAng1B: secondTangentTurns1} = self
-  local {ctangentAng2A: firstTangentTurns2, ctangentAng2B: secondTangentTurns2} = self
-  local {cfriction: frictions, crest: restitutions, cbias: biases} = self
-  local {cnormalImpulse: normalImpulses, ctangentImpulse1: tangentImpulses1, ctangentImpulse2: tangentImpulses2} = self
+  local {sensor, inverseMass: invMass, sleeping, position: pos, turn: qv, turnW: qw, friction, restitution, velocity: linVel, spin: angVel} = self
+  local {activeContacts: active, contactSolved: actives, contactFirst: bodiesA, contactSecond: bodiesB, contactPoint: points, contactNormal: normals, contactDepth: depths} = self
+  local {firstArm: firstArms, secondArm: secondArms, firstAnchor: firstAnchors, secondAnchor: secondAnchors} = self
+  local {normalMass: normalMasses, firstNormalTurn: firstNormalTurns, secondNormalTurn: secondNormalTurns} = self
+  local {tangent1: tangents1, tangent2: tangents2, tangentMass1: tangentMasses1, tangentMass2: tangentMasses2} = self
+  local {firstTangentTurn1: firstTangentTurns1, secondTangentTurn1: secondTangentTurns1} = self
+  local {firstTangentTurn2: firstTangentTurns2, secondTangentTurn2: secondTangentTurns2} = self
+  local {contactFriction: frictions, contactBounce: restitutions, contactBias: biases} = self
+  local {normalImpulse: normalImpulses, tangentImpulse1: tangentImpulses1, tangentImpulse2: tangentImpulses2} = self
   local {baumgarte, maxDepenetrationVelocity} = self
   local biasSlop, pace = math.max(self.penetrationSlop, self.baumgarteSlop), math.max(dt, 1e-5)
   local activeCount = 0
@@ -2058,27 +2058,27 @@ function World:_prepareContacts(dt)
 end
 
 applyPairImpulse = function(self,a,b,ra,rb,impulse)
-    if self.invMass[a]>0 and not self.sleeping[a] then
-        self.linVel[a]-=impulse*self.invMass[a]
+    if self.inverseMass[a]>0 and not self.sleeping[a] then
+        self.velocity[a]-=impulse*self.inverseMass[a]
         local spin=vector.cross(ra,impulse)
-        if vector.dot(spin,spin)>EPS then self.angVel[a]-=applyInvInertia(self,a,spin) end
+        if vector.dot(spin,spin)>EPS then self.spin[a]-=applyInvInertia(self,a,spin) end
     end
-    if self.invMass[b]>0 and not self.sleeping[b] then
-        self.linVel[b]+=impulse*self.invMass[b]
+    if self.inverseMass[b]>0 and not self.sleeping[b] then
+        self.velocity[b]+=impulse*self.inverseMass[b]
         local spin=vector.cross(rb,impulse)
-        if vector.dot(spin,spin)>EPS then self.angVel[b]+=applyInvInertia(self,b,spin) end
+        if vector.dot(spin,spin)>EPS then self.spin[b]+=applyInvInertia(self,b,spin) end
     end
 end
 
 function World:_solveContacts(dt)
-  local {alive, sleeping, invMass, linVel, angVel, restitutionThreshold, activeContacts: active} = self
-  local {ca: bodiesA, cb: bodiesB, cn: normals, cra: firstArms, crb: secondArms} = self
-  local {cnormalMass: normalMasses, cnormalAngA: firstNormalTurns, cnormalAngB: secondNormalTurns} = self
-  local {ctangent1: tangents1, ctangent2: tangents2, ctangentMass1: tangentMasses1, ctangentMass2: tangentMasses2} = self
-  local {ctangentAng1A: firstTangentTurns1, ctangentAng1B: secondTangentTurns1} = self
-  local {ctangentAng2A: firstTangentTurns2, ctangentAng2B: secondTangentTurns2} = self
-  local {cfriction: frictions, crest: restitutions, cbias: biases} = self
-  local {cnormalImpulse: normalImpulses, ctangentImpulse1: tangentImpulses1, ctangentImpulse2: tangentImpulses2} = self
+  local {alive, sleeping, inverseMass: invMass, velocity: linVel, spin: angVel, restitutionThreshold, activeContacts: active} = self
+  local {contactFirst: bodiesA, contactSecond: bodiesB, contactNormal: normals, firstArm: firstArms, secondArm: secondArms} = self
+  local {normalMass: normalMasses, firstNormalTurn: firstNormalTurns, secondNormalTurn: secondNormalTurns} = self
+  local {tangent1: tangents1, tangent2: tangents2, tangentMass1: tangentMasses1, tangentMass2: tangentMasses2} = self
+  local {firstTangentTurn1: firstTangentTurns1, secondTangentTurn1: secondTangentTurns1} = self
+  local {firstTangentTurn2: firstTangentTurns2, secondTangentTurn2: secondTangentTurns2} = self
+  local {contactFriction: frictions, contactBounce: restitutions, contactBias: biases} = self
+  local {normalImpulse: normalImpulses, tangentImpulse1: tangentImpulses1, tangentImpulse2: tangentImpulses2} = self
 
   for iteration = 1, self.velocityIterations do
     for index = 1, self.activeContactCount do
@@ -2165,13 +2165,13 @@ local function solvePointAxis(self,a,b,ra,rb,error,axis,stiffness,damping,dt)
 end
 
 local function angularDenom(self,i,axis)
-    if self.invMass[i]==0 or self.sleeping[i] then return 0 end
+    if self.inverseMass[i]==0 or self.sleeping[i] then return 0 end
     return vector.dot(axis,applyInvInertia(self,i,axis))
 end
 
 local function applyAngularPairImpulse(self,a,b,impulse)
-    if self.invMass[a]>0 and not self.sleeping[a] then self.angVel[a]-=applyInvInertia(self,a,impulse) end
-    if self.invMass[b]>0 and not self.sleeping[b] then self.angVel[b]+=applyInvInertia(self,b,impulse) end
+    if self.inverseMass[a]>0 and not self.sleeping[a] then self.spin[a]-=applyInvInertia(self,a,impulse) end
+    if self.inverseMass[b]>0 and not self.sleeping[b] then self.spin[b]+=applyInvInertia(self,b,impulse) end
 end
 
 local function solveBallAxes(self,j,a,b,ra,rb,wa,wb,dt)
@@ -2187,11 +2187,11 @@ function World:_solveJoints(dt)
         if not j then continue end
         local a,b=j.a,j.b
         if not self.alive[a] or not self.alive[b] or self.generation[a]~=j.ga or self.generation[b]~=j.gb then self:_dropJoint(id,j); continue end
-        if (self.invMass[a]==0 or self.sleeping[a]) and (self.invMass[b]==0 or self.sleeping[b]) then continue end
-        local ra=qRotate(self.qv[a],self.qw[a],j.la)
-        local rb=qRotate(self.qv[b],self.qw[b],j.lb)
-        local wa=self.pos[a]+ra
-        local wb=self.pos[b]+rb
+        if (self.inverseMass[a]==0 or self.sleeping[a]) and (self.inverseMass[b]==0 or self.sleeping[b]) then continue end
+        local ra=qRotate(self.turn[a],self.turnW[a],j.la)
+        local rb=qRotate(self.turn[b],self.turnW[b],j.lb)
+        local wa=self.position[a]+ra
+        local wb=self.position[b]+rb
         if j.kind==JOINT_DISTANCE then
             local d=wb-wa
             local len=vector.magnitude(d)
@@ -2208,26 +2208,26 @@ function World:_solveJoints(dt)
         else
             solveBallAxes(self,j,a,b,ra,rb,wa,wb,dt)
             if j.kind==JOINT_HINGE then
-                local axisA=qRotate(self.qv[a],self.qw[a],j.axisA)
-                local axisB=qRotate(self.qv[b],self.qw[b],j.axisB)
+                local axisA=qRotate(self.turn[a],self.turnW[a],j.axisA)
+                local axisB=qRotate(self.turn[b],self.turnW[b],j.axisB)
                 local hinge=safeUnit(axisA+axisB,axisA)
                 local t1,t2=contactTangents(hinge)
                 local error=vector.cross(axisA,axisB)
-                local wrel=self.angVel[b]-self.angVel[a]
+                local wrel=self.spin[b]-self.spin[a]
                 local stiffness=j.angularStiffness/math.max(dt,1e-5)
                 local denom1=angularDenom(self,a,t1)+angularDenom(self,b,t1)
                 if denom1>EPS then
                     local lambda=-(vector.dot(wrel,t1)+vector.dot(error,t1)*stiffness)/denom1
                     applyAngularPairImpulse(self,a,b,t1*lambda)
                 end
-                wrel=self.angVel[b]-self.angVel[a]
+                wrel=self.spin[b]-self.spin[a]
                 local denom2=angularDenom(self,a,t2)+angularDenom(self,b,t2)
                 if denom2>EPS then
                     local lambda=-(vector.dot(wrel,t2)+vector.dot(error,t2)*stiffness)/denom2
                     applyAngularPairImpulse(self,a,b,t2*lambda)
                 end
                 if j.motorSpeed~=nil and j.maxMotorTorque>0 then
-                    wrel=self.angVel[b]-self.angVel[a]
+                    wrel=self.spin[b]-self.spin[a]
                     local denom=angularDenom(self,a,hinge)+angularDenom(self,b,hinge)
                     if denom>EPS then
                         local lambda=(j.motorSpeed-vector.dot(wrel,hinge))/denom
@@ -2245,8 +2245,8 @@ function World:_solveJoints(dt)
 end
 
 function World:_correctPositions()
-  local {sleeping, invMass, pos, positionIterations: iterations, penetrationSlop: slop, activeContacts: active} = self
-  local {ca: bodiesA, cb: bodiesB, cn: normals, cpen: depths} = self
+  local {sleeping, inverseMass: invMass, position: pos, positionIterations: iterations, penetrationSlop: slop, activeContacts: active} = self
+  local {contactFirst: bodiesA, contactSecond: bodiesB, contactNormal: normals, contactDepth: depths} = self
   local percent = self.positionCorrection / iterations
 
   for _ = 1, iterations do
@@ -2269,7 +2269,7 @@ function World:_correctPositions()
 end
 
 function World:_integrate(dt)
-  local {bodyType, sleeping, invMass, ccd, pos, prevPos, linVel, angVel, force, torque, qv, qw} = self
+  local {bodyType, sleeping, inverseMass: invMass, swept: ccd, position: pos, previousPosition: prevPos, velocity: linVel, spin: angVel, force, torque, turn: qv, turnW: qw} = self
   local {gravity, linearDamping, angularDamping} = self
 
   for _, body in listMovers(self) do
@@ -2308,15 +2308,15 @@ end
 
 function World:_sweepSphereMesh(geom,startPos,endPos,radius)
     local shape=self.shape[geom]
-    local gqv,gqw,gp=self.qv[geom],self.qw[geom],self.pos[geom]
+    local gqv,gqw,gp=self.turn[geom],self.turnW[geom],self.position[geom]
     local ls=qInvRotate(gqv,gqw,startPos-gp)
     local le=qInvRotate(gqv,gqw,endPos-gp)
     local e=vector.create(radius,radius,radius)
-    local mn=vector.create(math.min(ls.X,le.X),math.min(ls.Y,le.Y),math.min(ls.Z,le.Z))-e
-    local mx=vector.create(math.max(ls.X,le.X),math.max(ls.Y,le.Y),math.max(ls.Z,le.Z))+e
+    local mn=vector.create(math.min(ls.x,le.x),math.min(ls.y,le.y),math.min(ls.z,le.z))-e
+    local mx=vector.create(math.max(ls.x,le.x),math.max(ls.y,le.y),math.max(ls.z,le.z))+e
     local cs=shape.cellSize
-    local x0,y0,z0=math.floor(mn.X/cs),math.floor(mn.Y/cs),math.floor(mn.Z/cs)
-    local x1,y1,z1=math.floor(mx.X/cs),math.floor(mx.Y/cs),math.floor(mx.Z/cs)
+    local x0,y0,z0=math.floor(mn.x/cs),math.floor(mn.y/cs),math.floor(mn.z/cs)
+    local x1,y1,z1=math.floor(mx.x/cs),math.floor(mx.y/cs),math.floor(mx.z/cs)
     local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
     self.meshMarkEpoch+=1
     local epoch=self.meshMarkEpoch
@@ -2361,14 +2361,14 @@ end
 
 function World:_sweepSphereHeightfield(geom,startPos,endPos,radius)
     local shape=self.shape[geom]
-    local gqv,gqw,gp=self.qv[geom],self.qw[geom],self.pos[geom]
+    local gqv,gqw,gp=self.turn[geom],self.turnW[geom],self.position[geom]
     local ls=qInvRotate(gqv,gqw,startPos-gp)
     local le=qInvRotate(gqv,gqw,endPos-gp)
     local o=shape.origin
-    local x0=clamp(math.floor((math.min(ls.X,le.X)-radius-o.X)/shape.cellSizeX),0,shape.width-2)
-    local x1=clamp(math.floor((math.max(ls.X,le.X)+radius-o.X)/shape.cellSizeX),0,shape.width-2)
-    local z0=clamp(math.floor((math.min(ls.Z,le.Z)-radius-o.Z)/shape.cellSizeZ),0,shape.depth-2)
-    local z1=clamp(math.floor((math.max(ls.Z,le.Z)+radius-o.Z)/shape.cellSizeZ),0,shape.depth-2)
+    local x0=clamp(math.floor((math.min(ls.x,le.x)-radius-o.x)/shape.cellSizeX),0,shape.width-2)
+    local x1=clamp(math.floor((math.max(ls.x,le.x)+radius-o.x)/shape.cellSizeX),0,shape.width-2)
+    local z0=clamp(math.floor((math.min(ls.z,le.z)-radius-o.z)/shape.cellSizeZ),0,shape.depth-2)
+    local z1=clamp(math.floor((math.max(ls.z,le.z)+radius-o.z)/shape.cellSizeZ),0,shape.depth-2)
     local bestT,bestN=1,nil
     for z=z0,z1 do for x=x0,x1 do
         local v00=heightVertex(shape,x,z)
@@ -2387,7 +2387,7 @@ end
 
 function World:_sweepSphereCompound(geom,startPos,endPos,radius)
     local shape=self.shape[geom]
-    local bp,bqv,bqw=self.pos[geom],self.qv[geom],self.qw[geom]
+    local bp,bqv,bqw=self.position[geom],self.turn[geom],self.turnW[geom]
     local bestT,bestN=1,nil
     for k=1,shape.count do
         local cp=bp+qRotate(bqv,bqw,shape.positions[k])
@@ -2409,14 +2409,14 @@ function World:_sweepSphereCompound(geom,startPos,endPos,radius)
 end
 
 function World:_ccd()
-    self.ccdHitCount=0
-    if self.ccdCount==0 then return end
+    self.sweptHits=0
+    if self.sweptCount==0 then return end
     for i=1,self.high do
-        if not self.alive[i] or self.bodyType[i]~=BODY_DYNAMIC or self.sleeping[i] or not self.ccd[i] then continue end
+        if not self.alive[i] or self.bodyType[i]~=BODY_DYNAMIC or self.sleeping[i] or not self.swept[i] then continue end
         local shape=self.shape[i]
         if shape.kind~=SHAPE_SPHERE then continue end -- CCD is intentionally sphere-first.
-        local start=self.prevPos[i]
-        local finish=self.pos[i]
+        local start=self.previousPosition[i]
+        local finish=self.position[i]
         local motion=finish-start
         local len2=vector.dot(motion,motion)
         if len2<=EPS then continue end
@@ -2427,9 +2427,9 @@ function World:_ccd()
             local target=self.shape[j]
             local t,n
             if target.kind==SHAPE_SPHERE then
-                t,n=sweepSphereSphere(start,finish,shape.radius,self.pos[j],target.radius)
+                t,n=sweepSphereSphere(start,finish,shape.radius,self.position[j],target.radius)
             elseif target.kind==SHAPE_BOX then
-                t,n=sweepSphereBox(start,finish,shape.radius,self.pos[j],self.qv[j],self.qw[j],target.halfExtents)
+                t,n=sweepSphereBox(start,finish,shape.radius,self.position[j],self.turn[j],self.turnW[j],target.halfExtents)
             elseif target.kind==SHAPE_MESH then
                 t,n=self:_sweepSphereMesh(j,start,finish,shape.radius)
             elseif target.kind==SHAPE_HEIGHTFIELD then
@@ -2442,13 +2442,13 @@ function World:_ccd()
         if bestN then
             local len=math.sqrt(len2)
             local backoff=if len>EPS then math.min(self.ccdSlop/len,bestT) else 0
-            self.pos[i]=start+motion*(bestT-backoff)
-            local vn=vector.dot(self.linVel[i],bestN)
+            self.position[i]=start+motion*(bestT-backoff)
+            local vn=vector.dot(self.velocity[i],bestN)
             if vn<0 then
                 local rest=math.max(self.restitution[i],self.restitution[bestJ])
-                self.linVel[i]-=bestN*(vn*(1+rest))
+                self.velocity[i]-=bestN*(vn*(1+rest))
             end
-            self.ccdHitCount+=1
+            self.sweptHits+=1
         end
     end
 end
@@ -2457,7 +2457,7 @@ end
 function World:_sleepIndependent(dt)
   if not self.allowSleep then return end
 
-  local {bodyType, sleeping, linVel, angVel, sleepTime, sleepDelay} = self
+  local {bodyType, sleeping, velocity: linVel, spin: angVel, sleepTime, sleepDelay} = self
   local linear, angular = self.sleepLinear * self.sleepLinear, self.sleepAngular * self.sleepAngular
   local count = 0
 
@@ -2489,8 +2489,8 @@ end
 function World:_sleep(dt)
   if not self.allowSleep then return end
 
-  local {islandParent: parent, islandCanSleep: canSleep, islandMinTime: leastRest, islandRoots: roots} = self
-  local {linVel, angVel, sleepTime, sleeping, sleepDelay} = self
+  local {islandParent: parent, islandCanSleep: canSleep, islandLeastRest: leastRest, islandRoots: roots} = self
+  local {velocity: linVel, spin: angVel, sleepTime, sleeping, sleepDelay} = self
   local linear, angular = self.sleepLinear * self.sleepLinear, self.sleepAngular * self.sleepAngular
   local movers = listMovers(self)
 
@@ -2584,17 +2584,17 @@ end
 
 function World:_rayMesh(i,origin,dir,maxDist)
     local shape=self.shape[i]
-    local lo=qInvRotate(self.qv[i],self.qw[i],origin-self.pos[i])
-    local ld=qInvRotate(self.qv[i],self.qw[i],dir)
+    local lo=qInvRotate(self.turn[i],self.turnW[i],origin-self.position[i])
+    local ld=qInvRotate(self.turn[i],self.turnW[i],dir)
     local enter,exit=rayAabbInterval(lo,ld,maxDist,shape.localMin,shape.localMax)
     if not enter then return nil end
     local a=lo+ld*math.max(enter,0)
     local b=lo+ld*exit
-    local mn=vector.create(math.min(a.X,b.X),math.min(a.Y,b.Y),math.min(a.Z,b.Z))
-    local mx=vector.create(math.max(a.X,b.X),math.max(a.Y,b.Y),math.max(a.Z,b.Z))
+    local mn=vector.create(math.min(a.x,b.x),math.min(a.y,b.y),math.min(a.z,b.z))
+    local mx=vector.create(math.max(a.x,b.x),math.max(a.y,b.y),math.max(a.z,b.z))
     local cs=shape.cellSize
-    local x0,y0,z0=math.floor(mn.X/cs),math.floor(mn.Y/cs),math.floor(mn.Z/cs)
-    local x1,y1,z1=math.floor(mx.X/cs),math.floor(mx.Y/cs),math.floor(mx.Z/cs)
+    local x0,y0,z0=math.floor(mn.x/cs),math.floor(mn.y/cs),math.floor(mn.z/cs)
+    local x1,y1,z1=math.floor(mx.x/cs),math.floor(mx.y/cs),math.floor(mx.z/cs)
     local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
     self.meshMarkEpoch+=1
     local epoch=self.meshMarkEpoch
@@ -2626,22 +2626,22 @@ function World:_rayMesh(i,origin,dir,maxDist)
     if bestTri==nil then return nil end
     local ta,tb,tc=meshTriangle(shape,bestTri)
     local bestN=triangleRayNormal(ta,tb,tc,ld)
-    return bestT,qRotate(self.qv[i],self.qw[i],bestN),origin+dir*bestT
+    return bestT,qRotate(self.turn[i],self.turnW[i],bestN),origin+dir*bestT
 end
 
 function World:_rayHeightfield(i,origin,dir,maxDist)
     local shape=self.shape[i]
-    local lo=qInvRotate(self.qv[i],self.qw[i],origin-self.pos[i])
-    local ld=qInvRotate(self.qv[i],self.qw[i],dir)
+    local lo=qInvRotate(self.turn[i],self.turnW[i],origin-self.position[i])
+    local ld=qInvRotate(self.turn[i],self.turnW[i],dir)
     local enter,exit=rayAabbInterval(lo,ld,maxDist,shape.localMin,shape.localMax)
     if not enter then return nil end
     local a=lo+ld*math.max(enter,0)
     local b=lo+ld*exit
     local o=shape.origin
-    local x0=clamp(math.floor((math.min(a.X,b.X)-o.X)/shape.cellSizeX),0,shape.width-2)
-    local x1=clamp(math.floor((math.max(a.X,b.X)-o.X)/shape.cellSizeX),0,shape.width-2)
-    local z0=clamp(math.floor((math.min(a.Z,b.Z)-o.Z)/shape.cellSizeZ),0,shape.depth-2)
-    local z1=clamp(math.floor((math.max(a.Z,b.Z)-o.Z)/shape.cellSizeZ),0,shape.depth-2)
+    local x0=clamp(math.floor((math.min(a.x,b.x)-o.x)/shape.cellSizeX),0,shape.width-2)
+    local x1=clamp(math.floor((math.max(a.x,b.x)-o.x)/shape.cellSizeX),0,shape.width-2)
+    local z0=clamp(math.floor((math.min(a.z,b.z)-o.z)/shape.cellSizeZ),0,shape.depth-2)
+    local z1=clamp(math.floor((math.max(a.z,b.z)-o.z)/shape.cellSizeZ),0,shape.depth-2)
     local bestT,bestA,bestB,bestC=maxDist,nil,nil,nil
     for z=z0,z1 do for x=x0,x1 do
         local v00=heightVertex(shape,x,z)
@@ -2655,13 +2655,13 @@ function World:_rayHeightfield(i,origin,dir,maxDist)
     end end
     if not bestA then return nil end
     local bestN=triangleRayNormal(bestA,bestB,bestC,ld)
-    return bestT,qRotate(self.qv[i],self.qw[i],bestN),origin+dir*bestT
+    return bestT,qRotate(self.turn[i],self.turnW[i],bestN),origin+dir*bestT
 end
 
 
 function World:_rayCompound(i,origin,dir,maxDist)
     local shape=self.shape[i]
-    local bp,bqv,bqw=self.pos[i],self.qv[i],self.qw[i]
+    local bp,bqv,bqw=self.position[i],self.turn[i],self.turnW[i]
     local bestT,bestN,bestP=maxDist,nil,nil
     for k=1,shape.count do
         local cp=bp+qRotate(bqv,bqw,shape.positions[k])
@@ -2679,15 +2679,15 @@ local function raycastBody(self, body: number, origin: vector, dir: vector, reac
 
   -- A sphere's box is not kept current as it moves, and the sphere is as quick to test as a box.
   local shape = self.shape[body]
-  if shape.kind == SHAPE_SPHERE then return raySphere(origin, dir, reach, self.pos[body], shape.radius) end
-  if not rayAabbInterval(origin, dir, reach, self.aabbMin[body], self.aabbMax[body]) then return nil end
+  if shape.kind == SHAPE_SPHERE then return raySphere(origin, dir, reach, self.position[body], shape.radius) end
+  if not rayAabbInterval(origin, dir, reach, self.boundsLow[body], self.boundsHigh[body]) then return nil end
 
   local kind = shape.kind
   if kind == SHAPE_MESH then return self:_rayMesh(body, origin, dir, reach) end
   if kind == SHAPE_HEIGHTFIELD then return self:_rayHeightfield(body, origin, dir, reach) end
   if kind == SHAPE_COMPOUND then return self:_rayCompound(body, origin, dir, reach) end
 
-  return rayPrimitiveShape(shape, self.pos[body], self.qv[body], self.qw[body], origin, dir, reach)
+  return rayPrimitiveShape(shape, self.position[body], self.turn[body], self.turnW[body], origin, dir, reach)
 end
 
 function World:_raycastRawScan(origin, dir, maxDistance, mask)
@@ -2734,7 +2734,7 @@ function World:_raycastRaw(origin, direction, maxDistance, mask)
 
   if entry ~= 0 then
     local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack, stillNear: nears} = self
-    local {aabbMin, aabbMax} = self
+    local {boundsLow: aabbMin, boundsHigh: aabbMax} = self
     local top = 0
 
     -- The nearer half of a node first, so that what is struck there rules out the further half
@@ -2789,31 +2789,31 @@ function World:_raycastRaw(origin, direction, maxDistance, mask)
   if bestDistance == math.huge then return self:_raycastRawScan(origin, dir, maxDistance, mask) end
 
   local cellSize = self.broadphaseCellSize
-  local estimated = (math.abs(dir.X) + math.abs(dir.Y) + math.abs(dir.Z)) * bestDistance / cellSize + 3
+  local estimated = (math.abs(dir.x) + math.abs(dir.y) + math.abs(dir.z)) * bestDistance / cellSize + 3
   if estimated > self.queryRayCellLimit then return self:_raycastRawScan(origin, dir, maxDistance, mask) end
 
   local epoch = self.queryMarkEpoch + 1
   self.queryMarkEpoch = epoch
 
   local {queryMarks: marks, gridHeads: heads, gridNext: nextIn, gridOccupied: occupied} = self
-  local column, row, layer = math.floor(origin.X / cellSize), math.floor(origin.Y / cellSize), math.floor(origin.Z / cellSize)
+  local column, row, layer = math.floor(origin.x / cellSize), math.floor(origin.y / cellSize), math.floor(origin.z / cellSize)
 
   -- An origin that is not a number is in no cell, so nothing in the grid is in the ray's way, and
   -- a cell that is not a number has no byte in the filter to ask for.
   if column ~= column or row ~= row or layer ~= layer then return bestBody, bestDistance, bestPoint, bestNormal end
 
-  local stepX = if dir.X > EPS then 1 elseif dir.X < -EPS then -1 else 0
-  local stepY = if dir.Y > EPS then 1 elseif dir.Y < -EPS then -1 else 0
-  local stepZ = if dir.Z > EPS then 1 elseif dir.Z < -EPS then -1 else 0
-  local spanX = if stepX ~= 0 then cellSize / math.abs(dir.X) else math.huge
-  local spanY = if stepY ~= 0 then cellSize / math.abs(dir.Y) else math.huge
-  local spanZ = if stepZ ~= 0 then cellSize / math.abs(dir.Z) else math.huge
+  local stepX = if dir.x > EPS then 1 elseif dir.x < -EPS then -1 else 0
+  local stepY = if dir.y > EPS then 1 elseif dir.y < -EPS then -1 else 0
+  local stepZ = if dir.z > EPS then 1 elseif dir.z < -EPS then -1 else 0
+  local spanX = if stepX ~= 0 then cellSize / math.abs(dir.x) else math.huge
+  local spanY = if stepY ~= 0 then cellSize / math.abs(dir.y) else math.huge
+  local spanZ = if stepZ ~= 0 then cellSize / math.abs(dir.z) else math.huge
   local wallX = if stepX > 0 then (column + 1) * cellSize else column * cellSize
   local wallY = if stepY > 0 then (row + 1) * cellSize else row * cellSize
   local wallZ = if stepZ > 0 then (layer + 1) * cellSize else layer * cellSize
-  local nextX = if stepX ~= 0 then (wallX - origin.X) / dir.X else math.huge
-  local nextY = if stepY ~= 0 then (wallY - origin.Y) / dir.Y else math.huge
-  local nextZ = if stepZ ~= 0 then (wallZ - origin.Z) / dir.Z else math.huge
+  local nextX = if stepX ~= 0 then (wallX - origin.x) / dir.x else math.huge
+  local nextY = if stepY ~= 0 then (wallY - origin.y) / dir.y else math.huge
+  local nextZ = if stepZ ~= 0 then (wallZ - origin.z) / dir.z else math.huge
   if nextX < 0 then nextX = 0 end
   if nextY < 0 then nextY = 0 end
   if nextZ < 0 then nextZ = 0 end
@@ -2898,10 +2898,10 @@ function World:_sphereCastRaw(startPos, endPos, radius, mask, ignoreHandle)
 
   local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
   local reach = vector.create(radius, radius, radius)
-  local low = vector.create(math.min(startPos.X, endPos.X), math.min(startPos.Y, endPos.Y), math.min(startPos.Z, endPos.Z)) - reach
-  local high = vector.create(math.max(startPos.X, endPos.X), math.max(startPos.Y, endPos.Y), math.max(startPos.Z, endPos.Z)) + reach
+  local low = vector.create(math.min(startPos.x, endPos.x), math.min(startPos.y, endPos.y), math.min(startPos.z, endPos.z)) - reach
+  local high = vector.create(math.max(startPos.x, endPos.x), math.max(startPos.y, endPos.y), math.max(startPos.z, endPos.z)) + reach
   local handles, count = self:queryAabb(low, high, mask, self.castCandidates)
-  local {shape, pos, qv, qw} = self
+  local {shape, position: pos, turn: qv, turnW: qw} = self
   local bestFraction = 1
   local bestNormal, bestBody
 
@@ -2987,7 +2987,7 @@ end
 --- world space, three corners each. Returns how many triangles.
 local function gatherTriangles(self, geom: number, centre: vector, reach: number, out: { vector }): number
   local shape = self.shape[geom]
-  local turn, turnW, origin = self.qv[geom], self.qw[geom], self.pos[geom]
+  local turn, turnW, origin = self.turn[geom], self.turnW[geom], self.position[geom]
   local inside = qInvRotate(turn, turnW, centre - origin)
   local count = 0
 
@@ -3000,10 +3000,10 @@ local function gatherTriangles(self, geom: number, centre: vector, reach: number
 
   if shape.kind == SHAPE_HEIGHTFIELD then
     local base = shape.origin
-    local firstColumn = clamp(math.floor((inside.X - reach - base.X) / shape.cellSizeX), 0, shape.width - 2)
-    local lastColumn = clamp(math.floor((inside.X + reach - base.X) / shape.cellSizeX), 0, shape.width - 2)
-    local firstRow = clamp(math.floor((inside.Z - reach - base.Z) / shape.cellSizeZ), 0, shape.depth - 2)
-    local lastRow = clamp(math.floor((inside.Z + reach - base.Z) / shape.cellSizeZ), 0, shape.depth - 2)
+    local firstColumn = clamp(math.floor((inside.x - reach - base.x) / shape.cellSizeX), 0, shape.width - 2)
+    local lastColumn = clamp(math.floor((inside.x + reach - base.x) / shape.cellSizeX), 0, shape.width - 2)
+    local firstRow = clamp(math.floor((inside.z - reach - base.z) / shape.cellSizeZ), 0, shape.depth - 2)
+    local lastRow = clamp(math.floor((inside.z + reach - base.z) / shape.cellSizeZ), 0, shape.depth - 2)
 
     for row = firstRow, lastRow do
       for column = firstColumn, lastColumn do
@@ -3018,9 +3018,9 @@ local function gatherTriangles(self, geom: number, centre: vector, reach: number
   end
 
   local cellSize = shape.cellSize
-  local firstColumn, lastColumn = math.floor((inside.X - reach) / cellSize), math.floor((inside.X + reach) / cellSize)
-  local firstRow, lastRow = math.floor((inside.Y - reach) / cellSize), math.floor((inside.Y + reach) / cellSize)
-  local firstLayer, lastLayer = math.floor((inside.Z - reach) / cellSize), math.floor((inside.Z + reach) / cellSize)
+  local firstColumn, lastColumn = math.floor((inside.x - reach) / cellSize), math.floor((inside.x + reach) / cellSize)
+  local firstRow, lastRow = math.floor((inside.y - reach) / cellSize), math.floor((inside.y + reach) / cellSize)
+  local firstLayer, lastLayer = math.floor((inside.z - reach) / cellSize), math.floor((inside.z + reach) / cellSize)
   local cells = (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1)
 
   if cells > self.meshQueryCellLimit then
@@ -3096,7 +3096,7 @@ end
 --- something that sweeps several times in one place, as a character does, asks the world once.
 --- `ignored` is a slot, not a handle. Returns as `_capsuleCastRaw` does.
 function World:_capsuleCastAmong(handles, count, startPos, motion, length, radius, halfHeight, ignored)
-  local {shape, pos, qv, qw, aabbMin, aabbMax, castCapsule: capsule, castTriangles: triangles} = self
+  local {shape, position: pos, turn: qv, turnW: qw, boundsLow: aabbMin, boundsHigh: aabbMax, castCapsule: capsule, castTriangles: triangles} = self
   local reach = vector.create(radius, halfHeight + radius, radius)
   local heading = motion / length
   local bestFraction = 1
@@ -3221,7 +3221,7 @@ end
 --- What an upright capsule overlaps of the bodies a box query has just answered with. `ignored`
 --- is a slot, not a handle. Returns as `capsuleContacts` does.
 function World:_capsuleContactsAmong(found, count, position, radius, halfHeight, ignored, out)
-  local {shape, pos, qv, qw, castCapsule: capsule, castTriangles: triangles} = self
+  local {shape, position: pos, turn: qv, turnW: qw, castCapsule: capsule, castTriangles: triangles} = self
   local handles, normals, depths, points = out.handles or {}, out.normals or {}, out.depths or {}, out.points or {}
   local rows = 0
 
@@ -3355,18 +3355,18 @@ local function bodyOverlapsAabb(self, body: number, low: vector, high: vector): 
   local radius = self.sphereRadius[body]
 
   if radius then
-    local centre, reach = self.pos[body], radius + self.contactMargin
-    if centre.X + reach < low.X or centre.X - reach > high.X then return false end
-    if centre.Y + reach < low.Y or centre.Y - reach > high.Y then return false end
+    local centre, reach = self.position[body], radius + self.contactMargin
+    if centre.x + reach < low.x or centre.x - reach > high.x then return false end
+    if centre.y + reach < low.y or centre.y - reach > high.y then return false end
 
-    return not (centre.Z + reach < low.Z or centre.Z - reach > high.Z)
+    return not (centre.z + reach < low.z or centre.z - reach > high.z)
   end
 
-  local bodyLow, bodyHigh = self.aabbMin[body], self.aabbMax[body]
-  if bodyHigh.X < low.X or bodyLow.X > high.X then return false end
-  if bodyHigh.Y < low.Y or bodyLow.Y > high.Y then return false end
+  local bodyLow, bodyHigh = self.boundsLow[body], self.boundsHigh[body]
+  if bodyHigh.x < low.x or bodyLow.x > high.x then return false end
+  if bodyHigh.y < low.y or bodyLow.y > high.y then return false end
 
-  return not (bodyHigh.Z < low.Z or bodyLow.Z > high.Z)
+  return not (bodyHigh.z < low.z or bodyLow.z > high.z)
 end
 
 --- Writes the handle of every body that overlaps a box, each tested in turn. Returns how many.
@@ -3431,12 +3431,12 @@ local function queryAabbGrid(
 
         if
           not (
-            low.X > nodeHigh.X
-            or high.X < nodeLow.X
-            or low.Y > nodeHigh.Y
-            or high.Y < nodeLow.Y
-            or low.Z > nodeHigh.Z
-            or high.Z < nodeLow.Z
+            low.x > nodeHigh.x
+            or high.x < nodeLow.x
+            or low.y > nodeHigh.y
+            or high.y < nodeLow.y
+            or low.z > nodeHigh.z
+            or high.z < nodeLow.z
           )
         then
           top += 1
@@ -3497,9 +3497,9 @@ function World:queryAabb(low, high, mask, out)
 
   -- Small bodies live in their center cell, but may extend into the immediately adjacent cell.
   local cellSize = self.broadphaseCellSize
-  local firstColumn, lastColumn = math.floor(low.X / cellSize) - 1, math.floor(high.X / cellSize) + 1
-  local firstRow, lastRow = math.floor(low.Y / cellSize) - 1, math.floor(high.Y / cellSize) + 1
-  local firstLayer, lastLayer = math.floor(low.Z / cellSize) - 1, math.floor(high.Z / cellSize) + 1
+  local firstColumn, lastColumn = math.floor(low.x / cellSize) - 1, math.floor(high.x / cellSize) + 1
+  local firstRow, lastRow = math.floor(low.y / cellSize) - 1, math.floor(high.y / cellSize) + 1
+  local firstLayer, lastLayer = math.floor(low.z / cellSize) - 1, math.floor(high.z / cellSize) + 1
   local cells = (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1)
   local count
 
@@ -3536,7 +3536,7 @@ function World:writeLinearState(out, opts)
   local userData = if opts.userData == true then out.userData or {} else nil
   local positions, velocities = out.positions or {}, out.velocities or {}
   local awakeOnly, dynamicOnly = opts.awakeOnly == true, opts.dynamicOnly == true
-  local {alive, sleeping, bodyType, generation, pos, linVel, userData: bodyData} = self
+  local {alive, sleeping, bodyType, generation, position: pos, velocity: linVel, userData: bodyData} = self
   local count = 0
 
   out.handles, out.userData, out.positions, out.velocities = handles, userData, positions, velocities
@@ -3581,7 +3581,7 @@ function World:writeTransforms(out, opts)
   local handles, positions, rotations = out.handles or {}, out.positions or {}, out.rotations or {}
   local rotationW, velocities, angularVelocities = out.rotationW or {}, out.velocities or {}, out.angularVelocities or {}
   local awakeOnly, dynamicOnly = opts.awakeOnly == true, opts.dynamicOnly == true
-  local {alive, sleeping, bodyType, generation, pos, qv, qw, linVel, angVel} = self
+  local {alive, sleeping, bodyType, generation, position: pos, turn: qv, turnW: qw, velocity: linVel, spin: angVel} = self
   local count = 0
 
   out.handles, out.positions, out.rotations = handles, positions, rotations
@@ -3616,14 +3616,14 @@ function World:applyTransforms(data,wake)
     local vels,ang=data.velocities,data.angularVelocities
     for n=1,count do
         local i=self:_check(data.handles[n])
-        self.pos[i]=data.positions[n]
+        self.position[i]=data.positions[n]
         if qvs and qws and qvs[n] and qws[n] then
-            self.qv[i],self.qw[i]=qNormalize(qvs[n],qws[n])
-            self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.qv[i],self.qw[i])
+            self.turn[i],self.turnW[i]=qNormalize(qvs[n],qws[n])
+            self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.turn[i],self.turnW[i])
         end
-        if vels and vels[n] then self.linVel[i]=vels[n] end
-        if ang and ang[n] then self.angVel[i]=ang[n] end
-        self.prevPos[i]=self.pos[i]
+        if vels and vels[n] then self.velocity[i]=vels[n] end
+        if ang and ang[n] then self.spin[i]=ang[n] end
+        self.previousPosition[i]=self.position[i]
         self:_updateAabb(i)
         if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
         if wake~=false and self.bodyType[i]==BODY_DYNAMIC then self.sleeping[i]=false;self.sleepTime[i]=0 end
@@ -3645,9 +3645,9 @@ function World:writeContacts(out)
     local sensors=out.sensor or {};out.sensor=sensors
     local n=self.contactCount
     for c=1,n do
-        local a,b=self.ca[c],self.cb[c]
+        local a,b=self.contactFirst[c],self.contactSecond[c]
         aa[c]=makeHandle(a,self.generation[a]);bb[c]=makeHandle(b,self.generation[b])
-        normals[c]=self.cn[c];points[c]=self.cp[c];penetration[c]=self.cpen[c];impulses[c]=self.cnormalImpulse[c]
+        normals[c]=self.contactNormal[c];points[c]=self.contactPoint[c];penetration[c]=self.contactDepth[c];impulses[c]=self.normalImpulse[c]
         sensors[c]=self.sensor[a] or self.sensor[b]
     end
     for c=#aa,n+1,-1 do aa[c]=nil;bb[c]=nil;normals[c]=nil;points[c]=nil;penetration[c]=nil;impulses[c]=nil;sensors[c]=nil end
@@ -3665,7 +3665,7 @@ function World:writeContactEvents(out,includeStay)
     for e=1,self.contactEventCount do
         local k=self.eventKind[e]
         if includeStay~=false or k~=EVENT_STAY then
-            local a,b=self.eventA[e],self.eventB[e]
+            local a,b=self.eventFirst[e],self.eventSecond[e]
             if self.alive[a] and self.alive[b] then
                 n+=1
                 aa[n]=makeHandle(a,self.generation[a]);bb[n]=makeHandle(b,self.generation[b])
@@ -3696,19 +3696,19 @@ end
 function World:contacts()
     local out=table.create(self.contactCount)
     for c=1,self.contactCount do
-        local a,b=self.ca[c],self.cb[c]
+        local a,b=self.contactFirst[c],self.contactSecond[c]
         out[c]={
             a=makeHandle(a,self.generation[a]),
             b=makeHandle(b,self.generation[b]),
-            normal=self.cn[c],point=self.cp[c],penetration=self.cpen[c],
-            normalImpulse=self.cnormalImpulse[c],sensor=self.sensor[a] or self.sensor[b],
+            normal=self.contactNormal[c],point=self.contactPoint[c],penetration=self.contactDepth[c],
+            normalImpulse=self.normalImpulse[c],sensor=self.sensor[a] or self.sensor[b],
         }
     end
     return out
 end
 
 function World:stats()
-  local {alive, sleeping, sensor, ca: bodiesA, cb: bodiesB} = self
+  local {alive, sleeping, sensor, contactFirst: bodiesA, contactSecond: bodiesB} = self
 
   return {
     frame = self.frame,
@@ -3721,7 +3721,7 @@ function World:stats()
     activeContacts = self.activeContactCount,
     manifolds = self.manifoldCount,
     warmStarted = self.warmStartedCount,
-    ccdHits = self.ccdHitCount,
+    ccdHits = self.sweptHits,
     joints = self.jointCount,
   }
 end
@@ -3767,22 +3767,22 @@ function M.newWorld(opts)
     w.fixedDt=opts.fixedDt or (1/60)
     w.maxCatchUpSteps=opts.maxCatchUpSteps or 8
     w.accumulator=0
-    w.gridHeads={};w.gridKeys={};w.gridNext={};w.gridLarge={};w.gridX={};w.gridY={};w.gridZ={};w.gridKey={}
-    w.gridKeyX={};w.gridKeyY={};w.gridKeyZ={}
+    w.gridHeads={};w.gridKeys={};w.gridNext={};w.gridLarge={};w.gridColumn={};w.gridRow={};w.gridLayer={};w.gridKey={}
+    w.gridKeyColumn={};w.gridKeyRow={};w.gridKeyLayer={}
     w.gridOccupied = buffer.create(GridFilterSize)
-    w.gridDenseKeys={};w.gridPairA={};w.gridPairB={};w.gridDenseCount=0;w.gridPairCount=0
+    w.gridDenseKeys={};w.gridPairFirst={};w.gridPairSecond={};w.gridDenseCount=0;w.gridPairCount=0
     w.gridTopologyReady=false;w.gridTopologyDirty=true
     w.stillDirty=true;w.stillRoot=0;w.movers={};w.moversDirty=true
-    w.nearStill={};w.nearLow={};w.nearHigh={};w.nearEpoch={};w.stillEpoch=0
+    w.nearStill={};w.nearLows={};w.nearHighs={};w.nearEpochs={};w.stillEpoch=0
     w.unseen={}
     w.stirring=0;w.stillWasMoved=false;w.quiet=false;w.changed=true
-    w.rest={};w.unsettled={};w.seenPos={};w.seenTurn={};w.seenTurnW={}
+    w.rest={};w.unsettled={};w.seenPosition={};w.seenTurn={};w.seenTurnW={}
     w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={};w.stillNear={}
     w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
     w.frame=0
     w.cacheEpoch=0
-    w.ccdHitCount=0
-    w.ccdCount=0
+    w.sweptHits=0
+    w.sweptCount=0
     w.high=0
     w.aliveCount=0
     w.free={}
@@ -3793,16 +3793,16 @@ function M.newWorld(opts)
     w.bodyType={}
     w.shape={}
     w.sphereRadius = {}
-    w.pos={}
-    w.qv={}
-    w.qw={}
+    w.position={}
+    w.turn={}
+    w.turnW={}
     w.axis0={};w.axis1={};w.axis2={}
-    w.linVel={}
-    w.angVel={}
+    w.velocity={}
+    w.spin={}
     w.force={}
     w.torque={}
-    w.invMass={}
-    w.invInertia={}
+    w.inverseMass={}
+    w.inverseInertia={}
     w.friction={}
     w.restitution={}
     w.linearDamping={}
@@ -3811,37 +3811,37 @@ function M.newWorld(opts)
     w.mask={}
     w.userData={}
     w.sensor={}
-    w.ccd={};w.prevPos={}
-    w.linearView={alive=w.alive,bodyType=w.bodyType,userData=w.userData,positions=w.pos,velocities=w.linVel,high=0,dynamicCode=BODY_DYNAMIC}
+    w.swept={};w.previousPosition={}
+    w.linearView={alive=w.alive,bodyType=w.bodyType,userData=w.userData,positions=w.position,velocities=w.velocity,high=0,dynamicCode=BODY_DYNAMIC}
     w.sleeping={}
     w.sleepTime={}
-    w.aabbMin={}
-    w.aabbMax={}
+    w.boundsLow={}
+    w.boundsHigh={}
     w.contactCount=0
     w.candidateCount=0
     w.manifoldCount=0
     w.warmStartedCount=0
     w.activeContactCount=0
     w.islandCount=0
-    w.ca={};w.cb={};w.cn={};w.cp={};w.cpen={};w.cactive={};w.cnormalImpulse={}
-    w.ctangentImpulse1={};w.ctangentImpulse2={}
-    w.cra={};w.crb={};w.cla={};w.clb={};w.cnormalMass={};w.cfriction={};w.crest={};w.cbias={}
-    w.cnormalAngA={};w.cnormalAngB={}
-    w.ctangent1={};w.ctangent2={};w.ctangentMass1={};w.ctangentMass2={}
-    w.ctangentAng1A={};w.ctangentAng1B={};w.ctangentAng2A={};w.ctangentAng2B={}
+    w.contactFirst={};w.contactSecond={};w.contactNormal={};w.contactPoint={};w.contactDepth={};w.contactSolved={};w.normalImpulse={}
+    w.tangentImpulse1={};w.tangentImpulse2={}
+    w.firstArm={};w.secondArm={};w.firstAnchor={};w.secondAnchor={};w.normalMass={};w.contactFriction={};w.contactBounce={};w.contactBias={}
+    w.firstNormalTurn={};w.secondNormalTurn={}
+    w.tangent1={};w.tangent2={};w.tangentMass1={};w.tangentMass2={}
+    w.firstTangentTurn1={};w.secondTangentTurn1={};w.firstTangentTurn2={};w.secondTangentTurn2={}
     w.contactCache={}
     w.activeContacts={}
     w.contactEventEpoch=0;w.contactEventCount=0
-    w.contactPairSeen={};w.contactPairActive={};w.contactPairA={};w.contactPairB={};w.contactPairSensor={}
-    w.contactPairPrev={};w.contactPairNext={}
-    w.eventA={};w.eventB={};w.eventKind={};w.eventSensor={}
-    w.clipA={};w.clipB={};w.manifoldPoints={};w.manifoldDepths={}
-    w.geomNormal={};w.geomPoint={};w.geomPen={};w.geomContactCount=0
+    w.contactPairSeen={};w.contactPairActive={};w.contactPairFirst={};w.contactPairSecond={};w.contactPairSensor={}
+    w.contactPairsBefore={};w.contactPairsNow={}
+    w.eventFirst={};w.eventSecond={};w.eventKind={};w.eventSensor={}
+    w.clipFrom={};w.clipTo={};w.manifoldPoints={};w.manifoldDepths={}
+    w.meshNormals={};w.meshPoints={};w.meshDepths={};w.meshContactCount=0
     w.firstPieceCentres, w.firstPieceTurns, w.firstPieceTurnWs = {}, {}, {}
     w.secondPieceCentres, w.secondPieceTurns, w.secondPieceTurnWs = {}, {}, {}
     w.meshMarks={};w.meshMarkEpoch=0
     w.castCapsule={kind=SHAPE_CAPSULE,radius=0,halfHeight=0};w.castTriangles={}
-    w.islandParent={};w.islandSize={};w.islandAwake={};w.islandRoots={};w.islandCanSleep={};w.islandMinTime={}
+    w.islandParent={};w.islandSize={};w.islandAwake={};w.islandRoots={};w.islandCanSleep={};w.islandLeastRest={}
     w.joints={};w.jointNoCollide={};w.nextJoint=1;w.jointCount=0
     return w
 end

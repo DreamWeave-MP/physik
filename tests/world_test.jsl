@@ -15,9 +15,9 @@ local function near(actual: number, expected: number, tolerance: number?)
 end
 
 local function nearVector(actual: vector, expected: vector, tolerance: number?)
-  near(actual.X, expected.X, tolerance)
-  near(actual.Y, expected.Y, tolerance)
-  near(actual.Z, expected.Z, tolerance)
+  near(actual.x, expected.x, tolerance)
+  near(actual.y, expected.y, tolerance)
+  near(actual.z, expected.z, tolerance)
 end
 
 local function ground(world)
@@ -164,14 +164,14 @@ suite.describe('shapes', function()
     local none = physik.heightfield(2, 2, { 0 / 0, 0 / 0, 0 / 0, 0 / 0 })
     local unbounded = physik.heightfield(2, 2, { math.huge, -math.huge, 0, 1 })
 
-    expect(first.localMin.Y).toBe(1)
-    expect(first.localMax.Y).toBe(3)
-    expect(last.localMin.Y).toBe(-1)
-    expect(last.localMax.Y).toBe(4)
-    expect(none.localMin.Y).toBe(math.huge)
-    expect(none.localMax.Y).toBe(-math.huge)
-    expect(unbounded.localMin.Y).toBe(-math.huge)
-    expect(unbounded.localMax.Y).toBe(math.huge)
+    expect(first.localMin.y).toBe(1)
+    expect(first.localMax.y).toBe(3)
+    expect(last.localMin.y).toBe(-1)
+    expect(last.localMax.y).toBe(4)
+    expect(none.localMin.y).toBe(math.huge)
+    expect(none.localMax.y).toBe(-math.huge)
+    expect(unbounded.localMin.y).toBe(-math.huge)
+    expect(unbounded.localMax.y).toBe(math.huge)
   end)
 
   suite.it('refuses heightfields that are not a grid of numbers', function()
@@ -320,8 +320,8 @@ suite.describe('stepping', function()
 
     local body = world:getBody(handle)
 
-    near(body.velocity.Y, -10, 1e-3)
-    near(body.position.Y, -10 * 1830 / 3600, 1e-3)
+    near(body.velocity.y, -10, 1e-3)
+    near(body.position.y, -10 * 1830 / 3600, 1e-3)
     expect(world:stats().frame).toBe(60)
   end)
 
@@ -330,7 +330,7 @@ suite.describe('stepping', function()
     local handle = world:addBody({ shape = physik.sphere(0.5), linearDamping = 0 })
     world:step(1 / 30, 2)
 
-    near(world:getBody(handle).position.Y, -10 * 3 / 3600, 1e-5)
+    near(world:getBody(handle).position.y, -10 * 3 / 3600, 1e-5)
     expect(world:stats().frame).toBe(1)
 
     expect(function()
@@ -376,10 +376,10 @@ suite.describe('stepping', function()
       local stats = world:stats()
 
       -- Each settles a little into the floor: the solver leaves the slop it is allowed.
-      near(world:getBody(sphere).position.Y, 0.4773, 1e-3)
-      near(world:getBody(box).position.Y, 0.2441, 1e-3)
-      near(world:getBody(capsule).position.Y, 0.7273, 1e-3)
-      near(world:getBody(sphere).position.X, -3, 1e-3)
+      near(world:getBody(sphere).position.y, 0.4773, 1e-3)
+      near(world:getBody(box).position.y, 0.2441, 1e-3)
+      near(world:getBody(capsule).position.y, 0.7273, 1e-3)
+      near(world:getBody(sphere).position.x, -3, 1e-3)
       expect(stats.sleeping).toBe(3)
       expect(stats.activeContacts).toBe(0)
       expect(stats.bodies).toBe(4)
@@ -392,7 +392,7 @@ suite.describe('stepping', function()
       expect(world:getBody(box).sleeping).toBe(false)
       world:step(1 / 60)
       expect(world:stats().sleeping).toBe(2)
-      near(world:getBody(box).position.Y, 0.2914, 1e-3)
+      near(world:getBody(box).position.y, 0.2914, 1e-3)
     end)
 
     suite.it(`stacks boxes and keeps every pair of neighbours in contact, by {broadphase}`, function()
@@ -417,9 +417,9 @@ suite.describe('stepping', function()
       for level, box in boxes do
         local body = world:getBody(box)
 
-        near(body.position.Y, level - 0.5, 0.08)
-        near(body.position.X, 0, 0.02)
-        near(body.position.Z, 0, 0.02)
+        near(body.position.y, level - 0.5, 0.08)
+        near(body.position.x, 0, 0.02)
+        near(body.position.z, 0, 0.02)
       end
 
       expect(stats.manifolds).toBe(2)
@@ -484,12 +484,12 @@ suite.describe('stepping', function()
 
         for _ = 1, 150 do
           world:step(1 / 60)
-          lowest = math.min(lowest, world:getBody(ball).position.Y)
+          lowest = math.min(lowest, world:getBody(ball).position.y)
         end
 
         -- Ten units on, far from the cells it started over, it is still resting on the surface.
         expect(lowest > 0.3).toBe(true)
-        expect(world:getBody(ball).position.X > 0).toBe(true)
+        expect(world:getBody(ball).position.x > 0).toBe(true)
         expect(world:stats().contacts > 0).toBe(true)
       end
     end)
@@ -564,7 +564,7 @@ suite.describe('stepping', function()
 
         expect(contact.a).toBe(first)
         expect(contact.b).toBe(second)
-        expect(contact.normal.X > 0.9).toBe(true)
+        expect(contact.normal.x > 0.9).toBe(true)
         expect(contact.penetration > 0).toBe(true)
       end
     end
@@ -598,12 +598,12 @@ suite.describe('stepping', function()
         world:step(1 / 60)
       end
 
-      near(world:getBody(sphere).position.Y, 1.4773, 1e-3)
-      near(world:getBody(capsule).position.Y, 1.5773, 1e-3)
+      near(world:getBody(sphere).position.y, 1.4773, 1e-3)
+      near(world:getBody(capsule).position.y, 1.5773, 1e-3)
       nearVector(world:getBody(sphere).position, vector.create(-2.5, 1.4773, 0.3), 1e-3)
 
       -- A box does not come to rest on triangles: it rides a little above them, and wanders.
-      near(world:getBody(box).position.Y, 1.6, 0.1)
+      near(world:getBody(box).position.y, 1.6, 0.1)
       expect(world:stats().sleeping).toBe(2)
       expect(world:stats().contacts).toBe(3)
     end
@@ -631,7 +631,7 @@ suite.describe('stepping', function()
     end
 
     expect(contacts > 0).toBe(true)
-    expect(world:getBody(ball).position.X < 104).toBe(true)
+    expect(world:getBody(ball).position.x < 104).toBe(true)
   end)
 
   suite.it('keeps a sensor out of the solve and reports what it touches', function()
@@ -666,8 +666,8 @@ suite.describe('stepping', function()
     expect(kinds[#kinds]).toBe(event.exit)
     expect(#[for kind in kinds if kind == event.stay => kind]).toBe(#kinds - 2)
     expect(#kinds).toBe(32)
-    near(world:getBody(mover).velocity.X, 6, 1e-4)
-    near(world:getBody(mover).position.X, 3, 1e-3)
+    near(world:getBody(mover).velocity.x, 6, 1e-4)
+    near(world:getBody(mover).position.x, 3, 1e-3)
     expect(select(2, world:writeContactEvents({}, false))).toBe(0)
   end)
 
@@ -696,7 +696,7 @@ suite.describe('stepping', function()
       world:step(1 / 60)
       expect(world:stats().ccdHits).toBe(if swept then 1 else 0)
 
-      return world:getBody(bullet).position.X
+      return world:getBody(bullet).position.x
     end
 
     near(fire(false), 1000 / 60, 1e-3)
@@ -716,7 +716,7 @@ suite.describe('stepping', function()
       world:step(1 / 60)
     end
 
-    near(world:getBody(weight).position.Y, 4, 0.1)
+    near(world:getBody(weight).position.y, 4, 0.1)
     world:removeJoint(joint)
     expect(world:stats().joints).toBe(0)
 
@@ -724,7 +724,7 @@ suite.describe('stepping', function()
       world:step(1 / 60)
     end
 
-    expect(world:getBody(weight).position.Y < 3).toBe(true)
+    expect(world:getBody(weight).position.y < 3).toBe(true)
   end)
 
   suite.it('lets jointed bodies overlap unless the joint says they collide', function()
@@ -812,7 +812,7 @@ suite.describe('stepping', function()
     local contact = world:contacts()[1]
 
     expect(contact.b).toBe(atItsEnd)
-    expect(contact.normal.Z > 0.9).toBe(true)
+    expect(contact.normal.z > 0.9).toBe(true)
   end)
 
   suite.it('wakes a sleeping body that a kinematic one runs into', function()
@@ -840,7 +840,7 @@ suite.describe('stepping', function()
     end
 
     expect(world:getBody(ball).sleeping).toBe(false)
-    expect(world:getBody(ball).position.X > 0.2).toBe(true)
+    expect(world:getBody(ball).position.x > 0.2).toBe(true)
   end)
 end)
 
@@ -894,8 +894,8 @@ suite.describe('queries', function()
 
       expect(hit.userData).toBe(name)
       near(hit.distance, 8 - tops[name], 0.03)
-      near(hit.point.Y, tops[name], 0.03)
-      expect(hit.normal.Y > 0.9).toBe(true)
+      near(hit.point.y, tops[name], 0.03)
+      expect(hit.normal.y > 0.9).toBe(true)
     end
 
     expect(world:raycast(vector.create(5, 8, 0), vector.create(0, -1, 0), 20)).toBe(nil)
@@ -1136,7 +1136,7 @@ suite.describe('queries', function()
     expect(again).toBe(2 * Generation + 2)
     expect(hit.handle).toBe(again)
     expect(hit.userData).toBe('again')
-    near(hit.center.Y, 0.75, 1e-3)
+    near(hit.center.y, 0.75, 1e-3)
     expect(world:sphereCast(vector.create(0, 5, 0), vector.create(0, -5, 0), 0.25, nil, again)).toBe(nil)
   end)
 
@@ -1147,11 +1147,11 @@ suite.describe('queries', function()
       local hit = world:sphereCast(vector.create(column + 0.1, 8, 0.1), vector.create(column + 0.1, -2, 0.1), 0.25)
 
       expect(hit.userData).toBe(name)
-      near(hit.center.Y, tops[name] + 0.25, 0.03)
-      near(hit.point.Y, tops[name], 0.03)
+      near(hit.center.y, tops[name] + 0.25, 0.03)
+      near(hit.point.y, tops[name], 0.03)
       near(hit.distance, 8 - tops[name] - 0.25, 0.03)
       near(hit.fraction, hit.distance / 10, 1e-6)
-      expect(hit.normal.Y > 0.9).toBe(true)
+      expect(hit.normal.y > 0.9).toBe(true)
     end
 
     expect(world:sphereCast(vector.create(5, 8, 0), vector.create(5, -2, 0), 0.25)).toBe(nil)
@@ -1224,7 +1224,7 @@ suite.describe('drains', function()
     expect(state.positions[4]).toBe(vector.create(-4, 3, 0))
     expect(state.rotationW[1]).toBe(1)
     expect(state.rotations[1]).toBe(vector.create(0, 0, 0))
-    expect(state.velocities[3].Y < -5).toBe(true)
+    expect(state.velocities[3].y < -5).toBe(true)
     expect(state.angularVelocities[1]).toBe(vector.create(0, 0, 0))
 
     local dynamic, dynamicCount = world:writeTransforms(state, { dynamicOnly = true })
@@ -1273,7 +1273,7 @@ suite.describe('drains', function()
     expect(state.b).toEqual({ resting })
     expect(state.sensor).toEqual({ false })
     nearVector(state.normals[1], vector.create(0, 1, 0), 1e-4)
-    near(state.points[1].Y, 0, 0.02)
+    near(state.points[1].y, 0, 0.02)
 
     local record = records[1]
 
@@ -1447,7 +1447,7 @@ suite.describe('a level of static bodies', function()
 
     local hit = world:sphereCast(vector.create(17, 3, 21), vector.create(17, -3, 21), 0.5)
     expect(world:getBody(hit.handle).userData).toBe('4,5')
-    near(hit.center.Y, 0.5)
+    near(hit.center.y, 0.5)
   end)
 end)
 
