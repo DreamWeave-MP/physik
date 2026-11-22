@@ -23,6 +23,28 @@ export type World = {
     mask: number?,
     ignore: number?
   ) -> (number?, number, vector, vector),
+  _capsuleCastAmong: (
+    self: World,
+    handles: { number },
+    count: number,
+    start: vector,
+    motion: vector,
+    length: number,
+    radius: number,
+    halfHeight: number,
+    ignored: number?
+  ) -> (number?, number, vector, vector),
+  _capsuleContactsAmong: (
+    self: World,
+    found: { number },
+    count: number,
+    position: vector,
+    radius: number,
+    halfHeight: number,
+    ignored: number?,
+    out: Overlaps
+  ) -> (Overlaps, number),
+  queryAabb: (self: World, low: vector, high: vector, mask: number?, out: { number }) -> ({ number }, number),
   _raycastRaw: (self: World, origin: vector, direction: vector, reach: number, mask: number?) -> (number?, number, vector, vector?),
   _handleOf: (self: World, body: number) -> number,
   capsuleContacts: (
@@ -79,12 +101,18 @@ export type Character = {
   planes: { vector },
   planeCount: number,
   overlaps: Overlaps,
+  --- The bodies near enough to be met in the move being made, asked for once.
+  nearby: { number },
+  nearbyCount: number,
 }
 
 local Up = vector.create(0, 1, 0)
 
 -- A surface is met a little before it is touched, and a character put down on one is this near.
 local Skin = 1e-3
+
+-- A handle's low bits are its body's slot, which is what the kernel's own sweeps are told to skip.
+local HandleStride = 1048576
 
 function character.new(world: World, options: Options?): Character
   local given: Options = options or {}
@@ -107,6 +135,8 @@ function character.new(world: World, options: Options?): Character
     planes = {},
     planeCount = 0,
     overlaps = { handles = {}, normals = {}, depths = {}, points = {} },
+    nearby = {},
+    nearbyCount = 0,
   }
 end
 
@@ -118,8 +148,20 @@ end
 --- Sweeps the capsule from `centre` along `motion`. Returns the slot of what it met, the fraction
 --- of the motion it got through, the normal there, and the point on what it met.
 local function cast(self: Character, centre: vector, motion: vector): (number?, number, vector, vector)
-  local body, fraction, normal, point =
-    self.world:_capsuleCastRaw(centre, centre + motion, self.radius, self.height / 2 - self.radius, self.mask, self.ignore)
+  local length = vector.magnitude(motion)
+  if not (length > 1e-8) then return nil, 1, Up, centre end
+
+  local ignore = self.ignore
+  local body, fraction, normal, point = self.world:_capsuleCastAmong(
+    self.nearby,
+    self.nearbyCount,
+    centre,
+    motion,
+    length,
+    self.radius,
+    self.height / 2 - self.radius,
+    if ignore then ignore % HandleStride else nil
+  )
 
   if not body then return nil, 1, Up, centre end
 
@@ -155,9 +197,12 @@ end
 --- leaving one thing can be entering another.
 local function recover(self: Character, centre: vector): vector
   local halfHeight = self.height / 2 - self.radius
+  local ignore = self.ignore
+  local ignored = if ignore then ignore % HandleStride else nil
 
   for _ = 1, 4 do
-    local overlaps, count = self.world:capsuleContacts(centre, self.radius, halfHeight, self.mask, self.ignore, self.overlaps)
+    local overlaps, count =
+      self.world:_capsuleContactsAmong(self.nearby, self.nearbyCount, centre, self.radius, halfHeight, ignored, self.overlaps)
     if count == 0 then break end
 
     local deepest = 1
@@ -236,12 +281,28 @@ end
 --- is standing on, and the planes it ran into.
 function character.move(self: Character, motion: vector)
   local wasGrounded = self.grounded
-  local start = recover(self, (capsule(self)))
-  local centre = start
+  local centre = capsule(self)
   local rise = motion.y
   local across = vector.create(motion.x, 0, motion.z)
 
   self.planeCount = 0
+
+  -- Everything this move could meet, asked for once: nothing in it goes further from here than
+  -- the motion, a step up and the ground it follows down.
+  local span = math.abs(motion.x) + math.abs(motion.y) + math.abs(motion.z) + self.stepHeight + self.snapDistance + Skin * 4
+  local reach = vector.create(self.radius + span, self.height / 2 + span, self.radius + span)
+
+  self.nearby, self.nearbyCount = self.world:queryAabb(centre - reach, centre + reach, self.mask, self.nearby)
+
+  -- Out of whatever has moved into it. Something that has pushed it further than it could have
+  -- gone by itself has taken it away from what was asked for, which is asked for again.
+  local start = centre
+
+  centre = recover(self, centre)
+
+  if vector.magnitude(centre - start) > Skin * 4 then
+    self.nearby, self.nearbyCount = self.world:queryAabb(centre - reach, centre + reach, self.mask, self.nearby)
+  end
 
   -- Up first, so a jump clears what it is jumping onto.
   if rise > 0 then centre = slideAlong(self, centre, vector.create(0, rise, 0), false) end
@@ -282,31 +343,36 @@ function character.move(self: Character, motion: vector)
     end
   end
 
-  -- Down: onto ground it stops on, and along anything steeper.
-  if rise < 0 then
-    local fall = vector.create(0, rise, 0)
-    local under, fraction, facing, point = cast(self, centre, fall)
-
-    if under and standing(self, centre + fall * fraction, facing, point) then
-      centre += fall * fraction
-      self.planeCount += 1
-      self.planes[self.planeCount] = facing
-    else
-      centre = slideAlong(self, centre, fall, false)
-    end
-  end
-
-  -- What is underfoot: followed down a step or a slope by someone who was walking, and only
-  -- looked for by someone who was not.
-  local reach = if wasGrounded and rise <= 0 then math.max(self.snapDistance, Skin * 2) else Skin * 2
+  -- Down, and what is underfoot, in one sweep: as far as it is falling, and then as far again as
+  -- ground is followed down a step or a slope by someone who was walking, or only looked for by
+  -- someone who was not.
+  local follow = if wasGrounded and rise <= 0 then math.max(self.snapDistance, Skin * 2) else Skin * 2
+  local fall = math.max(-rise, 0)
   local under, fraction, facing, point = nil, 1, Up, centre
 
   if rise <= 0 then
-    under, fraction, facing, point = cast(self, centre, vector.create(0, -reach, 0))
+    under, fraction, facing, point = cast(self, centre, vector.create(0, -(fall + follow), 0))
   end
 
-  if under and standing(self, centre - vector.create(0, reach * fraction, 0), facing, point) then
-    centre -= vector.create(0, reach * fraction, 0)
+  local drop = (fall + follow) * fraction
+  local stood = under ~= nil and standing(self, centre - vector.create(0, drop, 0), facing, point)
+
+  if under and drop <= fall and not stood then
+    -- Fell onto something too steep to stand on: along it, and then look again.
+    centre = slideAlong(self, centre, vector.create(0, -fall, 0), false)
+    under, fraction, facing, point = cast(self, centre, vector.create(0, -follow, 0))
+    drop = follow * fraction
+    stood = under ~= nil and standing(self, centre - vector.create(0, drop, 0), facing, point)
+  elseif drop <= fall and stood and fall > 0 then
+    -- Landed, or stood where it was standing: what it came down on stops its fall.
+    self.planeCount += 1
+    self.planes[self.planeCount] = facing
+  elseif not stood then
+    centre -= vector.create(0, fall, 0)
+  end
+
+  if under and stood then
+    centre -= vector.create(0, drop, 0)
     self.grounded = true
     self.groundNormal = if facing.y >= self.walkable then facing else Up
     self.ground = self.world:_handleOf(under)

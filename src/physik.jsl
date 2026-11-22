@@ -3749,9 +3749,13 @@ function World:_raycastRaw(origin, direction, maxDistance, mask)
   local entry = self.stillRoot
 
   if entry ~= 0 then
-    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = self
+    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack, stillNear: nears} = self
+    local {aabbMin, aabbMax} = self
     local top = 0
 
+    -- The nearer half of a node first, so that what is struck there rules out the further half
+    -- before it is entered. A half no nearer than what has been struck is still entered when it
+    -- is exactly as near, for the body of a lower slot that may be in it.
     while true do
       if entry < 0 then
         local distance, normal, point = raycastBody(self, -entry, origin, dir, bestDistance, mask)
@@ -3759,11 +3763,32 @@ function World:_raycastRaw(origin, direction, maxDistance, mask)
         if distance and (distance < bestDistance or (distance == bestDistance and bestBody and -entry < bestBody)) then
           bestDistance, bestBody, bestNormal, bestPoint = distance, -entry, normal, point
         end
-      elseif rayAabbInterval(origin, dir, bestDistance, lows[entry], highs[entry]) then
-        top += 1
-        stack[top] = rights[entry]
-        entry = lefts[entry]
-        continue
+      else
+        local left, right = lefts[entry], rights[entry]
+        local leftAt = if left < 0
+          then rayAabbInterval(origin, dir, bestDistance, aabbMin[-left], aabbMax[-left])
+          else rayAabbInterval(origin, dir, bestDistance, lows[left], highs[left])
+        local rightAt = if right < 0
+          then rayAabbInterval(origin, dir, bestDistance, aabbMin[-right], aabbMax[-right])
+          else rayAabbInterval(origin, dir, bestDistance, lows[right], highs[right])
+
+        if leftAt and rightAt then
+          if rightAt < leftAt then
+            left, right, leftAt, rightAt = right, left, rightAt, leftAt
+          end
+
+          top += 1
+          stack[top], nears[top] = right, rightAt
+          entry = left
+          continue
+        elseif leftAt or rightAt then
+          entry = if leftAt then left else right
+          continue
+        end
+      end
+
+      while top > 0 and nears[top] > bestDistance do
+        top -= 1
       end
 
       if top == 0 then break end
@@ -4131,11 +4156,22 @@ function World:_capsuleCastRaw(startPos, endPos, radius, halfHeight, mask, ignor
   local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
   local reach = vector.create(radius, halfHeight + radius, radius)
   local handles, count = self:queryAabb(vector.min(startPos, endPos) - reach, vector.max(startPos, endPos) + reach, mask, self.castCandidates)
-  local {shape, pos, qv, qw, castCapsule: capsule, castTriangles: triangles} = self
+
+  self.castCandidates = handles
+
+  return self:_capsuleCastAmong(handles, count, startPos, motion, length, radius, halfHeight, ignored)
+end
+
+--- Sweeps an upright capsule at the bodies a box query has just answered with, which is how
+--- something that sweeps several times in one place, as a character does, asks the world once.
+--- `ignored` is a slot, not a handle. Returns as `_capsuleCastRaw` does.
+function World:_capsuleCastAmong(handles, count, startPos, motion, length, radius, halfHeight, ignored)
+  local {shape, pos, qv, qw, aabbMin, aabbMax, castCapsule: capsule, castTriangles: triangles} = self
+  local reach = vector.create(radius, halfHeight + radius, radius)
+  local heading = motion / length
   local bestFraction = 1
   local bestNormal, bestPoint, bestBody
 
-  self.castCandidates = handles
   capsule.radius, capsule.halfHeight = radius, halfHeight
 
   for index = 1, count do
@@ -4146,6 +4182,15 @@ function World:_capsuleCastRaw(startPos, endPos, radius, halfHeight, mask, ignor
     local target = shape[body]
     local kind = target.kind
     local fraction, normal, point
+
+    -- The capsule's centre has to come within the capsule's own reach of a body's box, and
+    -- sooner than what has been met already. A sphere's box is not kept as it moves.
+    if
+      kind ~= SHAPE_SPHERE
+      and not rayAabbInterval(startPos, heading, length * bestFraction, aabbMin[body] - reach, aabbMax[body] + reach)
+    then
+      continue
+    end
 
     if kind == SHAPE_MESH or kind == SHAPE_HEIGHTFIELD then
       local gathered = gatherTriangles(self, body, startPos + motion * 0.5, length * 0.5 + halfHeight + radius, triangles)
@@ -4233,11 +4278,19 @@ function World:capsuleContacts(position, radius, halfHeight, mask, ignoreHandle,
   local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
   local reach = vector.create(radius, halfHeight + radius, radius)
   local found, count = self:queryAabb(position - reach, position + reach, mask, self.castCandidates)
+
+  self.castCandidates = found
+
+  return self:_capsuleContactsAmong(found, count, position, radius, halfHeight, ignored, out)
+end
+
+--- What an upright capsule overlaps of the bodies a box query has just answered with. `ignored`
+--- is a slot, not a handle. Returns as `capsuleContacts` does.
+function World:_capsuleContactsAmong(found, count, position, radius, halfHeight, ignored, out)
   local {shape, pos, qv, qw, castCapsule: capsule, castTriangles: triangles} = self
   local handles, normals, depths, points = out.handles or {}, out.normals or {}, out.depths or {}, out.points or {}
   local rows = 0
 
-  self.castCandidates = found
   capsule.radius, capsule.halfHeight = radius, halfHeight
   out.handles, out.normals, out.depths, out.points = handles, normals, depths, points
 
@@ -4465,6 +4518,9 @@ local function queryAabbGrid(
       top -= 1
     end
   end
+
+  -- A grid with nothing in it has no cells to walk.
+  if self.gridSmallCount == 0 then return count end
 
   -- Where every cell of the range can be packed, a cell's key is one more than the key before it.
   local packable = firstColumn >= -CELL_OFFSET
@@ -4786,7 +4842,7 @@ function M.newWorld(opts)
     w.nearStill={};w.nearLow={};w.nearHigh={};w.nearEpoch={};w.stillEpoch=0
     w.stirring=0;w.stillWasMoved=false;w.quiet=false;w.changed=true
     w.rest={};w.unsettled={};w.seenPos={};w.seenTurn={};w.seenTurnW={}
-    w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={}
+    w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={};w.stillNear={}
     w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
     w.frame=0
     w.cacheEpoch=0
