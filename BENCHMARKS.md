@@ -2,9 +2,52 @@
 
 Measured with `bench/bench.jsl`, which checks what every workload computes, to the bit, before and after it times it. The numbers in `docs/README.md` and `docs/PROFILE.md` are older, from another machine and another Jess, and are not comparable with these.
 
+## 0.5.0: typed, in modules
+
+Measured on 2026-11-22, on the same machine and the same Jess as 0.4.0 below. Base is 0.4.0 as one untyped file (`9469625`) and head is 0.5.0, each timed by its own copy of the benchmark, since 0.5.0 renames what a contact's bodies are called. The least of three runs each, taken turn about.
+
+Nothing in 0.5.0 changes what a world computes: every workload still computes what 0.3.2 computed, to the bit. What changed is how the code is written. The kernel was one file of 4,900 lines that the type checker gave up on; it is nine modules that pass the strict check. Annotated code compiles to tighter native code, and that is most of what this table is.
+
+Microseconds per call.
+
+| Workload | 0.4.0 | 0.5.0 | 0.4.0 / 0.5.0 |
+| --- | ---: | ---: | ---: |
+| step: 200 swept spheres fired at walls, spheres, compounds and terrain, swept and pruned, 6 steps | 109,110.7 | 48,638.6 | 2.24 |
+| step: 200 swept spheres fired at walls, spheres and compounds in the grid, 6 steps | 53,183.0 | 25,513.0 | 2.08 |
+| level: a character run 240 steps among 1,024 static boxes | 3,148.6 | 1,758.7 | 1.79 |
+| step: 600 spheres, capsules and boxes swept and pruned, 30 steps | 151,671.0 | 91,864.4 | 1.65 |
+| level: 256 rays among 1,024 static boxes | 1,238.3 | 793.5 | 1.56 |
+| level: 256 capsules swept among 1,024 static boxes | 2,316.0 | 1,482.3 | 1.56 |
+| step: 256 compounds of three pieces, 30 steps | 238,061.9 | 156,623.6 | 1.52 |
+| step: 600 capsules and boxes on a mesh of 8,192 triangles, 30 steps | 293,493.9 | 211,098.0 | 1.39 |
+| sync: move the origin under 5,000 bodies, and back | 901.4 | 667.4 | 1.35 |
+| step: 600 capsules and boxes on a heightfield 65 by 65, 30 steps | 162,314.9 | 125,882.2 | 1.29 |
+| step: 250 boxes tumbling wider than a cell, 30 steps | 161,618.8 | 131,470.5 | 1.23 |
+| step: 250 boxes tumbling in the grid, 30 steps | 143,786.9 | 118,372.9 | 1.21 |
+| level: 200 boxes thrown among 1,024 static ones and taken out again, 60 steps | 73,839.3 | 67,881.5 | 1.09 |
+| level: 48 boxes thrown among 1,024 static ones and taken out again, 60 steps | 12,784.7 | 11,816.7 | 1.08 |
+| step: 5,000 spheres drifting far apart with contact events, drained, 30 steps | 79,442.6 | 82,257.2 | 0.97 |
+
+The machine drifts by a tenth from one minute to the next, and a row within a tenth of 1 here is not a finding: the rows not shown read 0.97 to 1.19, the piles of spheres among them, and an earlier run of the same comparison had those at 0.98 to 1.01.
+
+**What moved, and why.**
+
+- *Sweeps, rays, compounds, meshes, a character, 1.3x to 2.2x (`3b2191b`, `ffa0b8d`, `c8bc758`).* The geometry, the narrow phase and the queries, typed. Not a line of their arithmetic changed.
+- *The sweep, 1.65x (`f9d67bb` and the two after `86d1688`).* The sweep-and-prune broadphase swept the static bodies with everything else: a level's walls against each other, which the grid had stopped doing in 0.4.0. It sweeps the movers alone, finds the static bodies through the tree, and tells two bodies apart along Y and Z without a call. On a level of 1,024 boxes with 48 thrown it went from 1.6 ms a step to 0.2.
+- *A mesh's triangles, once.* Four places walked a mesh's grid, each with its own copy of the loop. There is one, `shape.trianglesIn`.
+
+**What did not move, and why it was left.** Boxes thrown in a heap: 1.08x here with the grid, and 1.25x to 1.35x with the sweep on a game's level of 58 boxes, which is the broadphase to use for them. Two things were going to be tried for these and were measured first instead.
+
+- *Remembering the axis two boxes were apart along.* In a heap of 48 thrown boxes, 62 pairs a step are apart and 32 touch, and the pairs that are apart are found apart after 3.5 axes of the fifteen on average. Starting from the right one saves two and a half tests a pair: two hundredths of a step, before the lookup is paid for.
+- *Keeping the list of near pairs between steps.* Once two boxes are told apart by their bounds without a call, offering a pair costs less than keeping it.
+
+What a step with a heap in the air is spent on is the pairs that do touch: fifteen axes and a clipped face each, then the solver. Making that cheaper means doing less of it, by keeping a pair's contacts from the last step while it barely moves, or solving fewer times, and both change what a world computes.
+
+**Where a line between modules cost.** Calls between modules are not inlined. Moving the six small functions that turn a vector by a rotation into a module of their own, untyped, made compounds, meshes and sweeps 8% to 14% slower, so they are in `geometry.jsl` with the loops that call them. A mesh's grid being built called the cell packer for every cell, across modules, and was 1.3x slower until a triangle's cells were numbered from its first.
+
 ## 0.4.0: a level
 
-Measured on 2026-11-23, on an Intel(R) Core(TM) i7-10870H CPU @ 2.20GHz (16 threads), with Jess 0.3.0, a verified release build. Base is 0.3.2 (`53ac396`) and head is 0.4.0, each the least of three runs, taken turn about so that the machine's drift, which is some 10% from one minute to the next, falls on both.
+Measured on 2026-11-22, on an Intel(R) Core(TM) i7-10870H CPU @ 2.20GHz (16 threads), with Jess 0.3.0, a verified release build. Base is 0.3.2 (`53ac396`) and head is 0.4.0, each the least of three runs, taken turn about so that the machine's drift, which is some 10% from one minute to the next, falls on both.
 
 0.4.0 is for worlds that are mostly static: a game's level, with a few things moving in it and a heap of things that have stopped. The level workloads are new with it: 1,024 static boxes, a floor of slabs with pillars and crates on them and a room in the middle.
 

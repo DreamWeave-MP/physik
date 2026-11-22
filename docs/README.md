@@ -6,7 +6,34 @@
 local physik = require("@dream/physik")
 ```
 
-Current package version: **0.4.0**.
+Current package version: **0.5.0**.
+
+## How it is laid out
+
+physik is written in Jess's strict Luau throughout: `jess package check` passes on every file, the tests and the benchmark included, and so does the style checker. A world and everything a call hands over or gets back has a type, exported from `@dream/physik`: `physik.World`, `physik.Shape`, `physik.BodyOptions`, `physik.RayHit`, `physik.CastHit` and the rest.
+
+| Module | What is in it |
+| --- | --- |
+| `physik.jsl` | The way in: the shapes, `newWorld`, and what a step does in what order |
+| `world.jsl` | A world's state, as typed columns; bodies, forces and joints as they are declared |
+| `shape.jsl` | Making shapes; a mesh's grid of triangles; how hard each shape is to turn |
+| `geometry.jsl` | Rotations, nearest points, the contact tests, rays and sweeps: nothing in it knows what a body is |
+| `broadphase.jsl` | Which pairs may touch: the movers, the tree of static bodies, the grid, the sweep, bodies at rest |
+| `narrowphase.jsl` | What a pair does touch: contacts |
+| `solver.jsl` | Islands, the contact cache, solving contacts and joints, sleep, integration |
+| `queries.jsl` | Rays, box queries, sphere and capsule sweeps, swept bodies |
+| `drains.jsl` | A world's state read out as columns, and written back |
+| `character.jsl` | `@dream/physik/character` |
+
+Two things decided where the lines between them are, and both were measured. Calls between modules are never inlined, so a few lines that are in the middle of every loop, as turning a vector by a rotation is, live in the module whose loops they are in: kept in one of their own they cost a tenth of a step on meshes and compounds. And annotated code compiles to much tighter native code than code that is not: typing the geometry alone, with not a line of arithmetic changed, made rays and sweeps one and a half to twice as fast.
+
+## Changed in 0.5.0
+
+- A rotation's two parts are `turn` and `turnW`, where they were `v` and `w`: in what `quat` and `axisAngle` return and in `getBody().rotation`.
+- A contact's two bodies are `first` and `second`, where they were `a` and `b`: in `contacts()`, and as columns of `writeContacts` and `writeContactEvents`.
+- A mesh's `nodeTri` is `nodeTriangle`, and a compound's `qv` and `qw` are `turns` and `turnWs`.
+- `physik.STATIC`, `DYNAMIC`, `KINEMATIC` and `_constants` are gone: a body's type was always given as the string.
+- `character.setHeight` is new.
 
 ## v0.3 architecture
 
@@ -132,7 +159,7 @@ local state, count = world:writeTransforms(reusable, {
 
 -- state.handles
 -- state.positions
--- state.rotations       -- quaternion xyz as vector
+-- state.rotations       -- a rotation's vector part
 -- state.rotationW
 -- state.velocities
 -- state.angularVelocities
@@ -310,6 +337,7 @@ contactEvents              default false
 
 A level is mostly static bodies, and a step is not charged for them. Every static body, whatever its size, is kept in a tree that is built when one is added, removed or moved, and not otherwise; the grid and the sweep are of the bodies that can move, and a step visits only those. What moves looks itself up in the tree, and keeps the answer until it has moved a little way.
 
+- A world with up to a few hundred bodies moving in a level is quickest with `broadphase = 'sap'`: the sweep is of the movers alone, and the static bodies are found through the tree either way.
 - Add a level's geometry as `type = 'static'` boxes, meshes and heightfields. A thousand of them cost a step nothing, and a ray or a sweep through them walks the tree.
 - Move a static body with `setPosition` or `setRotation` and the tree is built again, at that step. Something that moves every step, a lift or a door, is `type = 'kinematic'`, driven with `driveKinematic`.
 - A world that has had bodies taken out of it steps as a new one does: a freed slot is given out lowest first, so the same bodies added in the same order get the same slots.
@@ -361,6 +389,7 @@ who.ground        -- the handle of what it is standing on
 - **Lifts.** `character.groundVelocity(who)` is how the ground under its soles is moving. Add it to the motion and the character rides a kinematic lift up and down; a lift that comes up under a character who was not told pushes them up all the same.
 - **Jumps.** A move that rises does not look for ground, so a jump leaves it.
 - `character.fits(who, position)` says whether the character would be clear of everything there.
+- **Crouching.** `character.setHeight(who, height)` makes the character that tall, its soles where they are. It is made shorter at once and taller only where there is room, and returns whether it is now that tall: false means it was to stand and something is over it. How fast a crouched character moves, and where its eyes are, are the game's.
 
 A move asks the world once for everything it could meet and sweeps against that, so it costs two or three sweeps whatever the size of the level.
 
@@ -415,7 +444,7 @@ Not implemented yet:
 - edge/edge multi-point manifolds;
 - general dynamic-vs-dynamic TOI islands;
 - moving-box/capsule/compound CCD and rotational TOI;
-- a character that crouches, swims or climbs: `@dream/physik/character` walks, steps, slides and rides, and the rest is the game's;
+- a character that swims or climbs: `@dream/physik/character` walks, steps, slides, rides and crouches, and the rest is the game's;
 - capsule sweeps of a capsule that is not upright;
 - deterministic fixed-point simulation or cross-architecture bitwise determinism;
 - solver parallelism across independent islands.
