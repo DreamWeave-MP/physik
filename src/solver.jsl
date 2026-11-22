@@ -383,6 +383,17 @@ local function matchCachedContact(state: State, contact: number, firstAnchor: ve
   state.warmStartedCount += 1
 end
 
+--- Forgets what was kept of the pairs that have not touched for a few steps.
+local function forgetStaleContacts(state: State)
+  local cache, epoch = state.contactCache, state.cacheEpoch
+
+  for key, entry in cache do
+    if epoch - (entry[CacheEpoch] :: number) > 2 then cache[key] = nil end
+  end
+end
+
+--- Keeps what each solved contact came to, for the next step to start from: up to four to a
+--- pair, each with where it is in both bodies.
 local function storeContactCache(state: State)
   local {contactCache: cache, activeContacts: active, cacheEpoch: epoch, generation, position, turn, turnW} = state
   local {contactFirst: firsts, contactSecond: seconds, contactPoint: points, contactNormal: normals, firstAnchor: firstAnchors, secondAnchor: secondAnchors} = state
@@ -424,11 +435,7 @@ local function storeContactCache(state: State)
     entry[record + 5] = tangents1[contact] * tangentImpulses1[contact] + tangents2[contact] * tangentImpulses2[contact]
   end
 
-  if epoch % 64 ~= 0 then return end
-
-  for key, entry in cache do
-    if epoch - (entry[CacheEpoch] :: number) > 2 then cache[key] = nil end
-  end
+  if epoch % 64 == 0 then forgetStaleContacts(state) end
 end
 
 local function buildContactEvents(state: State)
@@ -851,6 +858,7 @@ function solver.applyImpulse(state: State, handle: number, impulse: vector, poin
   state.sleepTime[body] = 0
 end
 
+solver.forgetStaleContacts = forgetStaleContacts
 solver.integrate = integrate
 solver.buildContactEvents = buildContactEvents
 solver.wakeContacts = wakeContacts

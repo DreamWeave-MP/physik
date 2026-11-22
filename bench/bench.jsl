@@ -718,7 +718,7 @@ workload('drain: contacts of the pile, as columns', function(): string
 
   local total = sum[
     for index in range(1, count) =>
-      state.a[index] % 1048576 + state.b[index] % 1048576 * 3 + weigh(state.normals[index]) + weigh(state.points[index]) + state.penetration[index] + state.normalImpulse[index]
+      state.first[index] % 1048576 + state.second[index] % 1048576 * 3 + weigh(state.normals[index]) + weigh(state.points[index]) + state.penetration[index] + state.normalImpulse[index]
   ]
 
   return `{count} contacts, checksum {pin(total)}`
@@ -726,7 +726,7 @@ end)
 
 workload('drain: contacts of the pile, as records', function(): string
   local contacts = pile:contacts()
-  local total = sum[for contact in contacts => contact.a % 1048576 + weigh(contact.point) + contact.penetration + contact.normalImpulse]
+  local total = sum[for contact in contacts => contact.first % 1048576 + weigh(contact.point) + contact.penetration + contact.normalImpulse]
 
   return `{#contacts} contacts, checksum {pin(total)}`
 end)
@@ -736,7 +736,7 @@ local happened = {}
 workload('drain: contact events of the pile, without the ones that stay', function(): string
   local every = select(2, pile:writeContactEvents(happened))
   local state, count = pile:writeContactEvents(happened, false)
-  local total = sum[for index in range(1, count) => state.a[index] % 1048576 + state.b[index] % 1048576 * 3 + state.kind[index]]
+  local total = sum[for index in range(1, count) => state.first[index] % 1048576 + state.second[index] % 1048576 * 3 + state.kind[index]]
 
   return `{every} events, {count} that began or ended, checksum {total}`
 end)

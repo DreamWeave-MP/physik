@@ -271,6 +271,7 @@ export type State = {
   castCandidates: { number },
   castCapsule: { kind: 'capsule', radius: number, halfHeight: number },
   castTriangles: { vector },
+  meshTriangles: { number },
 
   -- Islands: the bodies that touch or are joined, which sleep and wake together.
   islandParent: { number },
@@ -547,6 +548,7 @@ function world.new(options: Options?): State
     castCandidates = {},
     castCapsule = { kind = 'capsule' :: 'capsule', radius = 0, halfHeight = 0 },
     castTriangles = {},
+    meshTriangles = {},
 
     islandParent = {},
     islandSize = {},
@@ -924,6 +926,14 @@ function world.getBody(state: State, handle: number): Body
     sensor = state.sensor[body],
     userData = state.userData[body],
   }
+end
+
+--- Turns a body to a rotation given in its two parts, which need not be of length one.
+function world.turnTo(state: State, body: number, turn: vector, turnW: number)
+  local unitTurn, unitTurnW = geometry.normalizeTurn(turn, turnW)
+
+  state.turn[body], state.turnW[body] = unitTurn, unitTurnW
+  state.axis0[body], state.axis1[body], state.axis2[body] = geometry.axesOf(unitTurn, unitTurnW)
 end
 
 --- Puts a body somewhere, and wakes it unless `wake` is false.

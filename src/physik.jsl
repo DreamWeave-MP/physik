@@ -1,1478 +1,190 @@
+--!strict
 --!native
--- physik: compact 3D rigid-body physics for Jess/Luau.
--- Hot state uses Luau's native vector value type. Cold metadata stays scalar/packed-friendly.
+-- physik: rigid bodies in three dimensions, for Jess.
+--
+-- A world holds bodies, each a shape with a place and a rotation, and `step` moves them: under
+-- gravity and whatever pushes them, apart where they touch, together where they are joined.
+-- Around that a world answers questions, of rays and swept shapes and boxes, and hands its
+-- state out in columns for whatever draws it or sends it.
+--
+-- This file is the way in: the shapes, the world, and what a step does in what order. The
+-- work is in the modules beside it, one to each part of a step.
+local broadphase = require './broadphase'
+local drains = require './drains'
+local queries = require './queries'
+local shapes = require './shape'
+local solver = require './solver'
+local types = require './types'
+local worlds = require './world'
 
-local data = require('@dream/data')
-local cells = require('./cells')
-local geometry = require('./geometry')
-local shapes = require('./shape')
-local broadphase = require('./broadphase')
-local listMovers = broadphase.movers
-local solver = require('./solver')
-local worlds = require('./world')
+local physik = {}
 
-local M = {}
+type State = worlds.State
 
--- What has moved out of this file, under the names the rest of it still calls it by.
-local clamp, safeUnit, qNormalize = geometry.clamp, geometry.unit, geometry.normalizeTurn
-local qRotate, qInvRotate, qMul, qAxes, qIntegrate = geometry.rotate, geometry.unrotate, geometry.composeTurns, geometry.axesOf, geometry.integrateTurn
-local supportBoxAxes, capsuleEndpoints = geometry.boxSupport, geometry.capsuleEnds
-local sphereSphere, sphereBox, boxBox = geometry.sphereOnSphere, geometry.sphereOnBox, geometry.boxOnBox
-local capsuleSphere, capsuleCapsule, capsuleBox = geometry.capsuleOnSphere, geometry.capsuleOnCapsule, geometry.capsuleOnBox
-local capsuleTriangle = geometry.capsuleOnTriangle
-local collidePrimitives, primitiveTriangleContact = geometry.primitiveOnPrimitive, geometry.primitiveOnTriangle
-local transformedBoundsLocal = geometry.boundsWithin
-local rayTriangleT, triangleRayNormal = geometry.rayToTriangle, geometry.triangleFacing
-local raySphere, rayAabbInterval, rayPrimitiveShape = geometry.rayToSphere, geometry.rayThroughBox, geometry.rayToPrimitive
-local sweepSphereTriangle, sweepSphereSegment = geometry.sweepSphereAtTriangle, geometry.sweepSphereAtSegment
-local sweepSphereSphere, sweepSphereBox = geometry.sweepSphereAtSphere, geometry.sweepSphereAtBox
-local sweepCapsule, SweepSkin = geometry.sweepCapsule, geometry.SweepSkin
-local packCell, meshTriangle, heightVertex, inertiaFor = cells.pack, shapes.meshTriangle, shapes.heightVertex, shapes.inverseInertia
+export type Shape = types.Shape
+export type Rotation = types.Rotation
+export type WorldOptions = worlds.Options
+export type BodyOptions = worlds.BodyOptions
+export type JointOptions = worlds.JointOptions
+export type Body = worlds.Body
+export type CastHit = queries.CastHit
+export type RayHit = queries.RayHit
+export type Overlaps = queries.Overlaps
+export type Contact = drains.Contact
+export type Stats = drains.Stats
 
-M.sphere, M.box, M.capsule, M.compound = shapes.sphere, shapes.box, shapes.capsule, shapes.compound
-M.triangleMesh, M.heightfield, M.quat, M.axisAngle = shapes.triangleMesh, shapes.heightfield, shapes.quat, shapes.axisAngle
+--- Moves the world on by `duration`, in `substeps` equal parts if more than one is asked for,
+--- and returns how many contacts the last part found. Each part moves the bodies, stops the
+--- ones that are swept, finds what touches, and solves it.
+local function step(state: State, duration: number, substeps: number?): number
+  assert(type(duration) == 'number' and duration > 0, 'physik.step: dt must be > 0')
 
-local ZERO = vector.create(0, 0, 0)
-local XAXIS = vector.create(1, 0, 0)
-local YAXIS = vector.create(0, 1, 0)
-local ZAXIS = vector.create(0, 0, 1)
-local EPS = 1e-8
-local HANDLE_STRIDE = 1048576 -- 20 index bits worth of exact-number handle space.
+  local parts = substeps or 1
+  assert(parts >= 1 and parts % 1 == 0, 'physik.step: substeps must be a positive integer')
 
-local BODY_STATIC = 'static'
-local BODY_DYNAMIC = 'dynamic'
-local BODY_KINEMATIC = 'kinematic'
-local SHAPE_SPHERE = 'sphere'
-local SHAPE_BOX = 'box'
-local SHAPE_CAPSULE = 'capsule'
-local SHAPE_MESH = 'mesh'
-local SHAPE_HEIGHTFIELD = 'heightfield'
-local SHAPE_COMPOUND = 'compound'
-local JOINT_DISTANCE = 'distance'
-local JOINT_BALL = 'ball'
-local JOINT_HINGE = 'hinge'
+  local each = duration / parts
 
-local EVENT_ENTER = 1
-local EVENT_STAY = 2
-local EVENT_EXIT = 3
+  for _ = 1, parts do
+    solver.integrate(state, each)
+    queries.sweepBodies(state)
+    broadphase.collide(state)
 
--- Persistent contact cache entry layout. One array table per body pair, no child tables.
-local CACHE_COUNT = 1
-local CACHE_EPOCH = 2
-local CACHE_GA = 3
-local CACHE_GB = 4
-local CACHE_MATCH_EPOCH = 5
-local CACHE_USED_MASK = 6
-local CACHE_HEADER = 6
-local CACHE_STRIDE = 5 -- localA, localB, normal, normalImpulse, tangentImpulse
-
-local CELL_BASE = 65536
-local CELL_OFFSET = 32768
-local CELL_BASE2 = 4294967296
--- A cell, then the thirteen of its twenty-six neighbours it is paired with: half of them, so that
--- a pair of neighbouring cells is found from one side only. A packed cell is affine in its
--- coordinates, so inside the packed range a neighbour's key is the cell's plus a constant.
-local GridStepX = { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }
-local GridStepY = { 0, -1, -1, -1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0 }
-local GridStepZ = { 0, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, 1 }
-
-local GridKeyStep = [
-  for stepX, stepY, stepZ in zipStrict(GridStepX, GridStepY, GridStepZ) =>
-    stepX * CELL_BASE2 + stepY * CELL_BASE + stepZ
-]
-
--- A byte for each residue of a packed cell: set while a cell with that residue is occupied, so
--- a clear byte says a cell is empty without a lookup in the table of cells.
-local GridFilterSize = 65521
-
-M.STATIC = "static"
-M.DYNAMIC = "dynamic"
-M.KINEMATIC = "kinematic"
-
-
-local function makeHandle(i, generation)
-    return generation * HANDLE_STRIDE + i
-end
-
-local function splitHandle(handle)
-    local i = handle % HANDLE_STRIDE
-    return i, (handle - i) / HANDLE_STRIDE
-end
-
-
-
-
-local World = {}
-World.__index = World
-
--- What has moved into the world module, under the names the rest of this file still calls it by.
-local bodyPairKey = worlds.pairKey
-
-function World:_check(handle) return worlds.slotOf(self, handle) end
-function World:_updateAabb(body) worlds.refreshBounds(self, body) end
-function World:_handleOf(body) return worlds.handleOf(self, body) end
-function World:_unsettle(body) worlds.unsettle(self, body) end
-function World:shiftOrigin(delta)
-  worlds.shiftOrigin(self, delta)
-
-  return self
-end
-
-World.addBody, World.removeBody, World.hasBody, World.getBody = worlds.addBody, worlds.removeBody, worlds.hasBody, worlds.getBody
-World.setPosition, World.setRotation, World.driveKinematic = worlds.setPosition, worlds.setRotation, worlds.driveKinematic
-World.setVelocity, World.setAngularVelocity, World.wake = worlds.setVelocity, worlds.setAngularVelocity, worlds.wake
-World.applyForce, World.applyForceAtPoint, World.applyTorque = worlds.applyForce, worlds.applyForceAtPoint, worlds.applyTorque
-World.applyAngularImpulse, World.applyImpulse = solver.applyAngularImpulse, solver.applyImpulse
-World.addDistanceJoint, World.addBallJoint, World.addHingeJoint = worlds.addDistanceJoint, worlds.addBallJoint, worlds.addHingeJoint
-World.removeJoint = worlds.dropJoint
-
-function M.newWorld(options)
-  return setmetatable(worlds.new(options), World)
-end
-
-
-function World:_sweepSphereMesh(geom,startPos,endPos,radius)
-    local shape=self.shape[geom]
-    local gqv,gqw,gp=self.turn[geom],self.turnW[geom],self.position[geom]
-    local ls=qInvRotate(gqv,gqw,startPos-gp)
-    local le=qInvRotate(gqv,gqw,endPos-gp)
-    local e=vector.create(radius,radius,radius)
-    local mn=vector.create(math.min(ls.x,le.x),math.min(ls.y,le.y),math.min(ls.z,le.z))-e
-    local mx=vector.create(math.max(ls.x,le.x),math.max(ls.y,le.y),math.max(ls.z,le.z))+e
-    local cs=shape.cellSize
-    local x0,y0,z0=math.floor(mn.x/cs),math.floor(mn.y/cs),math.floor(mn.z/cs)
-    local x1,y1,z1=math.floor(mx.x/cs),math.floor(mx.y/cs),math.floor(mx.z/cs)
-    local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
-    self.meshMarkEpoch+=1
-    local epoch=self.meshMarkEpoch
-    local bestT,bestN=1,nil
-    if cells>self.meshQueryCellLimit then
-        for t=0,shape.triangleCount-1 do
-            self.meshMarks[t]=epoch
-            local a,b,c=meshTriangle(shape,t)
-            local tt,n=sweepSphereTriangle(ls,le,radius,a,b,c)
-            if tt and tt<bestT then bestT,bestN=tt,n end
-        end
+    if state.trackContactEvents then
+      solver.buildContactEvents(state)
     else
-        for x=x0,x1 do for y=y0,y1 do for z=z0,z1 do
-            local key=packCell(x,y,z)
-            if key then
-                local node=shape.heads[key] or 0
-                while node~=0 do
-                    local t=shape.nodeTriangle[node]
-                    if self.meshMarks[t]~=epoch then
-                        self.meshMarks[t]=epoch
-                        local a,b,c=meshTriangle(shape,t)
-                        local tt,n=sweepSphereTriangle(ls,le,radius,a,b,c)
-                        if tt and tt<bestT then bestT,bestN=tt,n end
-                    end
-                    node=shape.nextNode[node]
-                end
-            end
-        end end end
-        for k=1,#shape.overflow do
-            local t=shape.overflow[k]
-            if self.meshMarks[t]~=epoch then
-                self.meshMarks[t]=epoch
-                local a,b,c=meshTriangle(shape,t)
-                local tt,n=sweepSphereTriangle(ls,le,radius,a,b,c)
-                if tt and tt<bestT then bestT,bestN=tt,n end
-            end
-        end
+      state.contactEventCount = 0
     end
-    if not bestN then return nil end
-    return bestT,qRotate(gqv,gqw,bestN)
-end
 
-function World:_sweepSphereHeightfield(geom,startPos,endPos,radius)
-    local shape=self.shape[geom]
-    local gqv,gqw,gp=self.turn[geom],self.turnW[geom],self.position[geom]
-    local ls=qInvRotate(gqv,gqw,startPos-gp)
-    local le=qInvRotate(gqv,gqw,endPos-gp)
-    local o=shape.origin
-    local x0=clamp(math.floor((math.min(ls.x,le.x)-radius-o.x)/shape.cellSizeX),0,shape.width-2)
-    local x1=clamp(math.floor((math.max(ls.x,le.x)+radius-o.x)/shape.cellSizeX),0,shape.width-2)
-    local z0=clamp(math.floor((math.min(ls.z,le.z)-radius-o.z)/shape.cellSizeZ),0,shape.depth-2)
-    local z1=clamp(math.floor((math.max(ls.z,le.z)+radius-o.z)/shape.cellSizeZ),0,shape.depth-2)
-    local bestT,bestN=1,nil
-    for z=z0,z1 do for x=x0,x1 do
-        local v00=heightVertex(shape,x,z)
-        local v10=heightVertex(shape,x+1,z)
-        local v01=heightVertex(shape,x,z+1)
-        local v11=heightVertex(shape,x+1,z+1)
-        local t,n=sweepSphereTriangle(ls,le,radius,v00,v10,v11)
-        if t and t<bestT then bestT,bestN=t,n end
-        t,n=sweepSphereTriangle(ls,le,radius,v00,v11,v01)
-        if t and t<bestT then bestT,bestN=t,n end
-    end end
-    if not bestN then return nil end
-    return bestT,qRotate(gqv,gqw,bestN)
-end
-
-
-function World:_sweepSphereCompound(geom,startPos,endPos,radius)
-    local shape=self.shape[geom]
-    local bp,bqv,bqw=self.position[geom],self.turn[geom],self.turnW[geom]
-    local bestT,bestN=1,nil
-    for k=1,shape.count do
-        local cp=bp+qRotate(bqv,bqw,shape.positions[k])
-        local cqv,cqw=qMul(bqv,bqw,shape.turns[k],shape.turnWs[k])
-        local child=shape.shapes[k]
-        local t,n
-        if child.kind==SHAPE_SPHERE then
-            t,n=sweepSphereSphere(startPos,endPos,radius,cp,child.radius)
-        elseif child.kind==SHAPE_BOX then
-            t,n=sweepSphereBox(startPos,endPos,radius,cp,cqv,cqw,child.halfExtents)
-        else
-            local a,b=capsuleEndpoints(cp,cqv,cqw,child.halfHeight)
-            t,n=sweepSphereSegment(startPos,endPos,radius+child.radius,a,b)
-        end
-        if t and t<bestT then bestT,bestN=t,n end
-    end
-    if not bestN then return nil end
-    return bestT,bestN
-end
-
-function World:_ccd()
-    self.sweptHits=0
-    if self.sweptCount==0 then return end
-    for i=1,self.high do
-        if not self.alive[i] or self.bodyType[i]~=BODY_DYNAMIC or self.sleeping[i] or not self.swept[i] then continue end
-        local shape=self.shape[i]
-        if shape.kind~=SHAPE_SPHERE then continue end -- CCD is intentionally sphere-first.
-        local start=self.previousPosition[i]
-        local finish=self.position[i]
-        local motion=finish-start
-        local len2=vector.dot(motion,motion)
-        if len2<=EPS then continue end
-        local bestT,bestN,bestJ=1,nil,nil
-        for j=1,self.high do
-            if j==i or not self.alive[j] or self.bodyType[j]==BODY_DYNAMIC then continue end
-            if bit32.band(self.mask[i],self.group[j])==0 or bit32.band(self.mask[j],self.group[i])==0 then continue end
-            local target=self.shape[j]
-            local t,n
-            if target.kind==SHAPE_SPHERE then
-                t,n=sweepSphereSphere(start,finish,shape.radius,self.position[j],target.radius)
-            elseif target.kind==SHAPE_BOX then
-                t,n=sweepSphereBox(start,finish,shape.radius,self.position[j],self.turn[j],self.turnW[j],target.halfExtents)
-            elseif target.kind==SHAPE_MESH then
-                t,n=self:_sweepSphereMesh(j,start,finish,shape.radius)
-            elseif target.kind==SHAPE_HEIGHTFIELD then
-                t,n=self:_sweepSphereHeightfield(j,start,finish,shape.radius)
-            elseif target.kind==SHAPE_COMPOUND then
-                t,n=self:_sweepSphereCompound(j,start,finish,shape.radius)
-            end
-            if t and t<bestT then bestT,bestN,bestJ=t,n,j end
-        end
-        if bestN then
-            local len=math.sqrt(len2)
-            local backoff=if len>EPS then math.min(self.ccdSlop/len,bestT) else 0
-            self.position[i]=start+motion*(bestT-backoff)
-            local vn=vector.dot(self.velocity[i],bestN)
-            if vn<0 then
-                local rest=math.max(self.restitution[i],self.restitution[bestJ])
-                self.velocity[i]-=bestN*(vn*(1+rest))
-            end
-            self.sweptHits+=1
-        end
-    end
-end
-
-
-function World:step(dt,substeps)
-    assert(type(dt)=="number" and dt>0,"physik.step: dt must be > 0")
-    substeps=substeps or 1
-    assert(substeps>=1 and substeps%1==0,"physik.step: substeps must be a positive integer")
-    local h=dt/substeps
-    for _=1,substeps do
-        solver.integrate(self,h)
-        self:_ccd()
-        broadphase.collide(self)
-        if self.trackContactEvents then solver.buildContactEvents(self) else self.contactEventCount=0 end
-        if self.stirring==0 and self.jointCount==0 and #self.unsettled==0 and not self.stillWasMoved then
-            -- Everything is at rest, and touches as it did: nothing is woken, joined or solved.
-            self.activeContactCount=0
-            self.warmStartedCount=0
-        elseif self.contactCount==0 and self.jointCount==0 then
-            -- With no contact/joint graph every dynamic body is an independent island. Avoid
-            -- building union-find state merely to rediscover that fact.
-            self.activeContactCount=0
-            self.warmStartedCount=0
-            solver.sleepIndependent(self,h)
-            if self.cacheEpoch%64==0 then
-                for key,e in self.contactCache do
-                    if self.cacheEpoch-e[CACHE_EPOCH]>2 then self.contactCache[key]=nil end
-                end
-            end
-        else
-            solver.wakeContacts(self)
-            solver.buildIslands(self)
-            solver.prepareContacts(self,h)
-            solver.solveContacts(self,h)
-            solver.storeContactCache(self)
-            solver.correctPositions(self)
-            solver.sleep(self,h)
-        end
-        -- Position correction can move bodies after the collision broadphase was built.
-        -- Queries rebuild lazily only if a query is actually issued. Nothing has moved when
-        -- nothing stirred.
-        if self.stirring>0 then self.gridValid=false end
-    end
-    self.frame+=1
-    return self.contactCount
-end
-
-function World:_rayMeshTriangleT(shape,t,origin,dir,bestT,epoch)
-    if self.meshMarks[t]==epoch then return nil end
-    self.meshMarks[t]=epoch
-    local a,b,c=meshTriangle(shape,t)
-    return rayTriangleT(origin,dir,bestT,a,b,c)
-end
-
-function World:_rayMesh(i,origin,dir,maxDist)
-    local shape=self.shape[i]
-    local lo=qInvRotate(self.turn[i],self.turnW[i],origin-self.position[i])
-    local ld=qInvRotate(self.turn[i],self.turnW[i],dir)
-    local enter,exit=rayAabbInterval(lo,ld,maxDist,shape.localMin,shape.localMax)
-    if not enter then return nil end
-    local a=lo+ld*math.max(enter,0)
-    local b=lo+ld*exit
-    local mn=vector.create(math.min(a.x,b.x),math.min(a.y,b.y),math.min(a.z,b.z))
-    local mx=vector.create(math.max(a.x,b.x),math.max(a.y,b.y),math.max(a.z,b.z))
-    local cs=shape.cellSize
-    local x0,y0,z0=math.floor(mn.x/cs),math.floor(mn.y/cs),math.floor(mn.z/cs)
-    local x1,y1,z1=math.floor(mx.x/cs),math.floor(mx.y/cs),math.floor(mx.z/cs)
-    local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
-    self.meshMarkEpoch+=1
-    local epoch=self.meshMarkEpoch
-    local bestT,bestTri=maxDist,nil
-    if cells>self.meshQueryCellLimit then
-        for t=0,shape.triangleCount-1 do
-            local tt=self:_rayMeshTriangleT(shape,t,lo,ld,bestT,epoch)
-            if tt and tt<bestT then bestT,bestTri=tt,t end
-        end
+    if state.stirring == 0 and state.jointCount == 0 and not state.stillWasMoved then
+      -- Everything is at rest, and touches as it did: nothing is woken, joined or solved.
+      state.activeContactCount = 0
+      state.warmStartedCount = 0
+    elseif state.contactCount == 0 and state.jointCount == 0 then
+      -- Nothing touches and nothing is joined, so every body is an island of its own.
+      state.activeContactCount = 0
+      state.warmStartedCount = 0
+      solver.sleepIndependent(state, each)
+      if state.cacheEpoch % 64 == 0 then solver.forgetStaleContacts(state) end
     else
-        for x=x0,x1 do for y=y0,y1 do for z=z0,z1 do
-            local key=packCell(x,y,z)
-            if key then
-                local node=shape.heads[key] or 0
-                while node~=0 do
-                    local tri=shape.nodeTriangle[node]
-                    local tt=self:_rayMeshTriangleT(shape,tri,lo,ld,bestT,epoch)
-                    if tt and tt<bestT then bestT,bestTri=tt,tri end
-                    node=shape.nextNode[node]
-                end
-            end
-        end end end
-        for k=1,#shape.overflow do
-            local tri=shape.overflow[k]
-            local tt=self:_rayMeshTriangleT(shape,tri,lo,ld,bestT,epoch)
-            if tt and tt<bestT then bestT,bestTri=tt,tri end
-        end
+      solver.wakeContacts(state)
+      solver.buildIslands(state)
+      solver.prepareContacts(state, each)
+      solver.solveContacts(state, each)
+      solver.storeContactCache(state)
+      solver.correctPositions(state)
+      solver.sleep(state, each)
     end
-    if bestTri==nil then return nil end
-    local ta,tb,tc=meshTriangle(shape,bestTri)
-    local bestN=triangleRayNormal(ta,tb,tc,ld)
-    return bestT,qRotate(self.turn[i],self.turnW[i],bestN),origin+dir*bestT
-end
 
-function World:_rayHeightfield(i,origin,dir,maxDist)
-    local shape=self.shape[i]
-    local lo=qInvRotate(self.turn[i],self.turnW[i],origin-self.position[i])
-    local ld=qInvRotate(self.turn[i],self.turnW[i],dir)
-    local enter,exit=rayAabbInterval(lo,ld,maxDist,shape.localMin,shape.localMax)
-    if not enter then return nil end
-    local a=lo+ld*math.max(enter,0)
-    local b=lo+ld*exit
-    local o=shape.origin
-    local x0=clamp(math.floor((math.min(a.x,b.x)-o.x)/shape.cellSizeX),0,shape.width-2)
-    local x1=clamp(math.floor((math.max(a.x,b.x)-o.x)/shape.cellSizeX),0,shape.width-2)
-    local z0=clamp(math.floor((math.min(a.z,b.z)-o.z)/shape.cellSizeZ),0,shape.depth-2)
-    local z1=clamp(math.floor((math.max(a.z,b.z)-o.z)/shape.cellSizeZ),0,shape.depth-2)
-    local bestT,bestA,bestB,bestC=maxDist,nil,nil,nil
-    for z=z0,z1 do for x=x0,x1 do
-        local v00=heightVertex(shape,x,z)
-        local v10=heightVertex(shape,x+1,z)
-        local v01=heightVertex(shape,x,z+1)
-        local v11=heightVertex(shape,x+1,z+1)
-        local t=rayTriangleT(lo,ld,bestT,v00,v10,v11)
-        if t and t<bestT then bestT,bestA,bestB,bestC=t,v00,v10,v11 end
-        t=rayTriangleT(lo,ld,bestT,v00,v11,v01)
-        if t and t<bestT then bestT,bestA,bestB,bestC=t,v00,v11,v01 end
-    end end
-    if not bestA then return nil end
-    local bestN=triangleRayNormal(bestA,bestB,bestC,ld)
-    return bestT,qRotate(self.turn[i],self.turnW[i],bestN),origin+dir*bestT
-end
-
-
-function World:_rayCompound(i,origin,dir,maxDist)
-    local shape=self.shape[i]
-    local bp,bqv,bqw=self.position[i],self.turn[i],self.turnW[i]
-    local bestT,bestN,bestP=maxDist,nil,nil
-    for k=1,shape.count do
-        local cp=bp+qRotate(bqv,bqw,shape.positions[k])
-        local cqv,cqw=qMul(bqv,bqw,shape.turns[k],shape.turnWs[k])
-        local t,n,p=rayPrimitiveShape(shape.shapes[k],cp,cqv,cqw,origin,dir,bestT)
-        if t and t<bestT then bestT,bestN,bestP=t,n,p end
-    end
-    if not bestN then return nil end
-    return bestT,bestN,bestP
-end
-
---- Where a ray first meets one body, if it does within `reach` and the body's group is in `mask`.
-local function raycastBody(self, body: number, origin: vector, dir: vector, reach: number, mask: number)
-  if not self.alive[body] or bit32.band(mask, self.group[body]) == 0 then return nil end
-
-  -- A sphere's box is not kept current as it moves, and the sphere is as quick to test as a box.
-  local shape = self.shape[body]
-  if shape.kind == SHAPE_SPHERE then return raySphere(origin, dir, reach, self.position[body], shape.radius) end
-  if not rayAabbInterval(origin, dir, reach, self.boundsLow[body], self.boundsHigh[body]) then return nil end
-
-  local kind = shape.kind
-  if kind == SHAPE_MESH then return self:_rayMesh(body, origin, dir, reach) end
-  if kind == SHAPE_HEIGHTFIELD then return self:_rayHeightfield(body, origin, dir, reach) end
-  if kind == SHAPE_COMPOUND then return self:_rayCompound(body, origin, dir, reach) end
-
-  return rayPrimitiveShape(shape, self.position[body], self.turn[body], self.turnW[body], origin, dir, reach)
-end
-
-function World:_raycastRawScan(origin, dir, maxDistance, mask)
-  local bestDistance = maxDistance
-  local bestBody, bestNormal, bestPoint
-
-  for body = 1, self.high do
-    local distance, normal, point = raycastBody(self, body, origin, dir, bestDistance, mask)
-
-    if distance and distance < bestDistance then
-      bestDistance, bestBody, bestNormal, bestPoint = distance, body, normal, point
-    end
+    -- Solving moves bodies after the grid was built, so a question asked next has it looked
+    -- over again. Nothing has moved when nothing stirred.
+    if state.stirring > 0 then state.gridValid = false end
   end
 
-  return bestBody, bestDistance, bestPoint, bestNormal
+  state.frame += 1
+
+  return state.contactCount
 end
 
-function World:_raycastRaw(origin, direction, maxDistance, mask)
-  maxDistance = maxDistance or math.huge
-  mask = if mask == nil then 0xffffffff else mask
+--- Moves the world on by time as it passes, in steps of a fixed length: `elapsed` is added to
+--- what was left over, and as many whole steps are taken as fit, up to `maxSteps`. Returns how
+--- many steps were taken, how far into the next one the world is, as a fraction, for whatever
+--- draws between steps, and whether time was dropped because too much of it had built up.
+local function advance(state: State, elapsed: number, fixedStep: number?, maxSteps: number?): (number, number, boolean)
+  assert(type(elapsed) == 'number' and elapsed >= 0, 'physik.advance: dt must be >= 0')
 
-  local lengthSquared = vector.dot(direction, direction)
-  if lengthSquared <= EPS then return nil end
+  local each = fixedStep or state.fixedDt
+  local limit = maxSteps or state.maxCatchUpSteps
+  assert(each > 0 and limit >= 1 and limit % 1 == 0, 'physik.advance: fixedDt must be > 0 and maxSteps a positive integer')
 
-  local dir = direction / math.sqrt(lengthSquared)
-  broadphase.ensureQueryGrid(self)
+  state.accumulator += elapsed
 
-  -- Oversized bodies (world meshes, terrain, large compounds) are normally few. Test them first;
-  -- a world hit gives the grid walk a finite early-out distance even for an unbounded ray.
-  local bestDistance = maxDistance
-  local bestBody, bestNormal, bestPoint
+  local steps = math.min(math.floor(state.accumulator / each), limit)
 
-  for _, body in self.gridLarge do
-    local distance, normal, point = raycastBody(self, body, origin, dir, bestDistance, mask)
-
-    if distance and distance < bestDistance then
-      bestDistance, bestBody, bestNormal, bestPoint = distance, body, normal, point
-    end
+  for _ = 1, steps do
+    step(state, each)
   end
 
-  -- The static ones, through their tree. Of two struck at one distance the lower slot is the
-  -- hit, as it was when they were tested in the order of their slots.
-  local entry = self.stillRoot
+  state.accumulator -= steps * each
 
-  if entry ~= 0 then
-    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack, stillNear: nears} = self
-    local {boundsLow: aabbMin, boundsHigh: aabbMax} = self
-    local top = 0
+  local dropped = state.accumulator >= each
+  if dropped then state.accumulator %= each end
 
-    -- The nearer half of a node first, so that what is struck there rules out the further half
-    -- before it is entered. A half no nearer than what has been struck is still entered when it
-    -- is exactly as near, for the body of a lower slot that may be in it.
-    while true do
-      if entry < 0 then
-        local distance, normal, point = raycastBody(self, -entry, origin, dir, bestDistance, mask)
-
-        if distance and (distance < bestDistance or (distance == bestDistance and bestBody and -entry < bestBody)) then
-          bestDistance, bestBody, bestNormal, bestPoint = distance, -entry, normal, point
-        end
-      else
-        local left, right = lefts[entry], rights[entry]
-        local leftAt = if left < 0
-          then rayAabbInterval(origin, dir, bestDistance, aabbMin[-left], aabbMax[-left])
-          else rayAabbInterval(origin, dir, bestDistance, lows[left], highs[left])
-        local rightAt = if right < 0
-          then rayAabbInterval(origin, dir, bestDistance, aabbMin[-right], aabbMax[-right])
-          else rayAabbInterval(origin, dir, bestDistance, lows[right], highs[right])
-
-        if leftAt and rightAt then
-          if rightAt < leftAt then
-            left, right, leftAt, rightAt = right, left, rightAt, leftAt
-          end
-
-          top += 1
-          stack[top], nears[top] = right, rightAt
-          entry = left
-          continue
-        elseif leftAt or rightAt then
-          entry = if leftAt then left else right
-          continue
-        end
-      end
-
-      while top > 0 and nears[top] > bestDistance do
-        top -= 1
-      end
-
-      if top == 0 then break end
-
-      entry = stack[top]
-      top -= 1
-    end
-  end
-
-  if self.gridSmallCount == 0 then return bestBody, bestDistance, bestPoint, bestNormal end
-
-  -- If the ray is effectively unbounded and oversized geometry did not cap it, a DDA could walk
-  -- forever. Fall back to the linear scan in that unusual case.
-  if bestDistance == math.huge then return self:_raycastRawScan(origin, dir, maxDistance, mask) end
-
-  local cellSize = self.broadphaseCellSize
-  local estimated = (math.abs(dir.x) + math.abs(dir.y) + math.abs(dir.z)) * bestDistance / cellSize + 3
-  if estimated > self.queryRayCellLimit then return self:_raycastRawScan(origin, dir, maxDistance, mask) end
-
-  local epoch = self.queryMarkEpoch + 1
-  self.queryMarkEpoch = epoch
-
-  local {queryMarks: marks, gridHeads: heads, gridNext: nextIn, gridOccupied: occupied} = self
-  local column, row, layer = math.floor(origin.x / cellSize), math.floor(origin.y / cellSize), math.floor(origin.z / cellSize)
-
-  -- An origin that is not a number is in no cell, so nothing in the grid is in the ray's way, and
-  -- a cell that is not a number has no byte in the filter to ask for.
-  if column ~= column or row ~= row or layer ~= layer then return bestBody, bestDistance, bestPoint, bestNormal end
-
-  local stepX = if dir.x > EPS then 1 elseif dir.x < -EPS then -1 else 0
-  local stepY = if dir.y > EPS then 1 elseif dir.y < -EPS then -1 else 0
-  local stepZ = if dir.z > EPS then 1 elseif dir.z < -EPS then -1 else 0
-  local spanX = if stepX ~= 0 then cellSize / math.abs(dir.x) else math.huge
-  local spanY = if stepY ~= 0 then cellSize / math.abs(dir.y) else math.huge
-  local spanZ = if stepZ ~= 0 then cellSize / math.abs(dir.z) else math.huge
-  local wallX = if stepX > 0 then (column + 1) * cellSize else column * cellSize
-  local wallY = if stepY > 0 then (row + 1) * cellSize else row * cellSize
-  local wallZ = if stepZ > 0 then (layer + 1) * cellSize else layer * cellSize
-  local nextX = if stepX ~= 0 then (wallX - origin.x) / dir.x else math.huge
-  local nextY = if stepY ~= 0 then (wallY - origin.y) / dir.y else math.huge
-  local nextZ = if stepZ ~= 0 then (wallZ - origin.z) / dir.z else math.huge
-  if nextX < 0 then nextX = 0 end
-  if nextY < 0 then nextY = 0 end
-  if nextZ < 0 then nextZ = 0 end
-
-  -- How far the neighbourhood moved along each axis since it was last scanned. Three is further
-  -- than a step moves it, so the first scan leaves nothing out.
-  local movedX, movedY, movedZ = 3, 3, 3
-  local travelled = 0
-
-  while travelled <= bestDistance do
-    -- Small bodies are stored by center cell while their AABB may touch an adjacent cell, so the
-    -- 3x3x3 neighbourhood is probed. A cell that was in the neighbourhood probed before this one
-    -- holds only bodies already tested, and is left out.
-    for offsetX = -1, 1 do
-      local seenX = math.abs(offsetX + movedX) <= 1
-
-      for offsetY = -1, 1 do
-        local seenXY = seenX and math.abs(offsetY + movedY) <= 1
-        if seenXY and movedZ == 0 then continue end
-
-        for offsetZ = -1, 1 do
-          if seenXY and math.abs(offsetZ + movedZ) <= 1 then continue end
-
-          local key = packCell(column + offsetX, row + offsetY, layer + offsetZ)
-          if not key or buffer.readu8(occupied, key % GridFilterSize) == 0 then continue end
-
-          local body = heads[key] or 0
-
-          while body ~= 0 do
-            if marks[body] ~= epoch then
-              marks[body] = epoch
-              local distance, normal, point = raycastBody(self, body, origin, dir, bestDistance, mask)
-
-              if distance and distance < bestDistance then
-                bestDistance, bestBody, bestNormal, bestPoint = distance, body, normal, point
-              end
-            end
-
-            body = nextIn[body] or 0
-          end
-        end
-      end
-    end
-
-    local nextDistance = math.min(nextX, nextY, nextZ)
-    if nextDistance > bestDistance or nextDistance == math.huge then break end
-
-    local edge = nextDistance + 1e-12
-    movedX, movedY, movedZ = 0, 0, 0
-
-    if nextX <= edge then
-      column += stepX
-      nextX += spanX
-      movedX = stepX
-    end
-
-    if nextY <= edge then
-      row += stepY
-      nextY += spanY
-      movedY = stepY
-    end
-
-    if nextZ <= edge then
-      layer += stepZ
-      nextZ += spanZ
-      movedZ = stepZ
-    end
-
-    travelled = nextDistance
-  end
-
-  return bestBody, bestDistance, bestPoint, bestNormal
+  return steps, state.accumulator / each, dropped
 end
 
-function World:_sphereCastRaw(startPos, endPos, radius, mask, ignoreHandle)
-  assert(
-    typeof(startPos) == 'vector' and typeof(endPos) == 'vector' and type(radius) == 'number' and radius > 0,
-    'physik.sphereCast: expected start/end vectors and radius > 0'
-  )
+--- Moves the origin by `delta`, and returns the world.
+local function shiftOrigin(state: State, delta: vector): State
+  worlds.shiftOrigin(state, delta)
 
-  mask = if mask == nil then 0xffffffff else mask
-
-  local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
-  local reach = vector.create(radius, radius, radius)
-  local low = vector.create(math.min(startPos.x, endPos.x), math.min(startPos.y, endPos.y), math.min(startPos.z, endPos.z)) - reach
-  local high = vector.create(math.max(startPos.x, endPos.x), math.max(startPos.y, endPos.y), math.max(startPos.z, endPos.z)) + reach
-  local handles, count = self:queryAabb(low, high, mask, self.castCandidates)
-  local {shape, position: pos, turn: qv, turnW: qw} = self
-  local bestFraction = 1
-  local bestNormal, bestBody
-
-  self.castCandidates = handles
-
-  for index = 1, count do
-    -- A handle the query has just written is current, and its low bits are the body's slot.
-    local body = handles[index] % HANDLE_STRIDE
-    if body == ignored then continue end
-
-    local target = shape[body]
-    local kind = target.kind
-    local fraction, normal
-
-    if kind == SHAPE_SPHERE then
-      fraction, normal = sweepSphereSphere(startPos, endPos, radius, pos[body], target.radius)
-    elseif kind == SHAPE_BOX then
-      fraction, normal = sweepSphereBox(startPos, endPos, radius, pos[body], qv[body], qw[body], target.halfExtents)
-    elseif kind == SHAPE_CAPSULE then
-      local top, bottom = capsuleEndpoints(pos[body], qv[body], qw[body], target.halfHeight)
-      fraction, normal = sweepSphereSegment(startPos, endPos, radius + target.radius, top, bottom)
-    elseif kind == SHAPE_MESH then
-      fraction, normal = self:_sweepSphereMesh(body, startPos, endPos, radius)
-    elseif kind == SHAPE_HEIGHTFIELD then
-      fraction, normal = self:_sweepSphereHeightfield(body, startPos, endPos, radius)
-    elseif kind == SHAPE_COMPOUND then
-      fraction, normal = self:_sweepSphereCompound(body, startPos, endPos, radius)
-    end
-
-    if fraction and fraction < bestFraction then
-      bestFraction, bestNormal, bestBody = fraction, normal, body
-    end
-  end
-
-  if not bestBody then return nil end
-
-  return bestBody, bestFraction, bestNormal, startPos + (endPos - startPos) * bestFraction
+  return state
 end
 
-function World:sphereCast(startPos,endPos,radius,mask,ignoreHandle)
-    local i,t,n,center=self:_sphereCastRaw(startPos,endPos,radius,mask,ignoreHandle)
-    if not i then return nil end
-    local motion=endPos-startPos
-    local distance=vector.magnitude(motion)*t
-    return {handle=makeHandle(i,self.generation[i]),fraction=t,distance=distance,center=center,point=center-n*radius,normal=n,userData=self.userData[i]}
+local Methods = {
+  step = step,
+  advance = advance,
+
+  addBody = worlds.addBody,
+  removeBody = worlds.removeBody,
+  hasBody = worlds.hasBody,
+  getBody = worlds.getBody,
+  setPosition = worlds.setPosition,
+  setRotation = worlds.setRotation,
+  setVelocity = worlds.setVelocity,
+  setAngularVelocity = worlds.setAngularVelocity,
+  driveKinematic = worlds.driveKinematic,
+  shiftOrigin = shiftOrigin,
+  wake = worlds.wake,
+  applyForce = worlds.applyForce,
+  applyForceAtPoint = worlds.applyForceAtPoint,
+  applyTorque = worlds.applyTorque,
+  applyImpulse = solver.applyImpulse,
+  applyAngularImpulse = solver.applyAngularImpulse,
+
+  addDistanceJoint = worlds.addDistanceJoint,
+  addBallJoint = worlds.addBallJoint,
+  addHingeJoint = worlds.addHingeJoint,
+  removeJoint = worlds.dropJoint,
+
+  raycast = queries.raycast,
+  raycastBatch = queries.raycastBatch,
+  raycastBatchSoA = queries.raycastBatchSoA,
+  queryAabb = queries.queryAabb,
+  sphereCast = queries.sphereCast,
+  sphereCastBatchSoA = queries.sphereCastBatchSoA,
+  capsuleCast = queries.capsuleCast,
+  capsuleContacts = queries.capsuleContacts,
+
+  linearStateView = drains.linearStateView,
+  writeLinearState = drains.writeLinearState,
+  writeTransforms = drains.writeTransforms,
+  applyTransforms = drains.applyTransforms,
+  writeContacts = drains.writeContacts,
+  writeContactEvents = drains.writeContactEvents,
+  contacts = drains.contacts,
+  stats = drains.stats,
+}
+
+Methods.__index = Methods
+
+local Metatable = table.freeze(Methods)
+
+export type World = typeof(setmetatable({} :: State, Metatable))
+
+--- A world with nothing in it.
+function physik.newWorld(options: worlds.Options?): World
+  return setmetatable(worlds.new(options), Metatable)
 end
 
-function World:sphereCastBatchSoA(starts,ends,radii,masks,ignoreHandles,out)
-    assert(type(starts)=="table" and type(ends)=="table" and #starts==#ends,"physik.sphereCastBatchSoA: starts and ends must be equal-length arrays")
-    out=out or {}
-    local hit=out.hit or {};out.hit=hit
-    local handles=out.handles or {};out.handles=handles
-    local fractions=out.fractions or {};out.fractions=fractions
-    local distances=out.distances or {};out.distances=distances
-    local centers=out.centers or {};out.centers=centers
-    local points=out.points or {};out.points=points
-    local normals=out.normals or {};out.normals=normals
-    local userData=out.userData or {};out.userData=userData
-    local count=#starts
-    local oldCount=out.count or 0
-    for q=1,count do
-        local radius=if type(radii)=="table" then radii[q] else radii
-        local mask=if masks then masks[q] else nil
-        local ignore=if ignoreHandles then ignoreHandles[q] else nil
-        local i,t,n,center=self:_sphereCastRaw(starts[q],ends[q],radius,mask,ignore)
-        if i then
-            local motion=ends[q]-starts[q]
-            hit[q]=true;handles[q]=makeHandle(i,self.generation[i]);fractions[q]=t;distances[q]=vector.magnitude(motion)*t
-            centers[q]=center;points[q]=center-n*radius;normals[q]=n;userData[q]=self.userData[i]
-        else
-            hit[q]=false;handles[q]=nil;fractions[q]=nil;distances[q]=nil;centers[q]=nil;points[q]=nil;normals[q]=nil;userData[q]=nil
-        end
-    end
-    for q=count+1,oldCount do
-        hit[q]=nil;handles[q]=nil;fractions[q]=nil;distances[q]=nil;centers[q]=nil;points[q]=nil;normals[q]=nil;userData[q]=nil
-    end
-    out.count=count
-    return out,count
-end
-
-
---- Gathers the triangles of a mesh or a heightfield that a ball round `centre` could touch, in
---- world space, three corners each. Returns how many triangles.
-local function gatherTriangles(self, geom: number, centre: vector, reach: number, out: { vector }): number
-  local shape = self.shape[geom]
-  local turn, turnW, origin = self.turn[geom], self.turnW[geom], self.position[geom]
-  local inside = qInvRotate(turn, turnW, centre - origin)
-  local count = 0
-
-  local function take(first: vector, second: vector, third: vector)
-    out[count + 1] = origin + qRotate(turn, turnW, first)
-    out[count + 2] = origin + qRotate(turn, turnW, second)
-    out[count + 3] = origin + qRotate(turn, turnW, third)
-    count += 3
-  end
-
-  if shape.kind == SHAPE_HEIGHTFIELD then
-    local base = shape.origin
-    local firstColumn = clamp(math.floor((inside.x - reach - base.x) / shape.cellSizeX), 0, shape.width - 2)
-    local lastColumn = clamp(math.floor((inside.x + reach - base.x) / shape.cellSizeX), 0, shape.width - 2)
-    local firstRow = clamp(math.floor((inside.z - reach - base.z) / shape.cellSizeZ), 0, shape.depth - 2)
-    local lastRow = clamp(math.floor((inside.z + reach - base.z) / shape.cellSizeZ), 0, shape.depth - 2)
-
-    for row = firstRow, lastRow do
-      for column = firstColumn, lastColumn do
-        local near, across = heightVertex(shape, column, row), heightVertex(shape, column + 1, row + 1)
-
-        take(near, heightVertex(shape, column + 1, row), across)
-        take(near, across, heightVertex(shape, column, row + 1))
-      end
-    end
-
-    return count // 3
-  end
-
-  local cellSize = shape.cellSize
-  local firstColumn, lastColumn = math.floor((inside.x - reach) / cellSize), math.floor((inside.x + reach) / cellSize)
-  local firstRow, lastRow = math.floor((inside.y - reach) / cellSize), math.floor((inside.y + reach) / cellSize)
-  local firstLayer, lastLayer = math.floor((inside.z - reach) / cellSize), math.floor((inside.z + reach) / cellSize)
-  local cells = (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1)
-
-  if cells > self.meshQueryCellLimit then
-    for triangle = 0, shape.triangleCount - 1 do
-      take(meshTriangle(shape, triangle))
-    end
-
-    return count // 3
-  end
-
-  local epoch = self.meshMarkEpoch + 1
-  local marks, heads, nextNode, nodeTriangle = self.meshMarks, shape.heads, shape.nextNode, shape.nodeTriangle
-
-  self.meshMarkEpoch = epoch
-
-  for column = firstColumn, lastColumn do
-    for row = firstRow, lastRow do
-      for layer = firstLayer, lastLayer do
-        local key = packCell(column, row, layer)
-        local node = key and heads[key] or 0
-
-        while node ~= 0 do
-          local triangle = nodeTriangle[node]
-
-          if marks[triangle] ~= epoch then
-            marks[triangle] = epoch
-            take(meshTriangle(shape, triangle))
-          end
-
-          node = nextNode[node]
-        end
-      end
-    end
-  end
-
-  for _, triangle in shape.overflow do
-    if marks[triangle] == epoch then continue end
-
-    marks[triangle] = epoch
-    take(meshTriangle(shape, triangle))
-  end
-
-  return count // 3
-end
-
-function World:_capsuleCastRaw(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
-  assert(
-    typeof(startPos) == 'vector'
-      and typeof(endPos) == 'vector'
-      and type(radius) == 'number'
-      and radius > 0
-      and type(halfHeight) == 'number'
-      and halfHeight >= 0,
-    'physik.capsuleCast: expected start/end vectors, radius > 0 and half height >= 0'
-  )
-
-  local motion = endPos - startPos
-  local length = vector.magnitude(motion)
-  if not (length > EPS) then return nil end
-
-  mask = if mask == nil then 0xffffffff else mask
-
-  local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
-  local reach = vector.create(radius, halfHeight + radius, radius)
-  local handles, count = self:queryAabb(vector.min(startPos, endPos) - reach, vector.max(startPos, endPos) + reach, mask, self.castCandidates)
-
-  self.castCandidates = handles
-
-  return self:_capsuleCastAmong(handles, count, startPos, motion, length, radius, halfHeight, ignored)
-end
-
---- Sweeps an upright capsule at the bodies a box query has just answered with, which is how
---- something that sweeps several times in one place, as a character does, asks the world once.
---- `ignored` is a slot, not a handle. Returns as `_capsuleCastRaw` does.
-function World:_capsuleCastAmong(handles, count, startPos, motion, length, radius, halfHeight, ignored)
-  local {shape, position: pos, turn: qv, turnW: qw, boundsLow: aabbMin, boundsHigh: aabbMax, castCapsule: capsule, castTriangles: triangles} = self
-  local reach = vector.create(radius, halfHeight + radius, radius)
-  local heading = motion / length
-  local bestFraction = 1
-  local bestNormal, bestPoint, bestBody
-
-  capsule.radius, capsule.halfHeight = radius, halfHeight
-
-  for index = 1, count do
-    -- A handle the query has just written is current, and its low bits are the body's slot.
-    local body = handles[index] % HANDLE_STRIDE
-    if body == ignored then continue end
-
-    local target = shape[body]
-    local kind = target.kind
-    local fraction, normal, point
-
-    -- The capsule's centre has to come within the capsule's own reach of a body's box, and
-    -- sooner than what has been met already. A sphere's box is not kept as it moves.
-    if
-      kind ~= SHAPE_SPHERE
-      and not rayAabbInterval(startPos, heading, length * bestFraction, aabbMin[body] - reach, aabbMax[body] + reach)
-    then
-      continue
-    end
-
-    if kind == SHAPE_MESH or kind == SHAPE_HEIGHTFIELD then
-      local gathered = gatherTriangles(self, body, startPos + motion * 0.5, length * 0.5 + halfHeight + radius, triangles)
-
-      for corner = 1, gathered * 3, 3 do
-        local limit = fraction or bestFraction
-        local nearer, facing, touched = sweepCapsule(
-          radius, halfHeight, startPos, motion, length, limit, nil, ZERO, ZERO, 1, triangles[corner], triangles[corner + 1], triangles[corner + 2]
-        )
-
-        if nearer then
-          fraction, normal, point = nearer, facing, touched
-        end
-      end
-    elseif kind == SHAPE_COMPOUND then
-      local at, turn, turnW = pos[body], qv[body], qw[body]
-
-      for piece = 1, target.count do
-        local pieceTurn, pieceTurnW = qMul(turn, turnW, target.turns[piece], target.turnWs[piece])
-        local nearer, facing, touched = sweepCapsule(
-          radius,
-          halfHeight,
-          startPos,
-          motion,
-          length,
-          fraction or bestFraction,
-          target.shapes[piece],
-          at + qRotate(turn, turnW, target.positions[piece]),
-          pieceTurn,
-          pieceTurnW,
-          ZERO,
-          ZERO,
-          ZERO
-        )
-
-        if nearer then
-          fraction, normal, point = nearer, facing, touched
-        end
-      end
-    else
-      fraction, normal, point = sweepCapsule(radius, halfHeight, startPos, motion, length, bestFraction, target, pos[body], qv[body], qw[body], ZERO, ZERO, ZERO)
-    end
-
-    if fraction and fraction < bestFraction then
-      bestFraction, bestNormal, bestPoint, bestBody = fraction, normal, point, body
-    end
-  end
-
-  if not bestBody then return nil end
-
-  return bestBody, bestFraction, bestNormal, bestPoint
-end
-
---- Sweeps an upright capsule, its axis along Y, from one place to another. `radius` is the
---- capsule's and `halfHeight` is half the length of its axis, as `physik.capsule` takes them.
---- Returns nil when nothing is in the way, and otherwise what was met first: where the capsule's
---- centre is when they touch, the point on what was met, and the normal there, which points at the
---- capsule. A capsule that starts inside something meets it at a fraction of 0, unless it is on
---- its way out.
-function World:capsuleCast(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
-  local body, fraction, normal, point = self:_capsuleCastRaw(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
-  if not body then return nil end
-
-  local motion = endPos - startPos
-
-  return {
-    handle = makeHandle(body, self.generation[body]),
-    fraction = fraction,
-    distance = vector.magnitude(motion) * fraction,
-    center = startPos + motion * fraction,
-    point = point,
-    normal = normal,
-    userData = self.userData[body],
-  }
-end
-
---- Writes what an upright capsule at `position` overlaps as columns of `out`: `handles`,
---- `normals`, which point at the capsule, `depths` and `points`. A mesh or a heightfield gives one
---- row for each triangle touched, and a compound one for each piece. Returns `out` and how many.
-function World:capsuleContacts(position, radius, halfHeight, mask, ignoreHandle, out)
-  assert(
-    typeof(position) == 'vector' and type(radius) == 'number' and radius > 0 and type(halfHeight) == 'number' and halfHeight >= 0,
-    'physik.capsuleContacts: expected a position vector, radius > 0 and half height >= 0'
-  )
-
-  mask = if mask == nil then 0xffffffff else mask
-  out = out or {}
-
-  local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
-  local reach = vector.create(radius, halfHeight + radius, radius)
-  local found, count = self:queryAabb(position - reach, position + reach, mask, self.castCandidates)
-
-  self.castCandidates = found
-
-  return self:_capsuleContactsAmong(found, count, position, radius, halfHeight, ignored, out)
-end
-
---- What an upright capsule overlaps of the bodies a box query has just answered with. `ignored`
---- is a slot, not a handle. Returns as `capsuleContacts` does.
-function World:_capsuleContactsAmong(found, count, position, radius, halfHeight, ignored, out)
-  local {shape, position: pos, turn: qv, turnW: qw, castCapsule: capsule, castTriangles: triangles} = self
-  local handles, normals, depths, points = out.handles or {}, out.normals or {}, out.depths or {}, out.points or {}
-  local rows = 0
-
-  capsule.radius, capsule.halfHeight = radius, halfHeight
-  out.handles, out.normals, out.depths, out.points = handles, normals, depths, points
-
-  for index = 1, count do
-    local handle = found[index]
-    local body = handle % HANDLE_STRIDE
-    if body == ignored then continue end
-
-    local target = shape[body]
-    local kind = target.kind
-
-    if kind == SHAPE_MESH or kind == SHAPE_HEIGHTFIELD then
-      local gathered = gatherTriangles(self, body, position, halfHeight + radius, triangles)
-
-      for corner = 1, gathered * 3, 3 do
-        local met, normal, point, depth = capsuleTriangle(
-          position, ZERO, 1, radius, halfHeight, triangles[corner], triangles[corner + 1], triangles[corner + 2], 0
-        )
-
-        if met and depth > 0 then
-          rows += 1
-          handles[rows], normals[rows], depths[rows], points[rows] = handle, ZERO - normal, depth, point
-        end
-      end
-    elseif kind == SHAPE_COMPOUND then
-      local at, turn, turnW = pos[body], qv[body], qw[body]
-
-      for piece = 1, target.count do
-        local pieceTurn, pieceTurnW = qMul(turn, turnW, target.turns[piece], target.turnWs[piece])
-        local met, normal, point, depth = collidePrimitives(
-          capsule, position, ZERO, 1, target.shapes[piece], at + qRotate(turn, turnW, target.positions[piece]), pieceTurn, pieceTurnW, 0
-        )
-
-        if met and depth > 0 then
-          rows += 1
-          handles[rows], normals[rows], depths[rows], points[rows] = handle, ZERO - normal, depth, point
-        end
-      end
-    else
-      local met, normal, point, depth = collidePrimitives(capsule, position, ZERO, 1, target, pos[body], qv[body], qw[body], 0)
-
-      if met and depth > 0 then
-        rows += 1
-        handles[rows], normals[rows], depths[rows], points[rows] = handle, ZERO - normal, depth, point
-      end
-    end
-  end
-
-  for index = #handles, rows + 1, -1 do
-    handles[index], normals[index], depths[index], points[index] = nil, nil, nil, nil
-  end
-
-  out.count = rows
-
-  return out, rows
-end
-
-function World:raycast(origin,direction,maxDistance,mask)
-    local i,t,p,n=self:_raycastRaw(origin,direction,maxDistance,mask)
-    if not i then return nil end
-    return { handle=makeHandle(i,self.generation[i]), distance=t, point=p, normal=n, userData=self.userData[i] }
-end
-
-function World:raycastBatch(origins,directions,maxDistances,masks,out)
-    assert(type(origins)=="table" and type(directions)=="table" and #origins==#directions,"physik.raycastBatch: origins and directions must be equal-length arrays")
-    out=out or {}
-    local count=#origins
-    local oldCount=out.count or #out
-    for q=1,count do
-        local i,t,p,n=self:_raycastRaw(origins[q],directions[q],if maxDistances then maxDistances[q] else nil,if masks then masks[q] else nil)
-        if i then
-            local hit=out[q]
-            if type(hit)~="table" then hit={};out[q]=hit end
-            hit.handle=makeHandle(i,self.generation[i])
-            hit.distance=t
-            hit.point=p
-            hit.normal=n
-            hit.userData=self.userData[i]
-        else
-            out[q]=nil
-        end
-    end
-    for q=count+1,oldCount do out[q]=nil end
-    out.count=count
-    return out
-end
-
-function World:raycastBatchSoA(origins,directions,maxDistances,masks,out)
-    assert(type(origins)=="table" and type(directions)=="table" and #origins==#directions,"physik.raycastBatchSoA: origins and directions must be equal-length arrays")
-    out=out or {}
-    local hit=out.hit or {};out.hit=hit
-    local handles=out.handles or {};out.handles=handles
-    local distances=out.distances or {};out.distances=distances
-    local points=out.points or {};out.points=points
-    local normals=out.normals or {};out.normals=normals
-    local userData=out.userData or {};out.userData=userData
-    local count=#origins
-    local oldCount=out.count or 0
-    for q=1,count do
-        local i,t,p,n=self:_raycastRaw(origins[q],directions[q],if maxDistances then maxDistances[q] else nil,if masks then masks[q] else nil)
-        if i then
-            hit[q]=true
-            handles[q]=makeHandle(i,self.generation[i])
-            distances[q]=t
-            points[q]=p
-            normals[q]=n
-            userData[q]=self.userData[i]
-        else
-            hit[q]=false
-            handles[q]=nil
-            distances[q]=nil
-            points[q]=nil
-            normals[q]=nil
-            userData[q]=nil
-        end
-    end
-    for q=count+1,oldCount do
-        hit[q]=nil;handles[q]=nil;distances[q]=nil;points[q]=nil;normals[q]=nil;userData[q]=nil
-    end
-    out.count=count
-    return out,count
-end
-
-
---- Whether a body's bounds reach into a box: a sphere's from its centre and radius, anything
---- else's from the box last written for it.
-local function bodyOverlapsAabb(self, body: number, low: vector, high: vector): boolean
-  local radius = self.sphereRadius[body]
-
-  if radius then
-    local centre, reach = self.position[body], radius + self.contactMargin
-    if centre.x + reach < low.x or centre.x - reach > high.x then return false end
-    if centre.y + reach < low.y or centre.y - reach > high.y then return false end
-
-    return not (centre.z + reach < low.z or centre.z - reach > high.z)
-  end
-
-  local bodyLow, bodyHigh = self.boundsLow[body], self.boundsHigh[body]
-  if bodyHigh.x < low.x or bodyLow.x > high.x then return false end
-  if bodyHigh.y < low.y or bodyLow.y > high.y then return false end
-
-  return not (bodyHigh.z < low.z or bodyLow.z > high.z)
-end
-
---- Writes the handle of every body that overlaps a box, each tested in turn. Returns how many.
-local function queryAabbScan(self, low: vector, high: vector, mask: number, out: { number }): number
-  local {alive, group, generation} = self
-  local count = 0
-
-  for body = 1, self.high do
-    if not alive[body] or bit32.band(mask, group[body]) == 0 then continue end
-    if not bodyOverlapsAabb(self, body, low, high) then continue end
-
-    count += 1
-    out[count] = makeHandle(body, generation[body])
-  end
-
-  return count
-end
-
---- Writes the handle of every body that overlaps a box: the oversized ones, then the ones in a
---- block of cells. Returns how many.
-local function queryAabbGrid(
-  self,
-  low: vector,
-  high: vector,
-  mask: number,
-  out: { number },
-  firstColumn: number,
-  lastColumn: number,
-  firstRow: number,
-  lastRow: number,
-  firstLayer: number,
-  lastLayer: number
-): number
-  local {alive, group, generation, gridHeads: heads, gridNext: nextIn, gridOccupied: occupied} = self
-  local count = 0
-
-  -- Oversized bodies are outside the grid and are normally few.
-  for _, body in self.gridLarge do
-    if alive[body] and bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(self, body, low, high) then
-      count += 1
-      out[count] = makeHandle(body, generation[body])
-    end
-  end
-
-  -- The static ones, through their tree.
-  local entry = self.stillRoot
-
-  if entry ~= 0 then
-    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = self
-    local top = 0
-
-    while true do
-      if entry < 0 then
-        local body = -entry
-
-        if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(self, body, low, high) then
-          count += 1
-          out[count] = makeHandle(body, generation[body])
-        end
-      else
-        local nodeLow, nodeHigh = lows[entry], highs[entry]
-
-        if
-          not (
-            low.x > nodeHigh.x
-            or high.x < nodeLow.x
-            or low.y > nodeHigh.y
-            or high.y < nodeLow.y
-            or low.z > nodeHigh.z
-            or high.z < nodeLow.z
-          )
-        then
-          top += 1
-          stack[top] = rights[entry]
-          entry = lefts[entry]
-          continue
-        end
-      end
-
-      if top == 0 then break end
-
-      entry = stack[top]
-      top -= 1
-    end
-  end
-
-  -- A grid with nothing in it has no cells to walk.
-  if self.gridSmallCount == 0 then return count end
-
-  -- Where every cell of the range can be packed, a cell's key is one more than the key before it.
-  local packable = firstColumn >= -CELL_OFFSET
-    and lastColumn < CELL_OFFSET
-    and firstRow >= -CELL_OFFSET
-    and lastRow < CELL_OFFSET
-    and firstLayer >= -CELL_OFFSET
-    and lastLayer < CELL_OFFSET
-
-  for column = firstColumn, lastColumn do
-    for row = firstRow, lastRow do
-      local start = if packable then packCell(column, row, firstLayer) else nil
-
-      for layer = firstLayer, lastLayer do
-        local key = if start then start + (layer - firstLayer) else packCell(column, row, layer)
-        if not key or buffer.readu8(occupied, key % GridFilterSize) == 0 then continue end
-
-        local body = heads[key] or 0
-
-        while body ~= 0 do
-          if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(self, body, low, high) then
-            count += 1
-            out[count] = makeHandle(body, generation[body])
-          end
-
-          body = nextIn[body] or 0
-        end
-      end
-    end
-  end
-
-  return count
-end
-
-function World:queryAabb(low, high, mask, out)
-  assert(typeof(low) == 'vector' and typeof(high) == 'vector', 'physik.queryAabb: bounds must be vectors')
-  mask = if mask == nil then 0xffffffff else mask
-  out = out or {}
-  broadphase.ensureQueryGrid(self)
-
-  -- Small bodies live in their center cell, but may extend into the immediately adjacent cell.
-  local cellSize = self.broadphaseCellSize
-  local firstColumn, lastColumn = math.floor(low.x / cellSize) - 1, math.floor(high.x / cellSize) + 1
-  local firstRow, lastRow = math.floor(low.y / cellSize) - 1, math.floor(high.y / cellSize) + 1
-  local firstLayer, lastLayer = math.floor(low.z / cellSize) - 1, math.floor(high.z / cellSize) + 1
-  local cells = (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1)
-  local count
-
-  if cells > self.queryAabbCellLimit then
-    count = queryAabbScan(self, low, high, mask, out)
-  else
-    count = queryAabbGrid(self, low, high, mask, out, firstColumn, lastColumn, firstRow, lastRow, firstLayer, lastLayer)
-  end
-
-  for index = #out, count + 1, -1 do
-    out[index] = nil
-  end
-
-  return out, count
-end
-
-
--- Ephemeral zero-copy view of hot linear state for trusted bulk consumers. The returned arrays
--- are Physik-owned and must be treated as read-only; their contents may change on the next world
--- mutation/step. This avoids copying positions/velocities into an intermediate drain when a caller
--- is immediately streaming them into another packed store.
-function World:linearStateView()
-    local view=self.linearView
-    view.high=self.high
-    view.dynamicCode=BODY_DYNAMIC
-    return view
-end
-
-function World:writeLinearState(out, opts)
-  out = out or {}
-  opts = opts or {}
-
-  local handles = if opts.handles ~= false then out.handles or {} else nil
-  local userData = if opts.userData == true then out.userData or {} else nil
-  local positions, velocities = out.positions or {}, out.velocities or {}
-  local awakeOnly, dynamicOnly = opts.awakeOnly == true, opts.dynamicOnly == true
-  local {alive, sleeping, bodyType, generation, position: pos, velocity: linVel, userData: bodyData} = self
-  local count = 0
-
-  out.handles, out.userData, out.positions, out.velocities = handles, userData, positions, velocities
-
-  for body = 1, self.high do
-    if not alive[body] then continue end
-    if awakeOnly and sleeping[body] then continue end
-    if dynamicOnly and bodyType[body] ~= BODY_DYNAMIC then continue end
-
-    count += 1
-    if handles then handles[count] = makeHandle(body, generation[body]) end
-    if userData then userData[count] = bodyData[body] end
-
-    positions[count], velocities[count] = pos[body], linVel[body]
-  end
-
-  if handles then
-    for index = #handles, count + 1, -1 do
-      handles[index] = nil
-    end
-  end
-
-  if userData then
-    for index = #userData, count + 1, -1 do
-      userData[index] = nil
-    end
-  end
-
-  for index = #positions, count + 1, -1 do
-    positions[index], velocities[index] = nil, nil
-  end
-
-  out.count = count
-
-  return out, count
-end
-
-function World:writeTransforms(out, opts)
-  out = out or {}
-  opts = opts or {}
-
-  local handles, positions, rotations = out.handles or {}, out.positions or {}, out.rotations or {}
-  local rotationW, velocities, angularVelocities = out.rotationW or {}, out.velocities or {}, out.angularVelocities or {}
-  local awakeOnly, dynamicOnly = opts.awakeOnly == true, opts.dynamicOnly == true
-  local {alive, sleeping, bodyType, generation, position: pos, turn: qv, turnW: qw, velocity: linVel, spin: angVel} = self
-  local count = 0
-
-  out.handles, out.positions, out.rotations = handles, positions, rotations
-  out.rotationW, out.velocities, out.angularVelocities = rotationW, velocities, angularVelocities
-
-  for body = 1, self.high do
-    if not alive[body] then continue end
-    if awakeOnly and sleeping[body] then continue end
-    if dynamicOnly and bodyType[body] ~= BODY_DYNAMIC then continue end
-
-    count += 1
-    handles[count] = makeHandle(body, generation[body])
-    positions[count], rotations[count], rotationW[count] = pos[body], qv[body], qw[body]
-    velocities[count], angularVelocities[count] = linVel[body], angVel[body]
-  end
-
-  for index = #handles, count + 1, -1 do
-    handles[index], positions[index], rotations[index] = nil, nil, nil
-    rotationW[index], velocities[index], angularVelocities[index] = nil, nil, nil
-  end
-
-  out.count = count
-
-  return out, count
-end
-
-
-function World:applyTransforms(data,wake)
-    assert(type(data)=="table" and type(data.handles)=="table" and type(data.positions)=="table","physik.applyTransforms: expected writeTransforms-compatible data")
-    local count=data.count or #data.handles
-    local qvs,qws=data.rotations,data.rotationW
-    local vels,ang=data.velocities,data.angularVelocities
-    for n=1,count do
-        local i=self:_check(data.handles[n])
-        self.position[i]=data.positions[n]
-        if qvs and qws and qvs[n] and qws[n] then
-            self.turn[i],self.turnW[i]=qNormalize(qvs[n],qws[n])
-            self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.turn[i],self.turnW[i])
-        end
-        if vels and vels[n] then self.velocity[i]=vels[n] end
-        if ang and ang[n] then self.spin[i]=ang[n] end
-        self.previousPosition[i]=self.position[i]
-        self:_updateAabb(i)
-        if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
-        if wake~=false and self.bodyType[i]==BODY_DYNAMIC then self.sleeping[i]=false;self.sleepTime[i]=0 end
-    end
-    -- Topology is unchanged, but authoritative teleports invalidate persistent anchors and query cells.
-    self.cacheEpoch+=2
-    self.gridValid=false
-    return count
-end
-
-function World:writeContacts(out)
-    out=out or {}
-    local aa=out.a or {};out.a=aa
-    local bb=out.b or {};out.b=bb
-    local normals=out.normals or {};out.normals=normals
-    local points=out.points or {};out.points=points
-    local penetration=out.penetration or {};out.penetration=penetration
-    local impulses=out.normalImpulse or {};out.normalImpulse=impulses
-    local sensors=out.sensor or {};out.sensor=sensors
-    local n=self.contactCount
-    for c=1,n do
-        local a,b=self.contactFirst[c],self.contactSecond[c]
-        aa[c]=makeHandle(a,self.generation[a]);bb[c]=makeHandle(b,self.generation[b])
-        normals[c]=self.contactNormal[c];points[c]=self.contactPoint[c];penetration[c]=self.contactDepth[c];impulses[c]=self.normalImpulse[c]
-        sensors[c]=self.sensor[a] or self.sensor[b]
-    end
-    for c=#aa,n+1,-1 do aa[c]=nil;bb[c]=nil;normals[c]=nil;points[c]=nil;penetration[c]=nil;impulses[c]=nil;sensors[c]=nil end
-    out.count=n
-    return out,n
-end
-
-function World:writeContactEvents(out,includeStay)
-    out=out or {}
-    local aa=out.a or {};out.a=aa
-    local bb=out.b or {};out.b=bb
-    local kind=out.kind or {};out.kind=kind
-    local sensors=out.sensor or {};out.sensor=sensors
-    local n=0
-    for e=1,self.contactEventCount do
-        local k=self.eventKind[e]
-        if includeStay~=false or k~=EVENT_STAY then
-            local a,b=self.eventFirst[e],self.eventSecond[e]
-            if self.alive[a] and self.alive[b] then
-                n+=1
-                aa[n]=makeHandle(a,self.generation[a]);bb[n]=makeHandle(b,self.generation[b])
-                kind[n]=k;sensors[n]=self.eventSensor[e]
-            end
-        end
-    end
-    for i=#aa,n+1,-1 do aa[i]=nil;bb[i]=nil;kind[i]=nil;sensors[i]=nil end
-    out.count=n
-    return out,n
-end
-
-function World:advance(dt,fixedDt,maxSteps)
-    assert(type(dt)=="number" and dt>=0,"physik.advance: dt must be >= 0")
-    local h=fixedDt or self.fixedDt
-    local limit=maxSteps or self.maxCatchUpSteps
-    assert(h>0 and limit>=1 and limit%1==0,"physik.advance: fixedDt must be > 0 and maxSteps a positive integer")
-    self.accumulator+=dt
-    local wanted=math.floor(self.accumulator/h)
-    local steps=math.min(wanted,limit)
-    for _=1,steps do self:step(h) end
-    self.accumulator-=steps*h
-    local dropped=false
-    if self.accumulator>=h then self.accumulator=self.accumulator%h;dropped=true end
-    return steps,self.accumulator/h,dropped
-end
-
-function World:contacts()
-    local out=table.create(self.contactCount)
-    for c=1,self.contactCount do
-        local a,b=self.contactFirst[c],self.contactSecond[c]
-        out[c]={
-            a=makeHandle(a,self.generation[a]),
-            b=makeHandle(b,self.generation[b]),
-            normal=self.contactNormal[c],point=self.contactPoint[c],penetration=self.contactDepth[c],
-            normalImpulse=self.normalImpulse[c],sensor=self.sensor[a] or self.sensor[b],
-        }
-    end
-    return out
-end
-
-function World:stats()
-  local {alive, sleeping, sensor, contactFirst: bodiesA, contactSecond: bodiesB} = self
-
-  return {
-    frame = self.frame,
-    bodies = self.aliveCount,
-    sleeping = #[for body in range(1, self.high) if alive[body] and sleeping[body] => body],
-    islands = self.islandCount,
-    candidates = self.candidateCount,
-    contacts = self.contactCount,
-    sensorContacts = #[for contact in range(1, self.contactCount) if sensor[bodiesA[contact]] or sensor[bodiesB[contact]] => contact],
-    activeContacts = self.activeContactCount,
-    manifolds = self.manifoldCount,
-    warmStarted = self.warmStartedCount,
-    ccdHits = self.sweptHits,
-    joints = self.jointCount,
-  }
-end
-
-M.contactEvent = table.freeze({ enter=EVENT_ENTER, stay=EVENT_STAY, exit=EVENT_EXIT })
-M._constants = table.freeze({ sphere=SHAPE_SPHERE, box=SHAPE_BOX, capsule=SHAPE_CAPSULE, mesh=SHAPE_MESH, heightfield=SHAPE_HEIGHTFIELD, compound=SHAPE_COMPOUND })
-return table.freeze(M)
+physik.sphere = shapes.sphere
+physik.box = shapes.box
+physik.capsule = shapes.capsule
+physik.compound = shapes.compound
+physik.triangleMesh = shapes.triangleMesh
+physik.heightfield = shapes.heightfield
+physik.quat = shapes.quat
+physik.axisAngle = shapes.axisAngle
+
+-- What a pair of bodies did in a step, as `writeContactEvents` writes it.
+physik.contactEvent = solver.ContactEvent
+
+return table.freeze(physik)

@@ -8,57 +8,13 @@
 -- and what gravity does to it are the game's. The game says how far the character should move this
 -- step, `move` says where it got to and what it met, and `slide` takes out of the game's velocity
 -- what the character ran into.
+local queries = require './queries'
+local worlds = require './world'
+
 local character = {}
 
-type Overlaps = { handles: { number }, normals: { vector }, depths: { number }, points: { vector }, count: number? }
-
---- What a character asks of a physik world. The kernel is not typed, so this says it.
-export type World = {
-  _capsuleCastRaw: (
-    self: World,
-    start: vector,
-    finish: vector,
-    radius: number,
-    halfHeight: number,
-    mask: number?,
-    ignore: number?
-  ) -> (number?, number, vector, vector),
-  _capsuleCastAmong: (
-    self: World,
-    handles: { number },
-    count: number,
-    start: vector,
-    motion: vector,
-    length: number,
-    radius: number,
-    halfHeight: number,
-    ignored: number?
-  ) -> (number?, number, vector, vector),
-  _capsuleContactsAmong: (
-    self: World,
-    found: { number },
-    count: number,
-    position: vector,
-    radius: number,
-    halfHeight: number,
-    ignored: number?,
-    out: Overlaps
-  ) -> (Overlaps, number),
-  queryAabb: (self: World, low: vector, high: vector, mask: number?, out: { number }) -> ({ number }, number),
-  _raycastRaw: (self: World, origin: vector, direction: vector, reach: number, mask: number?) -> (number?, number, vector, vector?),
-  _handleOf: (self: World, body: number) -> number,
-  capsuleContacts: (
-    self: World,
-    position: vector,
-    radius: number,
-    halfHeight: number,
-    mask: number?,
-    ignore: number?,
-    out: Overlaps
-  ) -> (Overlaps, number),
-  hasBody: (self: World, handle: number) -> boolean,
-  getBody: (self: World, handle: number) -> { position: vector, velocity: vector, angularVelocity: vector },
-}
+--- The world a character is in: one that `physik.newWorld` made.
+export type World = worlds.State
 
 export type Options = {
   --- The capsule's radius. 0.35 unless given.
@@ -100,7 +56,7 @@ export type Character = {
   --- The normals of what its last move ran into, each pointing at the character.
   planes: { vector },
   planeCount: number,
-  overlaps: Overlaps,
+  overlaps: queries.Overlaps,
   --- The bodies near enough to be met in the move being made, asked for once.
   nearby: { number },
   nearbyCount: number,
@@ -134,7 +90,7 @@ function character.new(world: World, options: Options?): Character
     ground = nil,
     planes = {},
     planeCount = 0,
-    overlaps = { handles = {}, normals = {}, depths = {}, points = {} },
+    overlaps = { handles = {}, normals = {}, depths = {}, points = {}, count = 0 },
     nearby = {},
     nearbyCount = 0,
   }
@@ -152,7 +108,8 @@ local function cast(self: Character, centre: vector, motion: vector): (number?, 
   if not (length > 1e-8) then return nil, 1, Up, centre end
 
   local ignore = self.ignore
-  local body, fraction, normal, point = self.world:_capsuleCastAmong(
+  local body, fraction, normal, point = queries.capsuleCastAmong(
+    self.world,
     self.nearby,
     self.nearbyCount,
     centre,
@@ -181,14 +138,14 @@ local function standing(self: Character, centre: vector, facing: vector, point: 
 
   local world = self.world
   local inward = -vector.normalize(vector.create(facing.x, 0, facing.z))
-  local _, _, _, surface = world:_raycastRaw(point + inward * 0.02 + Up * 0.05, -Up, 0.1, self.mask)
+  local _, _, _, surface = queries.raycastRaw(world, point + inward * 0.02 + Up * 0.05, -Up, 0.1, self.mask)
   local ground: vector = surface or facing
 
   if ground.y < self.walkable then return false end
   if vector.dot(ground, facing) > 0.999 then return true end
 
   local foot = centre - vector.create(0, self.height / 2 - self.radius, 0)
-  local _, _, _, under = world:_raycastRaw(foot, -Up, self.radius + self.stepHeight + 0.01, self.mask)
+  local _, _, _, under = queries.raycastRaw(world, foot, -Up, self.radius + self.stepHeight + 0.01, self.mask)
 
   return under ~= nil and under.y >= self.walkable
 end
@@ -202,7 +159,7 @@ local function recover(self: Character, centre: vector): vector
 
   for _ = 1, 4 do
     local overlaps, count =
-      self.world:_capsuleContactsAmong(self.nearby, self.nearbyCount, centre, self.radius, halfHeight, ignored, self.overlaps)
+      queries.capsuleContactsAmong(self.world, self.nearby, self.nearbyCount, centre, self.radius, halfHeight, ignored, self.overlaps)
     if count == 0 then break end
 
     local deepest = 1
@@ -292,7 +249,7 @@ function character.move(self: Character, motion: vector)
   local span = math.abs(motion.x) + math.abs(motion.y) + math.abs(motion.z) + self.stepHeight + self.snapDistance + Skin * 4
   local reach = vector.create(self.radius + span, self.height / 2 + span, self.radius + span)
 
-  self.nearby, self.nearbyCount = self.world:queryAabb(centre - reach, centre + reach, self.mask, self.nearby)
+  self.nearby, self.nearbyCount = queries.queryAabb(self.world, centre - reach, centre + reach, self.mask, self.nearby)
 
   -- Out of whatever has moved into it. Something that has pushed it further than it could have
   -- gone by itself has taken it away from what was asked for, which is asked for again.
@@ -301,7 +258,7 @@ function character.move(self: Character, motion: vector)
   centre = recover(self, centre)
 
   if vector.magnitude(centre - start) > Skin * 4 then
-    self.nearby, self.nearbyCount = self.world:queryAabb(centre - reach, centre + reach, self.mask, self.nearby)
+    self.nearby, self.nearbyCount = queries.queryAabb(self.world, centre - reach, centre + reach, self.mask, self.nearby)
   end
 
   -- Up first, so a jump clears what it is jumping onto.
@@ -375,7 +332,7 @@ function character.move(self: Character, motion: vector)
     centre -= vector.create(0, drop, 0)
     self.grounded = true
     self.groundNormal = if facing.y >= self.walkable then facing else Up
-    self.ground = self.world:_handleOf(under)
+    self.ground = worlds.handleOf(self.world, under)
   else
     self.grounded = false
     self.groundNormal = Up
@@ -401,9 +358,9 @@ end
 --- Zero when it is not standing on anything.
 function character.groundVelocity(self: Character): vector
   local ground = self.ground
-  if not ground or not self.world:hasBody(ground) then return vector.zero end
+  if not ground or not worlds.hasBody(self.world, ground) then return vector.zero end
 
-  local body = self.world:getBody(ground)
+  local body = worlds.getBody(self.world, ground)
 
   return body.velocity + vector.cross(body.angularVelocity, self.position - body.position)
 end
@@ -411,7 +368,7 @@ end
 --- Whether the character, put at `position`, would be clear of everything.
 function character.fits(self: Character, position: vector): boolean
   local centre = position + vector.create(0, self.height / 2, 0)
-  local _, count = self.world:capsuleContacts(centre, self.radius, self.height / 2 - self.radius, self.mask, self.ignore, self.overlaps)
+  local _, count = queries.capsuleContacts(self.world, centre, self.radius, self.height / 2 - self.radius, self.mask, self.ignore, self.overlaps)
 
   return count == 0
 end
