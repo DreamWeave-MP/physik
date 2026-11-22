@@ -19,3 +19,8 @@ jess = "org.dreamweave.physik"
 version = "0.3.2"
 date = 2026-10-21
 summary = "First release published as a DreamWeave project."
+
+[[releases]]
+version = "0.5.0"
+date = 2026-11-22
+summary = "The kernel as nine typed modules that pass the strict check. Levels of static bodies cost a step nothing, bodies at rest keep their contacts, and a world that has had bodies taken out steps as a new one does. New: capsule sweeps, and a character that walks, climbs steps and slopes, rides lifts and crouches. A rotation's parts are now turn and turnW, and a contact's bodies first and second."
