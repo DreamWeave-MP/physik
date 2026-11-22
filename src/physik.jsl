@@ -1372,6 +1372,17 @@ function World:_unsettle(i)
     table.insert(self.unsettled,i)
 end
 
+--- Whether `handle` is of a body that is still in the world.
+function World:hasBody(handle)
+    if type(handle) ~= "number" then return false end
+    local i,g = splitHandle(handle)
+    return i >= 1 and self.alive[i] == true and self.generation[i] == g
+end
+
+function World:_handleOf(i)
+    return makeHandle(i,self.generation[i])
+end
+
 function World:getBody(handle)
     local i = self:_check(handle)
     return {
@@ -3843,6 +3854,328 @@ function World:sphereCastBatchSoA(starts,ends,radii,masks,ignoreHandles,out)
     return out,count
 end
 
+-- How near a swept capsule comes to what it meets before it is said to touch it.
+local SweepSkin = 1e-3
+
+--- Gathers the triangles of a mesh or a heightfield that a ball round `centre` could touch, in
+--- world space, three corners each. Returns how many triangles.
+local function gatherTriangles(self, geom: number, centre: vector, reach: number, out: { vector }): number
+  local shape = self.shape[geom]
+  local turn, turnW, origin = self.qv[geom], self.qw[geom], self.pos[geom]
+  local inside = qInvRotate(turn, turnW, centre - origin)
+  local count = 0
+
+  local function take(first: vector, second: vector, third: vector)
+    out[count + 1] = origin + qRotate(turn, turnW, first)
+    out[count + 2] = origin + qRotate(turn, turnW, second)
+    out[count + 3] = origin + qRotate(turn, turnW, third)
+    count += 3
+  end
+
+  if shape.kind == SHAPE_HEIGHTFIELD then
+    local base = shape.origin
+    local firstColumn = clamp(math.floor((inside.X - reach - base.X) / shape.cellSizeX), 0, shape.width - 2)
+    local lastColumn = clamp(math.floor((inside.X + reach - base.X) / shape.cellSizeX), 0, shape.width - 2)
+    local firstRow = clamp(math.floor((inside.Z - reach - base.Z) / shape.cellSizeZ), 0, shape.depth - 2)
+    local lastRow = clamp(math.floor((inside.Z + reach - base.Z) / shape.cellSizeZ), 0, shape.depth - 2)
+
+    for row = firstRow, lastRow do
+      for column = firstColumn, lastColumn do
+        local near, across = heightVertex(shape, column, row), heightVertex(shape, column + 1, row + 1)
+
+        take(near, heightVertex(shape, column + 1, row), across)
+        take(near, across, heightVertex(shape, column, row + 1))
+      end
+    end
+
+    return count // 3
+  end
+
+  local cellSize = shape.cellSize
+  local firstColumn, lastColumn = math.floor((inside.X - reach) / cellSize), math.floor((inside.X + reach) / cellSize)
+  local firstRow, lastRow = math.floor((inside.Y - reach) / cellSize), math.floor((inside.Y + reach) / cellSize)
+  local firstLayer, lastLayer = math.floor((inside.Z - reach) / cellSize), math.floor((inside.Z + reach) / cellSize)
+  local cells = (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1)
+
+  if cells > self.meshQueryCellLimit then
+    for triangle = 0, shape.triangleCount - 1 do
+      take(meshTriangle(shape, triangle))
+    end
+
+    return count // 3
+  end
+
+  local epoch = self.meshMarkEpoch + 1
+  local marks, heads, nextNode, nodeTriangle = self.meshMarks, shape.heads, shape.nextNode, shape.nodeTri
+
+  self.meshMarkEpoch = epoch
+
+  for column = firstColumn, lastColumn do
+    for row = firstRow, lastRow do
+      for layer = firstLayer, lastLayer do
+        local key = packCell(column, row, layer)
+        local node = key and heads[key] or 0
+
+        while node ~= 0 do
+          local triangle = nodeTriangle[node]
+
+          if marks[triangle] ~= epoch then
+            marks[triangle] = epoch
+            take(meshTriangle(shape, triangle))
+          end
+
+          node = nextNode[node]
+        end
+      end
+    end
+  end
+
+  for _, triangle in shape.overflow do
+    if marks[triangle] == epoch then continue end
+
+    marks[triangle] = epoch
+    take(meshTriangle(shape, triangle))
+  end
+
+  return count // 3
+end
+
+--- Sweeps an upright capsule along `motion` at a primitive, or at a triangle when `target` is
+--- nil, no further than the fraction `limit`. Returns the fraction at which they touch, the
+--- normal there, which points at the capsule, and the point on what was met; or nil.
+---
+--- Both are convex, so the capsule can close on the other no faster than it moves along the line
+--- between their nearest points: it is advanced by the gap over that speed until there is no gap,
+--- and is past it for good once it is not closing. A capsule that starts inside is met at once,
+--- unless it is on its way out.
+local function sweepCapsule(
+  capsule,
+  start: vector,
+  motion: vector,
+  length: number,
+  limit: number,
+  target,
+  at: vector?,
+  turn: vector?,
+  turnW: number?,
+  first: vector?,
+  second: vector?,
+  third: vector?
+): (number?, vector?, vector?)
+  local fraction = 0
+  local normal, point
+
+  for _ = 1, 32 do
+    local centre = start + motion * fraction
+    local reach = length * (limit - fraction) + SweepSkin
+    local met, depth
+
+    if target then
+      met, normal, point, depth = collidePrimitives(capsule, centre, ZERO, 1, target, at, turn, turnW, reach)
+    else
+      met, normal, point, depth = capsuleTriangle(centre, ZERO, 1, capsule.radius, capsule.halfHeight, first, second, third, reach)
+    end
+
+    if not met then return nil end
+
+    -- Motion along a surface is not into it, to within what the arithmetic can tell.
+    local closing = vector.dot(motion, normal)
+    if closing <= length * 1e-4 then return nil end
+    if -depth <= SweepSkin then return fraction, ZERO - normal, point end
+
+    fraction += (-depth - SweepSkin * 0.5) / closing
+    if fraction >= limit then return nil end
+  end
+
+  -- Thirty-two advances and still closing on it: it is no nearer than this, which is safe to
+  -- take as where they meet.
+  return fraction, ZERO - normal, point
+end
+
+function World:_capsuleCastRaw(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
+  assert(
+    typeof(startPos) == 'vector'
+      and typeof(endPos) == 'vector'
+      and type(radius) == 'number'
+      and radius > 0
+      and type(halfHeight) == 'number'
+      and halfHeight >= 0,
+    'physik.capsuleCast: expected start/end vectors, radius > 0 and half height >= 0'
+  )
+
+  local motion = endPos - startPos
+  local length = vector.magnitude(motion)
+  if not (length > EPS) then return nil end
+
+  mask = if mask == nil then 0xffffffff else mask
+
+  local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
+  local reach = vector.create(radius, halfHeight + radius, radius)
+  local handles, count = self:queryAabb(vector.min(startPos, endPos) - reach, vector.max(startPos, endPos) + reach, mask, self.castCandidates)
+  local {shape, pos, qv, qw, castCapsule: capsule, castTriangles: triangles} = self
+  local bestFraction = 1
+  local bestNormal, bestPoint, bestBody
+
+  self.castCandidates = handles
+  capsule.radius, capsule.halfHeight = radius, halfHeight
+
+  for index = 1, count do
+    -- A handle the query has just written is current, and its low bits are the body's slot.
+    local body = handles[index] % HANDLE_STRIDE
+    if body == ignored then continue end
+
+    local target = shape[body]
+    local kind = target.kind
+    local fraction, normal, point
+
+    if kind == SHAPE_MESH or kind == SHAPE_HEIGHTFIELD then
+      local gathered = gatherTriangles(self, body, startPos + motion * 0.5, length * 0.5 + halfHeight + radius, triangles)
+
+      for corner = 1, gathered * 3, 3 do
+        local limit = fraction or bestFraction
+        local nearer, facing, touched = sweepCapsule(
+          capsule, startPos, motion, length, limit, nil, nil, nil, nil, triangles[corner], triangles[corner + 1], triangles[corner + 2]
+        )
+
+        if nearer then
+          fraction, normal, point = nearer, facing, touched
+        end
+      end
+    elseif kind == SHAPE_COMPOUND then
+      local at, turn, turnW = pos[body], qv[body], qw[body]
+
+      for piece = 1, target.count do
+        local pieceTurn, pieceTurnW = qMul(turn, turnW, target.qv[piece], target.qw[piece])
+        local nearer, facing, touched = sweepCapsule(
+          capsule,
+          startPos,
+          motion,
+          length,
+          fraction or bestFraction,
+          target.shapes[piece],
+          at + qRotate(turn, turnW, target.positions[piece]),
+          pieceTurn,
+          pieceTurnW
+        )
+
+        if nearer then
+          fraction, normal, point = nearer, facing, touched
+        end
+      end
+    else
+      fraction, normal, point = sweepCapsule(capsule, startPos, motion, length, bestFraction, target, pos[body], qv[body], qw[body])
+    end
+
+    if fraction and fraction < bestFraction then
+      bestFraction, bestNormal, bestPoint, bestBody = fraction, normal, point, body
+    end
+  end
+
+  if not bestBody then return nil end
+
+  return bestBody, bestFraction, bestNormal, bestPoint
+end
+
+--- Sweeps an upright capsule, its axis along Y, from one place to another. `radius` is the
+--- capsule's and `halfHeight` is half the length of its axis, as `physik.capsule` takes them.
+--- Returns nil when nothing is in the way, and otherwise what was met first: where the capsule's
+--- centre is when they touch, the point on what was met, and the normal there, which points at the
+--- capsule. A capsule that starts inside something meets it at a fraction of 0, unless it is on
+--- its way out.
+function World:capsuleCast(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
+  local body, fraction, normal, point = self:_capsuleCastRaw(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
+  if not body then return nil end
+
+  local motion = endPos - startPos
+
+  return {
+    handle = makeHandle(body, self.generation[body]),
+    fraction = fraction,
+    distance = vector.magnitude(motion) * fraction,
+    center = startPos + motion * fraction,
+    point = point,
+    normal = normal,
+    userData = self.userData[body],
+  }
+end
+
+--- Writes what an upright capsule at `position` overlaps as columns of `out`: `handles`,
+--- `normals`, which point at the capsule, `depths` and `points`. A mesh or a heightfield gives one
+--- row for each triangle touched, and a compound one for each piece. Returns `out` and how many.
+function World:capsuleContacts(position, radius, halfHeight, mask, ignoreHandle, out)
+  assert(
+    typeof(position) == 'vector' and type(radius) == 'number' and radius > 0 and type(halfHeight) == 'number' and halfHeight >= 0,
+    'physik.capsuleContacts: expected a position vector, radius > 0 and half height >= 0'
+  )
+
+  mask = if mask == nil then 0xffffffff else mask
+  out = out or {}
+
+  local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
+  local reach = vector.create(radius, halfHeight + radius, radius)
+  local found, count = self:queryAabb(position - reach, position + reach, mask, self.castCandidates)
+  local {shape, pos, qv, qw, castCapsule: capsule, castTriangles: triangles} = self
+  local handles, normals, depths, points = out.handles or {}, out.normals or {}, out.depths or {}, out.points or {}
+  local rows = 0
+
+  self.castCandidates = found
+  capsule.radius, capsule.halfHeight = radius, halfHeight
+  out.handles, out.normals, out.depths, out.points = handles, normals, depths, points
+
+  for index = 1, count do
+    local handle = found[index]
+    local body = handle % HANDLE_STRIDE
+    if body == ignored then continue end
+
+    local target = shape[body]
+    local kind = target.kind
+
+    if kind == SHAPE_MESH or kind == SHAPE_HEIGHTFIELD then
+      local gathered = gatherTriangles(self, body, position, halfHeight + radius, triangles)
+
+      for corner = 1, gathered * 3, 3 do
+        local met, normal, point, depth = capsuleTriangle(
+          position, ZERO, 1, radius, halfHeight, triangles[corner], triangles[corner + 1], triangles[corner + 2], 0
+        )
+
+        if met and depth > 0 then
+          rows += 1
+          handles[rows], normals[rows], depths[rows], points[rows] = handle, ZERO - normal, depth, point
+        end
+      end
+    elseif kind == SHAPE_COMPOUND then
+      local at, turn, turnW = pos[body], qv[body], qw[body]
+
+      for piece = 1, target.count do
+        local pieceTurn, pieceTurnW = qMul(turn, turnW, target.qv[piece], target.qw[piece])
+        local met, normal, point, depth = collidePrimitives(
+          capsule, position, ZERO, 1, target.shapes[piece], at + qRotate(turn, turnW, target.positions[piece]), pieceTurn, pieceTurnW, 0
+        )
+
+        if met and depth > 0 then
+          rows += 1
+          handles[rows], normals[rows], depths[rows], points[rows] = handle, ZERO - normal, depth, point
+        end
+      end
+    else
+      local met, normal, point, depth = collidePrimitives(capsule, position, ZERO, 1, target, pos[body], qv[body], qw[body], 0)
+
+      if met and depth > 0 then
+        rows += 1
+        handles[rows], normals[rows], depths[rows], points[rows] = handle, ZERO - normal, depth, point
+      end
+    end
+  end
+
+  for index = #handles, rows + 1, -1 do
+    handles[index], normals[index], depths[index], points[index] = nil, nil, nil, nil
+  end
+
+  out.count = rows
+
+  return out, rows
+end
+
 function World:raycast(origin,direction,maxDistance,mask)
     local i,t,p,n=self:_raycastRaw(origin,direction,maxDistance,mask)
     if not i then return nil end
@@ -4395,6 +4728,7 @@ function M.newWorld(opts)
     w.firstPieceCentres, w.firstPieceTurns, w.firstPieceTurnWs = {}, {}, {}
     w.secondPieceCentres, w.secondPieceTurns, w.secondPieceTurnWs = {}, {}, {}
     w.meshMarks={};w.meshMarkEpoch=0
+    w.castCapsule={kind=SHAPE_CAPSULE,radius=0,halfHeight=0};w.castTriangles={}
     w.islandParent={};w.islandSize={};w.islandAwake={};w.islandRoots={};w.islandCanSleep={};w.islandMinTime={}
     w.joints={};w.jointNoCollide={};w.nextJoint=1;w.jointCount=0
     return w
