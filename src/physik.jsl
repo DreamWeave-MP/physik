@@ -1327,7 +1327,13 @@ function World:addBody(desc)
     self.gridValid=false
     self.gridTopologyDirty=true
     self.gridKey[i]=nil
-    if kind==BODY_STATIC then self.stillDirty=true else self.moversDirty=true end
+    self.rest[i],self.seenPos[i]=false,nil
+    if kind==BODY_STATIC then
+        self.stillDirty=true
+        table.insert(self.unsettled,i)
+    else
+        self.moversDirty=true
+    end
     if self.ccd[i] then self.ccdCount+=1 end
     return makeHandle(i,self.generation[i])
 end
@@ -1340,6 +1346,7 @@ function World:removeBody(handle)
     end
     self.alive[i] = false
     self.aliveCount -= 1
+    self.rest[i] = false
     if self.bodyType[i]==BODY_STATIC then self.stillDirty=true else self.moversDirty=true end
     if self.ccd[i] then self.ccdCount-=1 end
     self.free[#self.free+1] = i
@@ -1355,6 +1362,14 @@ function World:removeBody(handle)
     end
     self.gridValid=false
     self.gridTopologyDirty=true
+end
+
+--- A static body has been moved: the tree is to be built again, and what the body touches is to
+--- be found again.
+function World:_unsettle(i)
+    self.stillDirty=true
+    self.rest[i]=false
+    table.insert(self.unsettled,i)
 end
 
 function World:getBody(handle)
@@ -1376,7 +1391,7 @@ function World:setPosition(handle, p, wake)
     local i = self:_check(handle)
     self.pos[i] = p
     self.gridValid=false
-    if self.bodyType[i]==BODY_STATIC then self.stillDirty=true end
+    if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
     if wake ~= false then self:wake(handle) end
 end
 
@@ -1385,7 +1400,7 @@ function World:setRotation(handle,q,wake)
     self.qv[i],self.qw[i]=qNormalize(q.v,q.w)
     self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.qv[i],self.qw[i])
     self.gridValid=false
-    if self.bodyType[i]==BODY_STATIC then self.stillDirty=true end
+    if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
     if wake~=false then self:wake(handle) end
 end
 
@@ -1921,6 +1936,10 @@ end
 --- bounds are apart. Most pairs a broadphase offers are apart, and nothing else is read for those:
 --- a sphere is bounded by its centre and radius, anything else by its box.
 local function tryPair(self, first: number, second: number)
+  -- Two bodies at rest touch as they did, and their contacts have been kept.
+  local rest = self.rest
+  if rest[first] and rest[second] then return end
+
   local radii, pos = self.sphereRadius, self.pos
   local firstRadius, secondRadius = radii[first], radii[second]
 
@@ -2120,7 +2139,7 @@ function World:_rebuildStill()
   self.stillDirty = false
 end
 
-function World:_buildGridIndex(refreshAabbs)
+function World:_buildGridIndex(refreshAabbs, resting)
   local {gridHeads: heads, gridKeys: keys, gridNext: nextIn, gridLarge: large, gridOccupied: occupied} = self
   local {sphereRadius: radii, pos, aabbMin, aabbMax, gridKey, gridX, gridY, gridZ} = self
   local cellSize, margin = self.broadphaseCellSize, self.contactMargin
@@ -2134,7 +2153,13 @@ function World:_buildGridIndex(refreshAabbs)
   if self.gridTopologyReady and not self.gridTopologyDirty then
     local same = true
 
+    -- In a step, a body at rest is where it was and as it was. Outside one nothing has said
+    -- which bodies are at rest since they last moved.
+    local rest = if resting then self.rest else nil
+
     for _, body in movers do
+      if rest and rest[body] then continue end
+
       local radius = radii[body]
       local width, height, depth
 
@@ -2247,7 +2272,7 @@ function World:_ensureQueryGrid()
 end
 
 function World:_collideGrid()
-  self:_buildGridIndex(true)
+  self:_buildGridIndex(true, true)
   local {gridHeads: heads, gridNext: nextIn, gridDenseKeys: dense, gridPairA: pairA, gridPairB: pairB} = self
 
   -- Same-cell pairs only exist in cells cached as non-singleton during the most recent topology
@@ -2293,8 +2318,12 @@ function World:_collideGrid()
     local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = self
     local {sphereRadius: radii, pos, aabbMin, aabbMax} = self
     local margin = self.contactMargin
+    local rest, stillSettled = self.rest, #self.unsettled == 0
 
     for _, body in movers do
+      -- A body at rest touches the static bodies it did, unless one of those has been moved.
+      if stillSettled and rest[body] then continue end
+
       -- One body is no tree, and the pair is tested on its own bounds.
       if root < 0 then
         tryPair(self, -root, body)
@@ -2391,18 +2420,77 @@ function World:_collideGrid()
   end
 end
 
+--- Says which bodies are at rest, and keeps the contacts between two of them from the step
+--- before, where everything else's are found again. A body is at rest when it is static and has
+--- not been moved, or is asleep exactly where it was asleep at the last step: two such bodies
+--- touch as they did, so the pair is neither offered nor tested, however long a pile lies there.
+local function carryContacts(self, movers: { number })
+  local {rest, sleeping, pos, qv, qw, seenPos, seenTurn, seenTurnW} = self
+
+  for _, body in movers do
+    rest[body] = sleeping[body] and pos[body] == seenPos[body] and qv[body] == seenTurn[body] and qw[body] == seenTurnW[body]
+  end
+
+  local {ca: bodiesA, cb: bodiesB, cn: normals, cp: points, cpen: depths} = self
+  local {cnormalImpulse: normalImpulses, ctangentImpulse1: tangentImpulses1, ctangentImpulse2: tangentImpulses2} = self
+  local kept, pairs, lastFirst, lastSecond = 0, 0, 0, 0
+
+  for contact = 1, self.contactCount do
+    local first, second = bodiesA[contact], bodiesB[contact]
+    if not (rest[first] and rest[second]) then continue end
+
+    kept += 1
+    bodiesA[kept], bodiesB[kept] = first, second
+    normals[kept], points[kept], depths[kept] = normals[contact], points[contact], depths[contact]
+    normalImpulses[kept], tangentImpulses1[kept], tangentImpulses2[kept] = 0, 0, 0
+
+    -- A pair's contacts are together, so a change of pair is one more pair.
+    if first ~= lastFirst or second ~= lastSecond then
+      pairs += 1
+      lastFirst, lastSecond = first, second
+    end
+  end
+
+  self.contactCount = kept
+  self.candidateCount = pairs
+  self.manifoldCount = pairs
+end
+
+--- Notes where each sleeping body is, now that what it touches there is known, and takes the
+--- static bodies that had been moved to be at rest again.
+local function settle(self, movers: { number })
+  local {rest, sleeping, pos, qv, qw, seenPos, seenTurn, seenTurnW, unsettled, alive, bodyType} = self
+
+  for _, body in movers do
+    if sleeping[body] then
+      seenPos[body], seenTurn[body], seenTurnW[body] = pos[body], qv[body], qw[body]
+    else
+      seenPos[body] = nil
+    end
+  end
+
+  if #unsettled == 0 then return end
+
+  for _, body in unsettled do
+    rest[body] = alive[body] and bodyType[body] == BODY_STATIC
+  end
+
+  table.clear(unsettled)
+end
+
 function World:_collide()
-    self.contactCount=0
-    self.candidateCount=0
-    self.manifoldCount=0
+    local movers=listMovers(self)
     self.cacheEpoch+=1
+    carryContacts(self,movers)
     if self.broadphase=="sap" then
         if self.stillDirty then self:_rebuildStill() end
-        for _,i in listMovers(self) do self:_updateAabb(i) end
+        local rest=self.rest
+        for _,i in movers do if not rest[i] then self:_updateAabb(i) end end
         self:_collideSap()
     else
         self:_collideGrid()
     end
+    settle(self,movers)
 end
 
 local function pointVelocity(self,i,r)
@@ -4095,7 +4183,7 @@ function World:applyTransforms(data,wake)
         if ang and ang[n] then self.angVel[i]=ang[n] end
         self.prevPos[i]=self.pos[i]
         self:_updateAabb(i)
-        if self.bodyType[i]==BODY_STATIC then self.stillDirty=true end
+        if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
         if wake~=false and self.bodyType[i]==BODY_DYNAMIC then self.sleeping[i]=false;self.sleepTime[i]=0 end
     end
     -- Topology is unchanged, but authoritative teleports invalidate persistent anchors and query cells.
@@ -4243,6 +4331,7 @@ function M.newWorld(opts)
     w.gridDenseKeys={};w.gridPairA={};w.gridPairB={};w.gridDenseCount=0;w.gridPairCount=0
     w.gridTopologyReady=false;w.gridTopologyDirty=true
     w.stillDirty=true;w.stillRoot=0;w.movers={};w.moversDirty=true
+    w.rest={};w.unsettled={};w.seenPos={};w.seenTurn={};w.seenTurnW={}
     w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={}
     w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
     w.frame=0

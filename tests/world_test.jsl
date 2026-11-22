@@ -1451,4 +1451,101 @@ suite.describe('a level of static bodies', function()
   end)
 end)
 
+suite.describe('bodies at rest', function()
+  for _, broadphase in { 'grid', 'sap' } do
+    --- A floor, a box asleep on it and a box asleep on that: stepped until both sleep.
+    local function stack(options)
+      options.broadphase = broadphase
+      local world = physik.newWorld(options)
+      local floor = ground(world)
+      local lower = world:addBody({ shape = physik.box(vector.create(0.5, 0.5, 0.5)), position = vector.create(0, 0.5, 0) })
+      local upper = world:addBody({ shape = physik.box(vector.create(0.4, 0.4, 0.4)), position = vector.create(0, 1.4, 0) })
+
+      for _ = 1, 240 do
+        world:step(1 / 60)
+      end
+
+      expect(world:stats().sleeping).toBe(2)
+
+      return world, floor, lower, upper
+    end
+
+    suite.it(`touch as they did for as long as they lie there, by {broadphase}`, function()
+      local world = stack({ contactEvents = true })
+      local before = world:contacts()
+
+      for _ = 1, 30 do
+        world:step(1 / 60)
+      end
+
+      local after = world:contacts()
+      expect(#after).toBe(#before)
+      expect(#after >= 8).toBe(true)
+
+      for index, contact in after do
+        expect(contact.a).toBe(before[index].a)
+        expect(contact.b).toBe(before[index].b)
+        expect(contact.point).toBe(before[index].point)
+        expect(contact.normal).toBe(before[index].normal)
+        expect(contact.penetration).toBe(before[index].penetration)
+      end
+
+      -- Two pairs, both staying.
+      local events, count = world:writeContactEvents()
+      expect(count).toBe(2)
+      expect(events.kind[1]).toBe(physik.contactEvent.stay)
+      expect(events.kind[2]).toBe(physik.contactEvent.stay)
+      expect(world:stats().manifolds).toBe(2)
+    end)
+
+    suite.it(`are found again where one is put without waking it, by {broadphase}`, function()
+      local world, _, _, upper = stack({})
+
+      world:setPosition(upper, vector.create(10, 0.39, 0), false)
+      world:step(1 / 60)
+
+      expect(world:stats().sleeping).toBe(2)
+
+      local pairs = [for contact in world:contacts() => `{contact.a % Generation}-{contact.b % Generation}`]
+      expect(table.concat(pairs, ' ')).toBe('1-2 1-2 1-2 1-2 1-3 1-3 1-3 1-3')
+    end)
+
+    suite.it(`stop touching a body that is taken away, by {broadphase}`, function()
+      local world, _, lower = stack({})
+
+      world:removeBody(lower)
+      world:step(1 / 60)
+      expect(world:stats().contacts).toBe(0)
+
+      -- And one added in its slot is another body.
+      world:addBody({ shape = physik.sphere(0.1), position = vector.create(5, 5, 5) })
+      world:step(1 / 60)
+      expect(world:stats().contacts).toBe(0)
+    end)
+
+    suite.it(`stop touching a static body that is moved away, and touch one moved in, by {broadphase}`, function()
+      local world, floor = stack({})
+
+      world:setPosition(floor, vector.create(0, -30, 0))
+      world:step(1 / 60)
+      expect(world:stats().contacts).toBe(4)
+
+      world:setPosition(floor, vector.create(0, -0.5, 0))
+      world:step(1 / 60)
+      expect(world:stats().contacts).toBe(8)
+    end)
+
+    suite.it(`wake together when one of them is struck, by {broadphase}`, function()
+      local world, _, lower, upper = stack({})
+
+      world:applyImpulse(upper, vector.create(3, 0, 0))
+      world:step(1 / 60)
+
+      expect(world:getBody(lower).sleeping).toBe(false)
+      expect(world:getBody(upper).sleeping).toBe(false)
+      expect(world:stats().activeContacts).toBe(8)
+    end)
+  end
+end)
+
 return suite
