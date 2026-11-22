@@ -6,6 +6,7 @@ local data = require('@dream/data')
 local cells = require('./cells')
 local geometry = require('./geometry')
 local shapes = require('./shape')
+local worlds = require('./world')
 
 local M = {}
 
@@ -35,18 +36,18 @@ local ZAXIS = vector.create(0, 0, 1)
 local EPS = 1e-8
 local HANDLE_STRIDE = 1048576 -- 20 index bits worth of exact-number handle space.
 
-local BODY_STATIC = 0
-local BODY_DYNAMIC = 1
-local BODY_KINEMATIC = 2
+local BODY_STATIC = 'static'
+local BODY_DYNAMIC = 'dynamic'
+local BODY_KINEMATIC = 'kinematic'
 local SHAPE_SPHERE = 'sphere'
 local SHAPE_BOX = 'box'
 local SHAPE_CAPSULE = 'capsule'
 local SHAPE_MESH = 'mesh'
 local SHAPE_HEIGHTFIELD = 'heightfield'
 local SHAPE_COMPOUND = 'compound'
-local JOINT_DISTANCE = 1
-local JOINT_BALL = 2
-local JOINT_HINGE = 3
+local JOINT_DISTANCE = 'distance'
+local JOINT_BALL = 'ball'
+local JOINT_HINGE = 'hinge'
 
 local EVENT_ENTER = 1
 local EVENT_STAY = 2
@@ -90,21 +91,9 @@ local function makeHandle(i, generation)
     return generation * HANDLE_STRIDE + i
 end
 
-local function bodyPairKey(a,b)
-    if b<a then a,b=b,a end
-    return a*HANDLE_STRIDE+b
-end
-
 local function splitHandle(handle)
     local i = handle % HANDLE_STRIDE
     return i, (handle - i) / HANDLE_STRIDE
-end
-
-local function bodyTypeCode(kind)
-    if kind == nil or kind == "dynamic" then return BODY_DYNAMIC end
-    if kind == "static" then return BODY_STATIC end
-    if kind == "kinematic" then return BODY_KINEMATIC end
-    error("physik: body type must be 'dynamic', 'static', or 'kinematic'", 3)
 end
 
 
@@ -113,17 +102,29 @@ end
 local World = {}
 World.__index = World
 
-local function applyInvInertia(self,i,v)
-    if self.inverseMass[i]==0 then return ZERO end
-    local ii=self.inverseInertia[i]
-    -- Spheres are isotropic, so orientation cancels completely.
-    if math.abs(ii.x-ii.y)<1e-12 and math.abs(ii.x-ii.z)<1e-12 then return v*ii.x end
-    local a0,a1,a2=self.axis0[i],self.axis1[i],self.axis2[i]
-    if a0==nil then
-        a0,a1,a2=qAxes(self.turn[i],self.turnW[i])
-        self.axis0[i],self.axis1[i],self.axis2[i]=a0,a1,a2
-    end
-    return a0*(vector.dot(v,a0)*ii.x)+a1*(vector.dot(v,a1)*ii.y)+a2*(vector.dot(v,a2)*ii.z)
+-- What has moved into the world module, under the names the rest of this file still calls it by.
+local bodyPairKey, applyInvInertia = worlds.pairKey, worlds.spinFrom
+
+function World:_check(handle) return worlds.slotOf(self, handle) end
+function World:_updateAabb(body) worlds.refreshBounds(self, body) end
+function World:_handleOf(body) return worlds.handleOf(self, body) end
+function World:_unsettle(body) worlds.unsettle(self, body) end
+function World:shiftOrigin(delta)
+  worlds.shiftOrigin(self, delta)
+
+  return self
+end
+
+World.addBody, World.removeBody, World.hasBody, World.getBody = worlds.addBody, worlds.removeBody, worlds.hasBody, worlds.getBody
+World.setPosition, World.setRotation, World.driveKinematic = worlds.setPosition, worlds.setRotation, worlds.driveKinematic
+World.setVelocity, World.setAngularVelocity, World.wake = worlds.setVelocity, worlds.setAngularVelocity, worlds.wake
+World.applyForce, World.applyForceAtPoint, World.applyTorque = worlds.applyForce, worlds.applyForceAtPoint, worlds.applyTorque
+World.applyAngularImpulse, World.applyImpulse = worlds.applyAngularImpulse, worlds.applyImpulse
+World.addDistanceJoint, World.addBallJoint, World.addHingeJoint = worlds.addDistanceJoint, worlds.addBallJoint, worlds.addHingeJoint
+World.removeJoint = worlds.dropJoint
+
+function M.newWorld(options)
+  return setmetatable(worlds.new(options), World)
 end
 
 
@@ -273,429 +274,6 @@ end
 
 
 
-function World:_check(handle)
-    assert(type(handle) == "number", "physik: body handle must be a number")
-    local i,g = splitHandle(handle)
-    assert(i >= 1 and self.alive[i] and self.generation[i] == g, "physik: stale or invalid body handle")
-    return i
-end
-
-function World:_allocSlot()
-    local free = self.free
-    local n = #free
-    local i
-    if n > 0 then
-        -- The lowest free slot, off the top of the heap, and the last one sifted down from there.
-        i = free[1]
-        local last = free[n]
-        free[n] = nil
-        n -= 1
-        local at = 1
-        while true do
-            local below = at * 2
-            if below > n then break end
-            if below < n and free[below + 1] < free[below] then below += 1 end
-            if free[below] >= last then break end
-            free[at] = free[below]
-            at = below
-        end
-        if n > 0 then free[at] = last end
-        self.generation[i] += 1
-    else
-        i = self.high + 1
-        assert(i < HANDLE_STRIDE, "physik: world body capacity exceeded")
-        self.high = i
-        self.generation[i] = 1
-    end
-    self.alive[i] = true
-    self.aliveCount += 1
-    -- A slot that is taken again before the sweep's order was compacted is still listed in it,
-    -- and listing it twice would offer each of its pairs twice.
-    if not self.inOrder[i] then
-        self.inOrder[i] = true
-        self.order[#self.order+1] = i
-    end
-    return i
-end
-
-function World:addBody(desc)
-    desc = desc or {}
-    local shape = desc.shape or M.sphere(0.5)
-    assert(type(shape) == "table" and (shape.kind == SHAPE_SPHERE or shape.kind == SHAPE_BOX or shape.kind == SHAPE_CAPSULE or shape.kind == SHAPE_MESH or shape.kind == SHAPE_HEIGHTFIELD or shape.kind == SHAPE_COMPOUND), "physik.addBody: invalid shape")
-    local kind = bodyTypeCode(desc.type)
-    assert(not ((shape.kind==SHAPE_MESH or shape.kind==SHAPE_HEIGHTFIELD) and kind==BODY_DYNAMIC), "physik.addBody: triangle meshes and heightfields must be static or kinematic")
-    local mass = if kind == BODY_DYNAMIC then (desc.mass or 1) else 0
-    assert(mass >= 0, "physik.addBody: mass must be >= 0")
-
-    -- Checked before a slot is taken, so a body that is refused leaves nothing behind.
-    local rotation = desc.rotation
-    local turn, turnW = ZERO, 1
-
-    if rotation ~= nil then
-        if type(rotation) ~= 'table' or typeof(rotation.turn) ~= 'vector' or type(rotation.turnW) ~= 'number' then
-            error('physik.addBody: rotation must come from physik.quat/axisAngle', 2)
-        end
-
-        turn, turnW = qNormalize(rotation.turn, rotation.turnW)
-    end
-
-    local i = self:_allocSlot()
-    self.bodyType[i] = kind
-    self.shape[i] = shape
-    self.sphereRadius[i] = shape.kind == SHAPE_SPHERE and shape.radius
-    self.position[i] = desc.position or ZERO
-    self.velocity[i] = desc.velocity or ZERO
-    self.spin[i] = desc.angularVelocity or ZERO
-    self.force[i] = ZERO
-    self.torque[i] = ZERO
-    self.turn[i], self.turnW[i] = turn, turnW
-    self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.turn[i],self.turnW[i])
-    self.inverseMass[i] = if kind == BODY_DYNAMIC and mass > EPS then 1/mass else 0
-    self.inverseInertia[i] = if kind == BODY_DYNAMIC then inertiaFor(shape,mass) else ZERO
-    self.friction[i] = desc.friction or 0.6
-    self.restitution[i] = desc.restitution or 0.05
-    self.linearDamping[i] = desc.linearDamping or 0.02
-    self.angularDamping[i] = desc.angularDamping or 0.05
-    self.group[i] = desc.group or 1
-    self.mask[i] = if desc.mask == nil then 0xffffffff else desc.mask
-    self.userData[i] = desc.userData
-    self.swept[i] = desc.ccd == true
-    self.sensor[i] = desc.sensor == true
-    self.previousPosition[i] = self.position[i]
-    self.sleeping[i] = false
-    self.sleepTime[i] = 0
-    self.boundsLow[i] = ZERO
-    self.boundsHigh[i] = ZERO
-    self:_updateAabb(i)
-    self.gridValid=false
-    self.gridTopologyDirty=true
-    self.gridKey[i]=nil
-    self.rest[i],self.seenPosition[i]=false,nil
-    self.changed=true
-    self.nearEpochs[i]=0
-    if kind==BODY_STATIC then
-        self.stillDirty=true
-        table.insert(self.unsettled,i)
-    else
-        self.moversDirty=true
-    end
-    if self.swept[i] then self.sweptCount+=1 end
-    return makeHandle(i,self.generation[i])
-end
-
-function World:removeBody(handle)
-    local i = self:_check(handle)
-    for id=1,self.nextJoint-1 do
-        local j=self.joints[id]
-        if j and (j.a==i or j.b==i) then self:_dropJoint(id,j) end
-    end
-    self.alive[i] = false
-    self.aliveCount -= 1
-    self.rest[i] = false
-    self.changed = true
-    if self.bodyType[i]==BODY_STATIC then self.stillDirty=true else self.moversDirty=true end
-    if self.swept[i] then self.sweptCount-=1 end
-    -- The free slots are a heap with the lowest on top, which is the next one taken: a world
-    -- that has had bodies taken out of it then gives the same slots to the same bodies as a new
-    -- one, and steps as a new one does.
-    local free = self.free
-    local at = #free + 1
-    while at > 1 do
-        local above = at // 2
-        if free[above] <= i then break end
-        free[at] = free[above]
-        at = above
-    end
-    free[at] = i
-    self.userData[i] = nil
-    self.sleeping[i] = false
-    -- A destroyed slot must not turn into a "stay" event if the numeric slot is reused.
-    for k=1,#self.contactPairsBefore do
-        local key=self.contactPairsBefore[k]
-        if self.contactPairFirst[key]==i or self.contactPairSecond[key]==i then
-            self.contactPairActive[key]=nil
-            self.contactPairFirst[key]=nil;self.contactPairSecond[key]=nil;self.contactPairSensor[key]=nil
-        end
-    end
-    self.gridValid=false
-    self.gridTopologyDirty=true
-end
-
---- A static body has been moved: the tree is to be built again, and what the body touches is to
---- be found again.
-function World:_unsettle(i)
-    self.stillDirty=true
-    self.rest[i]=false
-    self.changed=true
-    table.insert(self.unsettled,i)
-end
-
---- Whether `handle` is of a body that is still in the world.
-function World:hasBody(handle)
-    if type(handle) ~= "number" then return false end
-    local i,g = splitHandle(handle)
-    return i >= 1 and self.alive[i] == true and self.generation[i] == g
-end
-
-function World:_handleOf(i)
-    return makeHandle(i,self.generation[i])
-end
-
-function World:getBody(handle)
-    local i = self:_check(handle)
-    return {
-        handle = handle,
-        type = if self.bodyType[i] == BODY_STATIC then "static" elseif self.bodyType[i] == BODY_KINEMATIC then "kinematic" else "dynamic",
-        position = self.position[i],
-        rotation = { turn = self.turn[i], turnW = self.turnW[i] },
-        velocity = self.velocity[i],
-        angularVelocity = self.spin[i],
-        sleeping = self.sleeping[i],
-        sensor = self.sensor[i],
-        userData = self.userData[i],
-    }
-end
-
-function World:setPosition(handle, p, wake)
-    local i = self:_check(handle)
-    self.position[i] = p
-    self.gridValid=false
-    if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
-    if wake ~= false then self:wake(handle) end
-end
-
-function World:setRotation(handle,q,wake)
-    local i=self:_check(handle)
-    self.turn[i],self.turnW[i]=qNormalize(q.turn,q.turnW)
-    self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.turn[i],self.turnW[i])
-    self.gridValid=false
-    if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
-    if wake~=false then self:wake(handle) end
-end
-
-
-function World:driveKinematic(handle,targetPosition,targetRotation,dt)
-    local i=self:_check(handle)
-    assert(self.bodyType[i]==BODY_KINEMATIC,"physik.driveKinematic: body must be kinematic")
-    assert(typeof(targetPosition)=="vector" and type(dt)=="number" and dt>0,"physik.driveKinematic: target position must be a vector and dt > 0")
-    self.velocity[i]=(targetPosition-self.position[i])/dt
-    if targetRotation then
-        assert(type(targetRotation)=="table" and typeof(targetRotation.turn)=="vector" and type(targetRotation.turnW)=="number","physik.driveKinematic: rotation must come from physik.quat/axisAngle")
-        local tv,tw=qNormalize(targetRotation.turn,targetRotation.turnW)
-        local dv,dw=qMul(tv,tw,-self.turn[i],self.turnW[i])
-        if dw<0 then dv,dw=-dv,-dw end
-        dw=clamp(dw,-1,1)
-        local angle=2*math.acos(dw)
-        local s2=math.max(1-dw*dw,0)
-        if angle>1e-7 and s2>1e-12 then self.spin[i]=dv*(angle/(math.sqrt(s2)*dt)) else self.spin[i]=ZERO end
-    else
-        self.spin[i]=ZERO
-    end
-end
-
-function World:shiftOrigin(delta)
-  assert(typeof(delta) == 'vector', 'physik.shiftOrigin: delta must be a vector')
-  local {alive, position: pos, previousPosition: prevPos, boundsLow: aabbMin, boundsHigh: aabbMax, contactPoint: points} = self
-
-  for body = 1, self.high do
-    if not alive[body] then continue end
-
-    pos[body] -= delta
-    prevPos[body] -= delta
-    aabbMin[body] -= delta
-    aabbMax[body] -= delta
-  end
-
-  for contact = 1, self.contactCount do
-    points[contact] -= delta
-  end
-
-  self.gridValid = false
-  self.stillDirty = true
-
-  return self
-end
-
-function World:setVelocity(handle, v)
-    local i = self:_check(handle)
-    self.velocity[i] = v
-    self.sleeping[i] = false
-    self.sleepTime[i] = 0
-end
-
-function World:setAngularVelocity(handle, v)
-    local i = self:_check(handle)
-    self.spin[i] = v
-    self.sleeping[i] = false
-    self.sleepTime[i] = 0
-end
-
-function World:wake(handle)
-    local i = self:_check(handle)
-    self.sleeping[i] = false
-    self.sleepTime[i] = 0
-end
-
-function World:applyForce(handle, f)
-    local i = self:_check(handle)
-    if self.bodyType[i] ~= BODY_DYNAMIC then return end
-    self.force[i] += f
-    self.sleeping[i] = false
-    self.sleepTime[i] = 0
-end
-
-function World:applyForceAtPoint(handle, f, point)
-    local i = self:_check(handle)
-    if self.bodyType[i] ~= BODY_DYNAMIC then return end
-    self.force[i] += f
-    self.torque[i] += vector.cross(point - self.position[i], f)
-    self.sleeping[i] = false
-    self.sleepTime[i] = 0
-end
-
-function World:applyTorque(handle, torque)
-    local i=self:_check(handle)
-    if self.bodyType[i]~=BODY_DYNAMIC then return end
-    self.torque[i]+=torque
-    self.sleeping[i]=false
-    self.sleepTime[i]=0
-end
-
-function World:applyAngularImpulse(handle, impulse)
-    local i=self:_check(handle)
-    if self.bodyType[i]~=BODY_DYNAMIC then return end
-    self.spin[i]+=applyInvInertia(self,i,impulse)
-    self.sleeping[i]=false
-    self.sleepTime[i]=0
-end
-
-function World:applyImpulse(handle, impulse, point)
-    local i = self:_check(handle)
-    if self.bodyType[i] ~= BODY_DYNAMIC then return end
-    self.velocity[i] += impulse * self.inverseMass[i]
-    if point ~= nil then
-        self.spin[i] += applyInvInertia(self,i,vector.cross(point-self.position[i],impulse))
-    end
-    self.sleeping[i] = false
-    self.sleepTime[i] = 0
-end
-
-function World:addDistanceJoint(aHandle,bHandle,opts)
-    local a,b = self:_check(aHandle),self:_check(bHandle)
-    opts = opts or {}
-    local la = opts.localAnchorA or ZERO
-    local lb = opts.localAnchorB or ZERO
-    local wa = self.position[a] + qRotate(self.turn[a],self.turnW[a],la)
-    local wb = self.position[b] + qRotate(self.turn[b],self.turnW[b],lb)
-    local id = self.nextJoint
-    self.nextJoint += 1
-    self.joints[id] = {
-        kind=JOINT_DISTANCE,
-        a=a,b=b, ga=self.generation[a],gb=self.generation[b],
-        la=la,lb=lb,
-        rest=opts.length or vector.magnitude(wb-wa),
-        stiffness=opts.stiffness or 0.25,
-        damping=opts.damping or 0.05,
-        impulse=0,
-        collideConnected=opts.collideConnected==true,
-    }
-    if not self.joints[id].collideConnected then
-        local key=bodyPairKey(a,b)
-        self.jointNoCollide[key]=(self.jointNoCollide[key] or 0)+1
-    end
-    self.jointCount+=1
-    return id
-end
-
-function World:addBallJoint(aHandle,bHandle,opts)
-    local a,b=self:_check(aHandle),self:_check(bHandle)
-    opts=opts or {}
-    local id=self.nextJoint
-    self.nextJoint+=1
-    self.joints[id]={kind=JOINT_BALL,a=a,b=b,ga=self.generation[a],gb=self.generation[b],la=opts.localAnchorA or ZERO,lb=opts.localAnchorB or ZERO,stiffness=opts.stiffness or 0.25,damping=opts.damping or 0.05,collideConnected=opts.collideConnected==true}
-    if not self.joints[id].collideConnected then
-        local key=bodyPairKey(a,b)
-        self.jointNoCollide[key]=(self.jointNoCollide[key] or 0)+1
-    end
-    self.jointCount+=1
-    return id
-end
-
-function World:addHingeJoint(aHandle,bHandle,opts)
-    local a,b=self:_check(aHandle),self:_check(bHandle)
-    opts=opts or {}
-    local id=self.nextJoint
-    self.nextJoint+=1
-    self.joints[id]={kind=JOINT_HINGE,a=a,b=b,ga=self.generation[a],gb=self.generation[b],la=opts.localAnchorA or ZERO,lb=opts.localAnchorB or ZERO,axisA=safeUnit(opts.localAxisA or YAXIS,YAXIS),axisB=safeUnit(opts.localAxisB or YAXIS,YAXIS),stiffness=opts.stiffness or 0.25,damping=opts.damping or 0.05,angularStiffness=opts.angularStiffness or 0.2,motorSpeed=opts.motorSpeed,maxMotorTorque=opts.maxMotorTorque or math.huge,motorImpulse=0,collideConnected=opts.collideConnected==true}
-    if not self.joints[id].collideConnected then
-        local key=bodyPairKey(a,b)
-        self.jointNoCollide[key]=(self.jointNoCollide[key] or 0)+1
-    end
-    self.jointCount+=1
-    return id
-end
-
-function World:_dropJoint(id,j)
-    j=j or self.joints[id]
-    if j==nil then return end
-    if not j.collideConnected then
-        local key=bodyPairKey(j.a,j.b)
-        local count=self.jointNoCollide[key] or 0
-        if count<=1 then self.jointNoCollide[key]=nil else self.jointNoCollide[key]=count-1 end
-    end
-    self.joints[id]=nil
-    self.jointCount-=1
-end
-
-function World:removeJoint(id)
-    self:_dropJoint(id)
-end
-
-function World:_updateAabb(i)
-    local shape = self.shape[i]
-    local p = self.position[i]
-    if shape.kind == SHAPE_SPHERE then
-        local r=shape.radius+self.contactMargin
-        local e=vector.create(r,r,r)
-        self.boundsLow[i],self.boundsHigh[i]=p-e,p+e
-        return
-    elseif shape.kind == SHAPE_BOX then
-        local a0,a1,a2=qAxes(self.turn[i],self.turnW[i])
-        self.axis0[i],self.axis1[i],self.axis2[i]=a0,a1,a2
-        local h = shape.halfExtents
-        local e = vector.create(
-            math.abs(a0.x)*h.x + math.abs(a1.x)*h.y + math.abs(a2.x)*h.z,
-            math.abs(a0.y)*h.x + math.abs(a1.y)*h.y + math.abs(a2.y)*h.z,
-            math.abs(a0.z)*h.x + math.abs(a1.z)*h.y + math.abs(a2.z)*h.z
-        )
-        self.boundsLow[i],self.boundsHigh[i] = p-e,p+e
-    elseif shape.kind == SHAPE_CAPSULE then
-        local a0,axis,a2=qAxes(self.turn[i],self.turnW[i])
-        self.axis0[i],self.axis1[i],self.axis2[i]=a0,axis,a2
-        local h = shape.halfHeight
-        local r = shape.radius
-        local e = vector.create(math.abs(axis.x)*h+r,math.abs(axis.y)*h+r,math.abs(axis.z)*h+r)
-        self.boundsLow[i],self.boundsHigh[i] = p-e,p+e
-    else
-        local a0,a1,a2=qAxes(self.turn[i],self.turnW[i])
-        self.axis0[i],self.axis1[i],self.axis2[i]=a0,a1,a2
-        local lc=(shape.localMin+shape.localMax)*0.5
-        local lh=(shape.localMax-shape.localMin)*0.5
-        local wc=p+qRotate(self.turn[i],self.turnW[i],lc)
-        local e=vector.create(
-            math.abs(a0.x)*lh.x+math.abs(a1.x)*lh.y+math.abs(a2.x)*lh.z,
-            math.abs(a0.y)*lh.x+math.abs(a1.y)*lh.y+math.abs(a2.y)*lh.z,
-            math.abs(a0.z)*lh.x+math.abs(a1.z)*lh.y+math.abs(a2.z)*lh.z
-        )
-        self.boundsLow[i],self.boundsHigh[i]=wc-e,wc+e
-    end
-    local margin=self.contactMargin
-    if margin>0 then
-        local skin=vector.create(margin,margin,margin)
-        self.boundsLow[i]-=skin
-        self.boundsHigh[i]+=skin
-    end
-end
 
 --- Sorts `order` by each body's least X from scratch: the keys go into a buffer, the data plane
 --- orders them, and the bodies follow. It is stable, as the insertion sort it stands in for is, so
@@ -1742,9 +1320,9 @@ function World:_buildIslands()
     local joint = joints[id]
     if not joint then continue end
 
-    local first, second = joint.a, joint.b
+    local first, second = joint.first, joint.second
     if not alive[first] or not alive[second] then continue end
-    if generation[first] ~= joint.ga or generation[second] ~= joint.gb then continue end
+    if generation[first] ~= joint.firstGeneration or generation[second] ~= joint.secondGeneration then continue end
     if bodyType[first] ~= BODY_DYNAMIC or bodyType[second] ~= BODY_DYNAMIC then continue end
 
     unionBodies(parent, size, first, second)
@@ -2185,11 +1763,11 @@ function World:_solveJoints(dt)
     for id=1,self.nextJoint-1 do
         local j=self.joints[id]
         if not j then continue end
-        local a,b=j.a,j.b
-        if not self.alive[a] or not self.alive[b] or self.generation[a]~=j.ga or self.generation[b]~=j.gb then self:_dropJoint(id,j); continue end
+        local a,b=j.first,j.second
+        if not self.alive[a] or not self.alive[b] or self.generation[a]~=j.firstGeneration or self.generation[b]~=j.secondGeneration then self:_dropJoint(id,j); continue end
         if (self.inverseMass[a]==0 or self.sleeping[a]) and (self.inverseMass[b]==0 or self.sleeping[b]) then continue end
-        local ra=qRotate(self.turn[a],self.turnW[a],j.la)
-        local rb=qRotate(self.turn[b],self.turnW[b],j.lb)
+        local ra=qRotate(self.turn[a],self.turnW[a],j.firstAnchor)
+        local rb=qRotate(self.turn[b],self.turnW[b],j.secondAnchor)
         local wa=self.position[a]+ra
         local wb=self.position[b]+rb
         if j.kind==JOINT_DISTANCE then
@@ -2208,8 +1786,8 @@ function World:_solveJoints(dt)
         else
             solveBallAxes(self,j,a,b,ra,rb,wa,wb,dt)
             if j.kind==JOINT_HINGE then
-                local axisA=qRotate(self.turn[a],self.turnW[a],j.axisA)
-                local axisB=qRotate(self.turn[b],self.turnW[b],j.axisB)
+                local axisA=qRotate(self.turn[a],self.turnW[a],j.firstAxis)
+                local axisB=qRotate(self.turn[b],self.turnW[b],j.secondAxis)
                 local hinge=safeUnit(axisA+axisB,axisA)
                 local t1,t2=contactTangents(hinge)
                 local error=vector.cross(axisA,axisB)
@@ -3724,126 +3302,6 @@ function World:stats()
     ccdHits = self.sweptHits,
     joints = self.jointCount,
   }
-end
-
-function M.newWorld(opts)
-    opts=opts or {}
-    local w=setmetatable({},World)
-    w.gravity=opts.gravity or vector.create(0,-9.81,0)
-    w.velocityIterations=opts.velocityIterations or 4
-    w.positionIterations=opts.positionIterations or 1
-    assert(w.positionIterations>=1 and w.positionIterations%1==0,"physik.newWorld: positionIterations must be a positive integer")
-    w.positionCorrection=if opts.positionCorrection==nil then 0.12 else opts.positionCorrection
-    w.baumgarte=if opts.baumgarte==nil then 0.03 else opts.baumgarte
-    w.baumgarteSlop=if opts.baumgarteSlop==nil then 0.05 else opts.baumgarteSlop
-    w.maxDepenetrationVelocity=opts.maxDepenetrationVelocity or 1.0
-    w.penetrationSlop=opts.penetrationSlop or 0.003
-    w.restitutionThreshold=opts.restitutionThreshold or 1.0
-    w.allowSleep=if opts.allowSleep==nil then true else opts.allowSleep
-    w.sleepLinear=opts.sleepLinear or 0.04
-    w.sleepAngular=opts.sleepAngular or 0.05
-    w.sleepDelay=opts.sleepDelay or 0.6
-    w.wakeSpeed=opts.wakeSpeed or 0.5
-    w.wakePenetration=opts.wakePenetration or 0.05
-    w.warmStarting=if opts.warmStarting==nil then true else opts.warmStarting
-    w.trackContactEvents=opts.contactEvents==true
-    w.warmStartFactor=opts.warmStartFactor or 0.85
-    w.manifoldMatchDistance=opts.manifoldMatchDistance or 0.08
-    w.contactMargin=if opts.contactMargin==nil then 0.015 else opts.contactMargin
-    w.manifoldSlop=opts.manifoldSlop or w.contactMargin
-    w.ccdSlop=opts.ccdSlop or 0.001
-    w.broadphase=opts.broadphase or "grid"
-    assert(w.broadphase=="grid" or w.broadphase=="sap","physik.newWorld: broadphase must be grid or sap")
-    w.broadphaseCellSize=opts.broadphaseCellSize or 1.0
-    assert(w.broadphaseCellSize>0,"physik.newWorld: broadphaseCellSize must be > 0")
-    w.directLargeThreshold=opts.directLargeThreshold or 16
-    assert(w.directLargeThreshold>=0 and w.directLargeThreshold%1==0,"physik.newWorld: directLargeThreshold must be a non-negative integer")
-    w.meshQueryCellLimit=opts.meshQueryCellLimit or 4096
-    assert(w.meshQueryCellLimit>=1 and w.meshQueryCellLimit%1==0,"physik.newWorld: meshQueryCellLimit must be a positive integer")
-    w.queryRayCellLimit=opts.queryRayCellLimit or 2048
-    assert(w.queryRayCellLimit>=1 and w.queryRayCellLimit%1==0,"physik.newWorld: queryRayCellLimit must be a positive integer")
-    w.queryAabbCellLimit=opts.queryAabbCellLimit or 8192
-    assert(w.queryAabbCellLimit>=1 and w.queryAabbCellLimit%1==0,"physik.newWorld: queryAabbCellLimit must be a positive integer")
-    w.fixedDt=opts.fixedDt or (1/60)
-    w.maxCatchUpSteps=opts.maxCatchUpSteps or 8
-    w.accumulator=0
-    w.gridHeads={};w.gridKeys={};w.gridNext={};w.gridLarge={};w.gridColumn={};w.gridRow={};w.gridLayer={};w.gridKey={}
-    w.gridKeyColumn={};w.gridKeyRow={};w.gridKeyLayer={}
-    w.gridOccupied = buffer.create(GridFilterSize)
-    w.gridDenseKeys={};w.gridPairFirst={};w.gridPairSecond={};w.gridDenseCount=0;w.gridPairCount=0
-    w.gridTopologyReady=false;w.gridTopologyDirty=true
-    w.stillDirty=true;w.stillRoot=0;w.movers={};w.moversDirty=true
-    w.nearStill={};w.nearLows={};w.nearHighs={};w.nearEpochs={};w.stillEpoch=0
-    w.unseen={}
-    w.stirring=0;w.stillWasMoved=false;w.quiet=false;w.changed=true
-    w.rest={};w.unsettled={};w.seenPosition={};w.seenTurn={};w.seenTurnW={}
-    w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={};w.stillNear={}
-    w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
-    w.frame=0
-    w.cacheEpoch=0
-    w.sweptHits=0
-    w.sweptCount=0
-    w.high=0
-    w.aliveCount=0
-    w.free={}
-    w.order={}
-    w.inOrder={}
-    w.generation={}
-    w.alive={}
-    w.bodyType={}
-    w.shape={}
-    w.sphereRadius = {}
-    w.position={}
-    w.turn={}
-    w.turnW={}
-    w.axis0={};w.axis1={};w.axis2={}
-    w.velocity={}
-    w.spin={}
-    w.force={}
-    w.torque={}
-    w.inverseMass={}
-    w.inverseInertia={}
-    w.friction={}
-    w.restitution={}
-    w.linearDamping={}
-    w.angularDamping={}
-    w.group={}
-    w.mask={}
-    w.userData={}
-    w.sensor={}
-    w.swept={};w.previousPosition={}
-    w.linearView={alive=w.alive,bodyType=w.bodyType,userData=w.userData,positions=w.position,velocities=w.velocity,high=0,dynamicCode=BODY_DYNAMIC}
-    w.sleeping={}
-    w.sleepTime={}
-    w.boundsLow={}
-    w.boundsHigh={}
-    w.contactCount=0
-    w.candidateCount=0
-    w.manifoldCount=0
-    w.warmStartedCount=0
-    w.activeContactCount=0
-    w.islandCount=0
-    w.contactFirst={};w.contactSecond={};w.contactNormal={};w.contactPoint={};w.contactDepth={};w.contactSolved={};w.normalImpulse={}
-    w.tangentImpulse1={};w.tangentImpulse2={}
-    w.firstArm={};w.secondArm={};w.firstAnchor={};w.secondAnchor={};w.normalMass={};w.contactFriction={};w.contactBounce={};w.contactBias={}
-    w.firstNormalTurn={};w.secondNormalTurn={}
-    w.tangent1={};w.tangent2={};w.tangentMass1={};w.tangentMass2={}
-    w.firstTangentTurn1={};w.secondTangentTurn1={};w.firstTangentTurn2={};w.secondTangentTurn2={}
-    w.contactCache={}
-    w.activeContacts={}
-    w.contactEventEpoch=0;w.contactEventCount=0
-    w.contactPairSeen={};w.contactPairActive={};w.contactPairFirst={};w.contactPairSecond={};w.contactPairSensor={}
-    w.contactPairsBefore={};w.contactPairsNow={}
-    w.eventFirst={};w.eventSecond={};w.eventKind={};w.eventSensor={}
-    w.clipFrom={};w.clipTo={};w.manifoldPoints={};w.manifoldDepths={}
-    w.meshNormals={};w.meshPoints={};w.meshDepths={};w.meshContactCount=0
-    w.firstPieceCentres, w.firstPieceTurns, w.firstPieceTurnWs = {}, {}, {}
-    w.secondPieceCentres, w.secondPieceTurns, w.secondPieceTurnWs = {}, {}, {}
-    w.meshMarks={};w.meshMarkEpoch=0
-    w.castCapsule={kind=SHAPE_CAPSULE,radius=0,halfHeight=0};w.castTriangles={}
-    w.islandParent={};w.islandSize={};w.islandAwake={};w.islandRoots={};w.islandCanSleep={};w.islandLeastRest={}
-    w.joints={};w.jointNoCollide={};w.nextJoint=1;w.jointCount=0
-    return w
 end
 
 M.contactEvent = table.freeze({ enter=EVENT_ENTER, stay=EVENT_STAY, exit=EVENT_EXIT })
