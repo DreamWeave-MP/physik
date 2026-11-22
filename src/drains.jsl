@@ -20,13 +20,13 @@ end
 
 export type DrainOptions = {
   --- Leave out the bodies that are asleep.
-  awakeOnly: boolean?,
+  read awakeOnly: boolean?,
   --- Leave out the bodies that are static or kinematic.
-  dynamicOnly: boolean?,
+  read dynamicOnly: boolean?,
   --- For `writeLinearState`: false leaves the handles out.
-  handles: boolean?,
+  read handles: boolean?,
   --- For `writeLinearState`: true puts each body's user data beside it.
-  userData: boolean?,
+  read userData: boolean?,
 }
 
 --- The world's own columns of where its bodies are and how they move, for a caller that reads
@@ -143,13 +143,13 @@ end
 --- What `applyTransforms` takes: what `writeTransforms` writes, of which only the handles and
 --- the positions have to be there.
 export type TransformsToApply = {
-  handles: { number },
-  positions: { vector },
-  rotations: { vector }?,
-  rotationW: { number }?,
-  velocities: { vector }?,
-  angularVelocities: { vector }?,
-  count: number?,
+  read handles: { number },
+  read positions: { vector },
+  read rotations: { vector }?,
+  read rotationW: { number }?,
+  read velocities: { vector }?,
+  read angularVelocities: { vector }?,
+  read count: number?,
 }
 
 --- Puts bodies where a drained state says they are: for a state that came from somewhere that

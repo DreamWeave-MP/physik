@@ -745,12 +745,12 @@ end
 --- the other columns are empty where it did not.
 export type CastColumns = {
   hit: { boolean },
-  handles: { [number]: number? },
-  fractions: { [number]: number? },
-  distances: { [number]: number? },
-  centers: { [number]: vector? },
-  points: { [number]: vector? },
-  normals: { [number]: vector? },
+  handles: { number },
+  fractions: { number },
+  distances: { number },
+  centers: { vector },
+  points: { vector },
+  normals: { vector },
   userData: { [number]: unknown },
   count: number,
 }
@@ -781,7 +781,7 @@ function queries.sphereCastBatchSoA(
   finishes: { vector },
   radii: number | { number },
   masks: { number }?,
-  ignoreHandles: { [number]: number? }?,
+  ignoreHandles: { number }?,
   into: unknown
 ): (CastColumns, number)
   assert(
@@ -1161,10 +1161,10 @@ end
 --- other columns are empty where it did not.
 export type RayColumns = {
   hit: { boolean },
-  handles: { [number]: number? },
-  distances: { [number]: number? },
-  points: { [number]: vector? },
-  normals: { [number]: vector? },
+  handles: { number },
+  distances: { number },
+  points: { vector },
+  normals: { vector },
   userData: { [number]: unknown },
   count: number,
 }

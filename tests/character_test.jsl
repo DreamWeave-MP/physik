@@ -6,6 +6,13 @@ local suite = test.new()
 
 local Step = 1 / 60
 
+--- What a ray or a sweep met, where a case expects it to have met something.
+local function met<Hit>(hit: Hit?): Hit
+  if not hit then error('expected to meet something, and met nothing', 2) end
+
+  return hit :: Hit
+end
+
 local function near(actual: number, expected: number, tolerance: number?)
   local allowed = tolerance or 5e-3
   if math.abs(actual - expected) <= allowed then return end
@@ -13,7 +20,7 @@ local function near(actual: number, expected: number, tolerance: number?)
   error(`expected {actual} to be within {allowed} of {expected}`, 2)
 end
 
-local function box(world, half: vector, position: vector, rotation: any?)
+local function box(world: physik.World, half: vector, position: vector, rotation: physik.Rotation?)
   return world:addBody({ type = 'static', shape = physik.box(half), position = position, rotation = rotation })
 end
 
@@ -41,21 +48,21 @@ suite.describe('a capsule swept', function()
     world:addBody({ type = 'static', shape = physik.capsule(0.5, 1), position = vector.create(-5, 1.5, 0) })
 
     local down = world:capsuleCast(vector.create(0, 5, 0), vector.create(0, -5, 0), 0.4, 0.5)
-    near(down.center.y, 0.9)
-    near(down.normal.y, 1)
-    near(down.distance, 4.1)
+    near(met(down).center.y, 0.9)
+    near(met(down).normal.y, 1)
+    near(met(down).distance, 4.1)
 
     local wall = world:capsuleCast(vector.create(0, 1, 0), vector.create(8, 1, 0), 0.4, 0.5)
-    near(wall.center.x, 3.1)
-    near(wall.normal.x, -1)
+    near(met(wall).center.x, 3.1)
+    near(met(wall).normal.x, -1)
 
     local ball = world:capsuleCast(vector.create(0, 1, 0), vector.create(0, 1, 8), 0.4, 0.5)
-    near(ball.center.z, 4.6)
-    near(ball.normal.z, -1)
+    near(met(ball).center.z, 4.6)
+    near(met(ball).normal.z, -1)
 
     local pill = world:capsuleCast(vector.create(0, 1.5, 0), vector.create(-8, 1.5, 0), 0.4, 0.5)
-    near(pill.center.x, -4.1)
-    near(pill.normal.x, 1)
+    near(met(pill).center.x, -4.1)
+    near(met(pill).normal.x, 1)
   end)
 
   suite.it('meets nothing it passes, slides along or leaves', function()
@@ -66,7 +73,7 @@ suite.describe('a capsule swept', function()
     expect(world:capsuleCast(vector.create(0, 0.9005, 0), vector.create(2, 0.9005, 0), 0.4, 0.5)).toBe(nil)
 
     -- Sunk a little into the floor: met at once going down, and not at all going up.
-    expect(world:capsuleCast(vector.create(0, 0.85, 0), vector.create(0, 0.5, 0), 0.4, 0.5).fraction).toBe(0)
+    expect(met(world:capsuleCast(vector.create(0, 0.85, 0), vector.create(0, 0.5, 0), 0.4, 0.5)).fraction).toBe(0)
     expect(world:capsuleCast(vector.create(0, 0.85, 0), vector.create(0, 2, 0), 0.4, 0.5)).toBe(nil)
   end)
 
@@ -75,10 +82,10 @@ suite.describe('a capsule swept', function()
     box(world, vector.create(0.5, 2, 2), vector.create(4, 2, 0))
 
     local hit = world:capsuleCast(vector.create(0, 1, 3), vector.create(8, 1, 1), 0.4, 0.5)
-    local corner = vector.create(3.5, hit.center.y, 2)
+    local corner = vector.create(3.5, met(hit).center.y, 2)
 
-    near(vector.magnitude(vector.create(hit.center.x, hit.center.y, hit.center.z) - corner), 0.4)
-    expect(hit.normal.x < 0 and hit.normal.z > 0).toBe(true)
+    near(vector.magnitude(vector.create(met(hit).center.x, met(hit).center.y, met(hit).center.z) - corner), 0.4)
+    expect(met(hit).normal.x < 0 and met(hit).normal.z > 0).toBe(true)
   end)
 
   suite.it('meets a mesh, a heightfield and a compound', function()
@@ -108,10 +115,10 @@ suite.describe('a capsule swept', function()
       position = vector.create(-20, 0, 0),
     })
 
-    near(world:capsuleCast(vector.create(1, 8, 1), vector.create(1, -2, 1), 0.4, 0.5).center.y, 2.9)
-    near(world:capsuleCast(vector.create(23, 8, 3), vector.create(23, -2, 3), 0.4, 0.5).center.y, 1.9)
-    near(world:capsuleCast(vector.create(-20, 8, 0), vector.create(-20, -2, 0), 0.4, 0.5).center.y, 2.4)
-    near(world:capsuleCast(vector.create(-20.8, 8, 0.8), vector.create(-20.8, -2, 0.8), 0.4, 0.5).center.y, 1.4)
+    near(met(world:capsuleCast(vector.create(1, 8, 1), vector.create(1, -2, 1), 0.4, 0.5)).center.y, 2.9)
+    near(met(world:capsuleCast(vector.create(23, 8, 3), vector.create(23, -2, 3), 0.4, 0.5)).center.y, 1.9)
+    near(met(world:capsuleCast(vector.create(-20, 8, 0), vector.create(-20, -2, 0), 0.4, 0.5)).center.y, 2.4)
+    near(met(world:capsuleCast(vector.create(-20.8, 8, 0.8), vector.create(-20.8, -2, 0.8), 0.4, 0.5)).center.y, 1.4)
   end)
 
   suite.it('says what a capsule overlaps, and how to leave it', function()

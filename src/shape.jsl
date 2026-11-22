@@ -216,9 +216,9 @@ end
 
 export type MeshOptions = {
   --- The side of a cell of the mesh's grid. Fitted to the mesh unless given.
-  cellSize: number?,
+  read cellSize: number?,
   --- The most cells a triangle is sorted into before it is kept apart. 64 unless given.
-  maxCellsPerTriangle: number?,
+  read maxCellsPerTriangle: number?,
 }
 
 --- A mesh of triangles. `vertices` is a list of vectors or a buffer of packed f32 triples.
@@ -305,11 +305,11 @@ end
 
 export type HeightfieldOptions = {
   --- How far apart the samples are, across and along. 1 unless given.
-  cellSize: number?,
-  cellSizeX: number?,
-  cellSizeZ: number?,
+  read cellSize: number?,
+  read cellSizeX: number?,
+  read cellSizeZ: number?,
   --- Where the first sample is, in the body's own space. The body's origin unless given.
-  origin: vector?,
+  read origin: vector?,
 }
 
 --- Ground as heights: `width` by `depth` of them, row by row, as a list or packed f32.
@@ -382,7 +382,7 @@ local function reachOf(primitive: types.Primitive, turn: vector, turnW: number):
   )
 end
 
-export type Piece = { shape: types.Primitive, position: vector?, rotation: types.Rotation? }
+export type Piece = { read shape: types.Primitive, read position: vector?, read rotation: types.Rotation? }
 
 --- Several primitives as one shape, each where and how `pieces` says it is.
 function shape.compound(pieces: { Piece }): types.Compound

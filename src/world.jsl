@@ -288,36 +288,36 @@ export type State = {
 }
 
 export type Options = {
-  gravity: vector?,
-  velocityIterations: number?,
-  positionIterations: number?,
-  positionCorrection: number?,
-  baumgarte: number?,
-  baumgarteSlop: number?,
-  maxDepenetrationVelocity: number?,
-  penetrationSlop: number?,
-  restitutionThreshold: number?,
-  allowSleep: boolean?,
-  sleepLinear: number?,
-  sleepAngular: number?,
-  sleepDelay: number?,
-  wakeSpeed: number?,
-  wakePenetration: number?,
-  warmStarting: boolean?,
-  warmStartFactor: number?,
-  contactEvents: boolean?,
-  manifoldMatchDistance: number?,
-  contactMargin: number?,
-  manifoldSlop: number?,
-  ccdSlop: number?,
-  broadphase: ('grid' | 'sap')?,
-  broadphaseCellSize: number?,
-  directLargeThreshold: number?,
-  meshQueryCellLimit: number?,
-  queryRayCellLimit: number?,
-  queryAabbCellLimit: number?,
-  fixedDt: number?,
-  maxCatchUpSteps: number?,
+  read gravity: vector?,
+  read velocityIterations: number?,
+  read positionIterations: number?,
+  read positionCorrection: number?,
+  read baumgarte: number?,
+  read baumgarteSlop: number?,
+  read maxDepenetrationVelocity: number?,
+  read penetrationSlop: number?,
+  read restitutionThreshold: number?,
+  read allowSleep: boolean?,
+  read sleepLinear: number?,
+  read sleepAngular: number?,
+  read sleepDelay: number?,
+  read wakeSpeed: number?,
+  read wakePenetration: number?,
+  read warmStarting: boolean?,
+  read warmStartFactor: number?,
+  read contactEvents: boolean?,
+  read manifoldMatchDistance: number?,
+  read contactMargin: number?,
+  read manifoldSlop: number?,
+  read ccdSlop: number?,
+  read broadphase: ('grid' | 'sap')?,
+  read broadphaseCellSize: number?,
+  read directLargeThreshold: number?,
+  read meshQueryCellLimit: number?,
+  read queryRayCellLimit: number?,
+  read queryAabbCellLimit: number?,
+  read fixedDt: number?,
+  read maxCatchUpSteps: number?,
 }
 
 --- A whole number of at least `least`, or an error naming the option that was not one.
@@ -713,27 +713,27 @@ end
 
 export type BodyOptions = {
   --- Dynamic unless given.
-  type: BodyKind?,
+  read type: BodyKind?,
   --- A sphere of radius 0.5 unless given.
-  shape: types.Shape?,
-  position: vector?,
-  rotation: types.Rotation?,
-  velocity: vector?,
-  angularVelocity: vector?,
+  read shape: types.Shape?,
+  read position: vector?,
+  read rotation: types.Rotation?,
+  read velocity: vector?,
+  read angularVelocity: vector?,
   --- 1 unless given. A static or kinematic body has none.
-  mass: number?,
-  friction: number?,
-  restitution: number?,
-  linearDamping: number?,
-  angularDamping: number?,
+  read mass: number?,
+  read friction: number?,
+  read restitution: number?,
+  read linearDamping: number?,
+  read angularDamping: number?,
   --- The bits a body is in, and the bits of the bodies it meets.
-  group: number?,
-  mask: number?,
-  userData: unknown,
+  read group: number?,
+  read mask: number?,
+  read userData: unknown,
   --- A sensor touches and is told so, and pushes nothing.
-  sensor: boolean?,
+  read sensor: boolean?,
   --- A sphere that is swept from where it was to where it is, so that it passes through nothing.
-  ccd: boolean?,
+  read ccd: boolean?,
 }
 
 --- Adds a body and returns its handle.
@@ -1072,22 +1072,22 @@ end
 
 export type JointOptions = {
   --- Where the joint holds each body, in the body's own space. Its middle unless given.
-  localAnchorA: vector?,
-  localAnchorB: vector?,
+  read localAnchorA: vector?,
+  read localAnchorB: vector?,
   --- A hinge's axis in each body's own space. Y unless given.
-  localAxisA: vector?,
-  localAxisB: vector?,
+  read localAxisA: vector?,
+  read localAxisB: vector?,
   --- A distance joint's length. How far apart the anchors are when it is made, unless given.
-  length: number?,
-  stiffness: number?,
-  damping: number?,
+  read length: number?,
+  read stiffness: number?,
+  read damping: number?,
   --- How stiffly a hinge keeps the two axes in line.
-  angularStiffness: number?,
+  read angularStiffness: number?,
   --- A hinge's motor: the speed it turns at, and the most it will twist to get there.
-  motorSpeed: number?,
-  maxMotorTorque: number?,
+  read motorSpeed: number?,
+  read maxMotorTorque: number?,
   --- Whether the two bodies still collide with each other. They do not unless this is true.
-  collideConnected: boolean?,
+  read collideConnected: boolean?,
 }
 
 --- Joins two bodies and returns the joint's number. Unless the joint says otherwise the pair

@@ -22,6 +22,9 @@ local physik = {}
 type State = worlds.State
 
 export type Shape = types.Shape
+export type Primitive = types.Primitive
+export type Mesh = types.Mesh
+export type Heightfield = types.Heightfield
 export type Rotation = types.Rotation
 export type WorldOptions = worlds.Options
 export type BodyOptions = worlds.BodyOptions
@@ -30,8 +33,11 @@ export type Body = worlds.Body
 export type CastHit = queries.CastHit
 export type RayHit = queries.RayHit
 export type Overlaps = queries.Overlaps
+export type RayColumns = queries.RayColumns
+export type CastColumns = queries.CastColumns
 export type Contact = drains.Contact
 export type Stats = drains.Stats
+export type Transforms = drains.Transforms
 
 --- Moves the world on by `duration`, in `substeps` equal parts if more than one is asked for,
 --- and returns how many contacts the last part found. Each part moves the bodies, stops the

@@ -18,22 +18,22 @@ export type World = worlds.State
 
 export type Options = {
   --- The capsule's radius. 0.35 unless given.
-  radius: number?,
+  read radius: number?,
   --- From the soles to the crown. 1.8 unless given, and never less than twice the radius.
-  height: number?,
+  read height: number?,
   --- The tallest step walked up without a jump. 0.3 unless given; 0 for none.
-  stepHeight: number?,
+  read stepHeight: number?,
   --- How far down the ground is followed when the character walks off an edge or down a slope
   --- without having jumped. 0.2 unless given.
-  snapDistance: number?,
+  read snapDistance: number?,
   --- The steepest slope that is ground and not a wall, in degrees. 50 unless given.
-  slopeDegrees: number?,
+  read slopeDegrees: number?,
   --- The bodies the character meets: those whose group shares a bit with this. All unless given.
-  mask: number?,
+  read mask: number?,
   --- A body the character never meets: its own, if it has one in the world.
-  ignore: number?,
+  read ignore: number?,
   --- Where its soles are.
-  position: vector?,
+  read position: vector?,
 }
 
 export type Character = {
