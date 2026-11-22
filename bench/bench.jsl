@@ -73,6 +73,7 @@ local Expected: { [string]: string } = {
   -- been taken out of it: these are as 0.4.0 computes them.
   ['level: 1,024 static boxes and nothing moving, 60 steps'] = '0 contacts, 0 candidates, 0 manifolds, 0 warm, 0 asleep, 0 islands, 0 swept, checksum 37482.222238540649',
   ['level: 48 boxes thrown among 1,024 static ones and taken out again, 60 steps'] = '2539 contacts, 64 candidates, 55 manifolds, 144 warm, 0 asleep, 45 islands, 0 swept, checksum 37672.436927226612',
+  ['level: 200 boxes thrown among 1,024 static ones and taken out again, 60 steps'] = '13451 contacts, 424 candidates, 292 manifolds, 602 warm, 0 asleep, 123 islands, 0 swept, checksum 35935.988151607206',
   ['level: 256 rays among 1,024 static boxes'] = '192 struck, 1575.0599460284282 far',
   ['level: 256 capsules swept among 1,024 static boxes'] = '142 met, 930.984696956682 far',
   ['level: a character run 240 steps among 1,024 static boxes'] = '240 grounded, at 29.093298554420471',
@@ -890,6 +891,18 @@ do
   -- bodies in it and out of it has to step as a new one does.
   workload('level: 48 boxes thrown among 1,024 static ones and taken out again, 60 steps', function(): string
     local thrown = throw(world, 48)
+    local result = run(world, 60)
+
+    for _, handle in thrown do
+      world:removeBody(handle)
+    end
+
+    return result
+  end)
+
+  -- A heap in the air: every piece near enough to most of the others to be offered them.
+  workload('level: 200 boxes thrown among 1,024 static ones and taken out again, 60 steps', function(): string
+    local thrown = throw(world, 200)
     local result = run(world, 60)
 
     for _, handle in thrown do
