@@ -353,6 +353,7 @@ suite.describe('a character', function()
     expect(character.fits(who, vector.create(0, 0.01, 0))).toBe(false)
     expect(character.fits(who, vector.create(5, 0.01, 0))).toBe(true)
   end)
+
   suite.it('crouches under what it cannot walk under, and stands only where there is room', function()
     local world = room()
 
