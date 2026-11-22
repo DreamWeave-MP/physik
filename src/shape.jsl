@@ -13,6 +13,12 @@ local Zero = vector.zero
 local Up = vector.create(0, 1, 0)
 local Tiny = 1e-8
 
+-- How much further on a cell's number is for each column and each row; a layer is one.
+local ColumnStep, RowStep = cells.Base2, cells.Base
+
+-- A column, row or layer from here out has no number.
+local Furthest = cells.Offset
+
 function shape.sphere(radius: number): types.Sphere
   assert(type(radius) == 'number' and radius > 0, 'physik.sphere: radius must be > 0')
 
@@ -96,25 +102,25 @@ local function buildGrid(
     local lastColumn, lastRow, lastLayer = math.floor(high.x / cellSize), math.floor(high.y / cellSize), math.floor(high.z / cellSize)
     local count = (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1)
 
-    -- Every cell between two that have numbers has one.
-    if
-      not (count <= cellLimit)
-      or not cells.pack(firstColumn, firstRow, firstLayer)
-      or not cells.pack(lastColumn, lastRow, lastLayer)
-    then
+    -- When the first cell has a number and the last is not too far out, every cell between has
+    -- one: the first one's, and a step for each column, row and layer on from it.
+    local corner = cells.pack(firstColumn, firstRow, firstLayer)
+
+    if not (count <= cellLimit) or not corner or lastColumn >= Furthest or lastRow >= Furthest or lastLayer >= Furthest then
       table.insert(overflow, triangle)
       continue
     end
 
-    for column = firstColumn, lastColumn do
-      for row = firstRow, lastRow do
-        for layer = firstLayer, lastLayer do
-          local key = cells.pack(column, row, layer) :: number
+    for column = 0, lastColumn - firstColumn do
+      for row = 0, lastRow - firstRow do
+        local key = corner + column * ColumnStep + row * RowStep
 
+        for _ = firstLayer, lastLayer do
           nodeCount += 1
           nodeTriangle[nodeCount] = triangle
           nextNode[nodeCount] = heads[key] or 0
           heads[key] = nodeCount
+          key += 1
         end
       end
     end
