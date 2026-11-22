@@ -321,12 +321,20 @@ local function collideSap(state: State)
     local first = order[position]
     if not alive[first] or bodyType[first] == 'static' then continue end
 
-    local reach = boundsHigh[first].x
+    local low, high = boundsLow[first], boundsHigh[first]
+    local reach = high.x
 
     for after = position + 1, count do
       local second = order[after]
       if not alive[second] or bodyType[second] == 'static' then continue end
-      if boundsLow[second].x > reach then break end
+
+      local otherLow = boundsLow[second]
+      if otherLow.x > reach then break end
+
+      -- Overlapping along X is most of the pairs here, and few of those overlap along Y and Z
+      -- too: they are told apart without the call.
+      local otherHigh = boundsHigh[second]
+      if otherLow.y > high.y or otherHigh.y < low.y or otherLow.z > high.z or otherHigh.z < low.z then continue end
 
       tryPair(state, first, second)
     end
