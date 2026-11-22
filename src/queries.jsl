@@ -300,7 +300,7 @@ local function queryAabbScan(state: State, low: vector, high: vector, mask: numb
     if not bodyOverlapsAabb(state, body, low, high) then continue end
 
     count += 1
-    out[count] = worlds.handleOf(state, body)
+    out[count] = generation[body] * HandleStride + body
   end
 
   return count
@@ -328,7 +328,7 @@ local function queryAabbGrid(
   for _, body in state.gridLarge do
     if alive[body] and bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(state, body, low, high) then
       count += 1
-      out[count] = worlds.handleOf(state, body)
+      out[count] = generation[body] * HandleStride + body
     end
   end
 
@@ -345,7 +345,7 @@ local function queryAabbGrid(
 
         if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(state, body, low, high) then
           count += 1
-          out[count] = worlds.handleOf(state, body)
+          out[count] = generation[body] * HandleStride + body
         end
       else
         local nodeLow, nodeHigh = lows[entry], highs[entry]
@@ -398,7 +398,7 @@ local function queryAabbGrid(
         while body ~= 0 do
           if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(state, body, low, high) then
             count += 1
-            out[count] = worlds.handleOf(state, body)
+            out[count] = generation[body] * HandleStride + body
           end
 
           body = nextIn[body] or 0

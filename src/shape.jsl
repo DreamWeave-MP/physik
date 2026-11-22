@@ -329,7 +329,9 @@ function shape.heightfield(width: number, depth: number, heights: { number } | b
     assert(type(heights) == 'table' and #heights == count, 'physik.heightfield: heights must contain width*depth values')
     samples = buffer.create(count * 4)
 
-    for index, height in heights do
+    for index = 1, count do
+      local height = heights[index]
+
       assert(type(height) == 'number', 'physik.heightfield: heights must be numbers')
       buffer.writef32(samples, (index - 1) * 4, height)
     end

@@ -296,20 +296,25 @@ export type Contact = {
 --- A step's contacts as a list of records: for looking at, where `writeContacts` is for reading
 --- every step.
 function drains.contacts(state: State): { Contact }
-  local {contactFirst, contactSecond, contactNormal, contactPoint, contactDepth, normalImpulse, sensor} = state
+  local {contactFirst, contactSecond, contactNormal, contactPoint, contactDepth, normalImpulse, sensor, generation} = state
+  local count = state.contactCount
+  local out = table.create(count) :: { Contact }
 
-  return [
-    for contact in range(1, state.contactCount) =>
-      {
-        first = worlds.handleOf(state, contactFirst[contact]),
-        second = worlds.handleOf(state, contactSecond[contact]),
-        normal = contactNormal[contact],
-        point = contactPoint[contact],
-        penetration = contactDepth[contact],
-        normalImpulse = normalImpulse[contact],
-        sensor = sensor[contactFirst[contact]] or sensor[contactSecond[contact]],
-      }
-  ]
+  for contact = 1, count do
+    local first, second = contactFirst[contact], contactSecond[contact]
+
+    out[contact] = {
+      first = generation[first] * worlds.HandleStride + first,
+      second = generation[second] * worlds.HandleStride + second,
+      normal = contactNormal[contact],
+      point = contactPoint[contact],
+      penetration = contactDepth[contact],
+      normalImpulse = normalImpulse[contact],
+      sensor = sensor[first] or sensor[second],
+    }
+  end
+
+  return out
 end
 
 export type Stats = {
