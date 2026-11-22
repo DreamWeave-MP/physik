@@ -756,7 +756,7 @@ local function measured(shape): string
     local node = head
 
     while node ~= 0 do
-      chained += shape.nodeTri[node] + 1
+      chained += shape.nodeTriangle[node] + 1
       node = shape.nextNode[node]
     end
   end

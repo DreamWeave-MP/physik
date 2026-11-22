@@ -3,7 +3,9 @@
 -- Hot state uses Luau's native vector value type. Cold metadata stays scalar/packed-friendly.
 
 local data = require('@dream/data')
+local cells = require('./cells')
 local geometry = require('./geometry')
+local shapes = require('./shape')
 
 local M = {}
 
@@ -21,6 +23,10 @@ local raySphere, rayAabbInterval, rayPrimitiveShape = geometry.rayToSphere, geom
 local sweepSphereTriangle, sweepSphereSegment = geometry.sweepSphereAtTriangle, geometry.sweepSphereAtSegment
 local sweepSphereSphere, sweepSphereBox = geometry.sweepSphereAtSphere, geometry.sweepSphereAtBox
 local sweepCapsule, SweepSkin = geometry.sweepCapsule, geometry.SweepSkin
+local packCell, meshTriangle, heightVertex, inertiaFor = cells.pack, shapes.meshTriangle, shapes.heightVertex, shapes.inverseInertia
+
+M.sphere, M.box, M.capsule, M.compound = shapes.sphere, shapes.box, shapes.capsule, shapes.compound
+M.triangleMesh, M.heightfield, M.quat, M.axisAngle = shapes.triangleMesh, shapes.heightfield, shapes.quat, shapes.axisAngle
 
 local ZERO = vector.create(0, 0, 0)
 local XAXIS = vector.create(1, 0, 0)
@@ -75,13 +81,6 @@ local GridKeyStep = [
 -- a clear byte says a cell is empty without a lookup in the table of cells.
 local GridFilterSize = 65521
 
-local function packCell(x,y,z)
-    if x < -CELL_OFFSET or x >= CELL_OFFSET or y < -CELL_OFFSET or y >= CELL_OFFSET or z < -CELL_OFFSET or z >= CELL_OFFSET then
-        return nil
-    end
-    return (x + CELL_OFFSET) * CELL_BASE2 + (y + CELL_OFFSET) * CELL_BASE + (z + CELL_OFFSET)
-end
-
 M.STATIC = "static"
 M.DYNAMIC = "dynamic"
 M.KINEMATIC = "kinematic"
@@ -108,301 +107,8 @@ local function bodyTypeCode(kind)
     error("physik: body type must be 'dynamic', 'static', or 'kinematic'", 3)
 end
 
-function M.sphere(radius)
-    assert(type(radius) == "number" and radius > 0, "physik.sphere: radius must be > 0")
-    return table.freeze({ kind = SHAPE_SPHERE, radius = radius })
-end
-
-function M.box(halfExtents)
-    assert(typeof(halfExtents) == "vector", "physik.box: halfExtents must be a vector")
-    assert(halfExtents.X > 0 and halfExtents.Y > 0 and halfExtents.Z > 0, "physik.box: extents must be > 0")
-    return table.freeze({ kind = SHAPE_BOX, halfExtents = halfExtents })
-end
-
-function M.capsule(radius, halfHeight)
-    assert(type(radius) == "number" and radius > 0, "physik.capsule: radius must be > 0")
-    assert(type(halfHeight) == "number" and halfHeight >= 0, "physik.capsule: halfHeight must be >= 0")
-    return table.freeze({ kind = SHAPE_CAPSULE, radius = radius, halfHeight = halfHeight })
-end
 
 
-local function readVec3(buf, index)
-    local o=index*12
-    return vector.create(buffer.readf32(buf,o),buffer.readf32(buf,o+4),buffer.readf32(buf,o+8))
-end
-
-local function writeVec3(buf,index,v)
-    local o=index*12
-    buffer.writef32(buf,o,v.X); buffer.writef32(buf,o+4,v.Y); buffer.writef32(buf,o+8,v.Z)
-end
-
-local function buildMeshGrid(vbuf,ibuf,triCount,cellSize,maxCellsPerTriangle)
-    local heads,nextNode,nodeTri,overflow={},{},{},{}
-    local nodeCount=0
-    for t=0,triCount-1 do
-        local io=t*12
-        local ia,ib,ic=buffer.readu32(ibuf,io),buffer.readu32(ibuf,io+4),buffer.readu32(ibuf,io+8)
-        local a,b,c=readVec3(vbuf,ia),readVec3(vbuf,ib),readVec3(vbuf,ic)
-        local mn=vector.create(math.min(a.X,b.X,c.X),math.min(a.Y,b.Y,c.Y),math.min(a.Z,b.Z,c.Z))
-        local mx=vector.create(math.max(a.X,b.X,c.X),math.max(a.Y,b.Y,c.Y),math.max(a.Z,b.Z,c.Z))
-        local x0,y0,z0=math.floor(mn.X/cellSize),math.floor(mn.Y/cellSize),math.floor(mn.Z/cellSize)
-        local x1,y1,z1=math.floor(mx.X/cellSize),math.floor(mx.Y/cellSize),math.floor(mx.Z/cellSize)
-        local cells=(x1-x0+1)*(y1-y0+1)*(z1-z0+1)
-        local valid=cells<=maxCellsPerTriangle
-        if valid then
-            for x=x0,x1 do for y=y0,y1 do for z=z0,z1 do
-                local key=packCell(x,y,z)
-                if key==nil then valid=false; break end
-                nodeCount+=1
-                nodeTri[nodeCount]=t
-                nextNode[nodeCount]=heads[key] or 0
-                heads[key]=nodeCount
-            end if not valid then break end end if not valid then break end end
-        end
-        if not valid then overflow[#overflow+1]=t end
-    end
-    return heads,nextNode,nodeTri,overflow
-end
-
--- The data plane's readers of what shapes pack: a mesh's vertices, three f32 to each, and a
--- heightfield's samples.
-local VertexFields: dream_data_Kind_f32 = data.f32(12)
-local Samples: dream_data_Kind_f32 = data.f32()
-
---- The least and the greatest of one coordinate of a mesh's packed vertices, as comparing each
---- with the bound so far finds them: a coordinate that is not a number is in neither. The data
---- plane's own bounds keep such a coordinate when it comes first, and only then is the column
---- asked for again, filtered.
-local function coordinateBounds(packed: buffer, offset: number, count: number): (number, number)
-  local lowest = VertexFields:min(packed, offset, count)
-  local highest = VertexFields:max(packed, offset, count)
-  if lowest ~= lowest then lowest = VertexFields:minLt(packed, offset, count, math.huge) or math.huge end
-  if highest ~= highest then highest = VertexFields:maxGt(packed, offset, count, -math.huge) or -math.huge end
-
-  return lowest, highest
-end
-
-function M.triangleMesh(vertices, indices, opts)
-  opts = opts or {}
-
-  local packed, vertexCount
-
-  if typeof(vertices) == 'buffer' then
-    assert(buffer.len(vertices) % 12 == 0, 'physik.triangleMesh: vertex buffer must contain packed f32 xyz triples')
-    packed, vertexCount = vertices, buffer.len(vertices) / 12
-  else
-    assert(type(vertices) == 'table' and #vertices >= 3, 'physik.triangleMesh: vertices must be a vector array or packed f32 buffer')
-    vertexCount = #vertices
-    packed = buffer.create(vertexCount * 12)
-
-    for index = 1, vertexCount do
-      local vertex = vertices[index]
-
-      assert(typeof(vertex) == 'vector', 'physik.triangleMesh: every vertex must be a vector')
-      writeVec3(packed, index - 1, vertex)
-    end
-  end
-
-  local triangles, indexCount
-
-  if indices == nil then
-    assert(vertexCount % 3 == 0, 'physik.triangleMesh: without indices, vertex count must be divisible by 3')
-    indexCount = vertexCount
-    triangles = buffer.create(indexCount * 4)
-    into(triangles, 'u32')[for index in range(0, indexCount - 1) => index]
-  elseif typeof(indices) == 'buffer' then
-    assert(buffer.len(indices) % 12 == 0, 'physik.triangleMesh: index buffer length must be divisible by 3 u32 indices')
-    triangles, indexCount = indices, buffer.len(indices) / 4
-  else
-    assert(type(indices) == 'table' and #indices % 3 == 0, 'physik.triangleMesh: indices must be a triangle-list table or u32 buffer')
-    indexCount = #indices
-    triangles = buffer.create(indexCount * 4)
-
-    for position = 1, indexCount do
-      local index = indices[position]
-
-      assert(
-        type(index) == 'number' and index % 1 == 0 and index >= 1 and index <= vertexCount,
-        'physik.triangleMesh: table indices are 1-based and must reference a vertex'
-      )
-
-      buffer.writeu32(triangles, (position - 1) * 4, index - 1)
-    end
-  end
-
-  local triangleCount = indexCount / 3
-  assert(triangleCount >= 1, 'physik.triangleMesh: mesh must contain at least one triangle')
-
-  local low = vector.create(math.huge, math.huge, math.huge)
-  local high = -low
-
-  if vertexCount > 0 then
-    local lowX, highX = coordinateBounds(packed, 0, vertexCount)
-    local lowY, highY = coordinateBounds(packed, 4, vertexCount)
-    local lowZ, highZ = coordinateBounds(packed, 8, vertexCount)
-
-    low, high = vector.create(lowX, lowY, lowZ), vector.create(highX, highY, highZ)
-  end
-
-  local extent = high - low
-  local longest = math.max(extent.X, extent.Y, extent.Z)
-  local cellSize = opts.cellSize or math.max(longest / math.max(math.sqrt(triangleCount) * 0.5, 1), 0.25)
-  assert(type(cellSize) == 'number' and cellSize > 0, 'physik.triangleMesh: cellSize must be > 0')
-
-  local heads, nextNode, nodeTri, overflow = buildMeshGrid(packed, triangles, triangleCount, cellSize, opts.maxCellsPerTriangle or 64)
-
-  return table.freeze({
-    kind = SHAPE_MESH,
-    vertices = packed,
-    indices = triangles,
-    vertexCount = vertexCount,
-    triangleCount = triangleCount,
-    localMin = low,
-    localMax = high,
-    cellSize = cellSize,
-    heads = heads,
-    nextNode = nextNode,
-    nodeTri = nodeTri,
-    overflow = overflow,
-  })
-end
-
-function M.heightfield(width, depth, heights, opts)
-  opts = opts or {}
-  assert(type(width) == 'number' and width % 1 == 0 and width >= 2, 'physik.heightfield: width must be an integer >= 2')
-  assert(type(depth) == 'number' and depth % 1 == 0 and depth >= 2, 'physik.heightfield: depth must be an integer >= 2')
-
-  local count = width * depth
-  local samples
-
-  if typeof(heights) == 'buffer' then
-    assert(buffer.len(heights) == count * 4, 'physik.heightfield: height buffer must contain width*depth f32 values')
-    samples = heights
-  else
-    assert(type(heights) == 'table' and #heights == count, 'physik.heightfield: heights must contain width*depth values')
-    samples = buffer.create(count * 4)
-
-    for index = 1, count do
-      local height = heights[index]
-
-      assert(type(height) == 'number', 'physik.heightfield: heights must be numbers')
-      buffer.writef32(samples, (index - 1) * 4, height)
-    end
-  end
-
-  local cellSizeX = opts.cellSizeX or opts.cellSize or 1
-  local cellSizeZ = opts.cellSizeZ or opts.cellSize or 1
-  assert(cellSizeX > 0 and cellSizeZ > 0, 'physik.heightfield: cell sizes must be > 0')
-
-  local origin = opts.origin or ZERO
-  assert(typeof(origin) == 'vector', 'physik.heightfield: origin must be a vector')
-
-  -- A sample that is not a number is in neither bound: it compares with nothing. The data
-  -- plane's own bounds keep such a sample when it comes first, and only then are the samples
-  -- asked for again, filtered.
-  local lowest = Samples:min(samples, 0, count)
-  local highest = Samples:max(samples, 0, count)
-  if lowest ~= lowest then lowest = Samples:minLt(samples, 0, count, math.huge) or math.huge end
-  if highest ~= highest then highest = Samples:maxGt(samples, 0, count, -math.huge) or -math.huge end
-
-  return table.freeze({
-    kind = SHAPE_HEIGHTFIELD,
-    width = width,
-    depth = depth,
-    heights = samples,
-    cellSizeX = cellSizeX,
-    cellSizeZ = cellSizeZ,
-    origin = origin,
-    localMin = vector.create(origin.X, origin.Y + lowest, origin.Z),
-    localMax = vector.create(origin.X + (width - 1) * cellSizeX, origin.Y + highest, origin.Z + (depth - 1) * cellSizeZ),
-  })
-end
-
-
-local function primitiveLocalBounds(shape,p,qv,qw)
-    if shape.kind==SHAPE_SPHERE then
-        local e=vector.create(shape.radius,shape.radius,shape.radius)
-        return p-e,p+e
-    elseif shape.kind==SHAPE_BOX then
-        local a0,a1,a2=qAxes(qv,qw)
-        local h=shape.halfExtents
-        local e=vector.create(math.abs(a0.X)*h.X+math.abs(a1.X)*h.Y+math.abs(a2.X)*h.Z,math.abs(a0.Y)*h.X+math.abs(a1.Y)*h.Y+math.abs(a2.Y)*h.Z,math.abs(a0.Z)*h.X+math.abs(a1.Z)*h.Y+math.abs(a2.Z)*h.Z)
-        return p-e,p+e
-    else
-        local _,axis,_=qAxes(qv,qw)
-        local e=vector.create(math.abs(axis.X)*shape.halfHeight+shape.radius,math.abs(axis.Y)*shape.halfHeight+shape.radius,math.abs(axis.Z)*shape.halfHeight+shape.radius)
-        return p-e,p+e
-    end
-end
-
-function M.compound(children)
-    assert(type(children)=="table" and #children>=1,"physik.compound: children must be a non-empty array")
-    local shapes,positions,qvs,qws={},{},{},{}
-    local mn=vector.create(math.huge,math.huge,math.huge)
-    local mx=vector.create(-math.huge,-math.huge,-math.huge)
-    for i=1,#children do
-        local child=children[i]
-        assert(type(child)=="table" and type(child.shape)=="table","physik.compound: every child needs a shape")
-        local shape=child.shape
-        assert(shape.kind==SHAPE_SPHERE or shape.kind==SHAPE_BOX or shape.kind==SHAPE_CAPSULE,"physik.compound: children must be sphere, box, or capsule shapes")
-        local p=child.position or ZERO
-        assert(typeof(p)=="vector","physik.compound: child position must be a vector")
-        local qv,qw=ZERO,1
-        if child.rotation then
-            assert(type(child.rotation)=="table" and typeof(child.rotation.v)=="vector" and type(child.rotation.w)=="number","physik.compound: child rotation must come from physik.quat/axisAngle")
-            qv,qw=qNormalize(child.rotation.v,child.rotation.w)
-        end
-        shapes[i],positions[i],qvs[i],qws[i]=shape,p,qv,qw
-        local cmn,cmx=primitiveLocalBounds(shape,p,qv,qw)
-        mn=vector.create(math.min(mn.X,cmn.X),math.min(mn.Y,cmn.Y),math.min(mn.Z,cmn.Z))
-        mx=vector.create(math.max(mx.X,cmx.X),math.max(mx.Y,cmx.Y),math.max(mx.Z,cmx.Z))
-    end
-    return table.freeze({kind=SHAPE_COMPOUND,count=#children,shapes=shapes,positions=positions,qv=qvs,qw=qws,localMin=mn,localMax=mx})
-end
-
-function M.quat(x, y, z, w)
-    local qv, qw = qNormalize(vector.create(x, y, z), w)
-    return table.freeze({ v = qv, w = qw })
-end
-
-function M.axisAngle(axis, radians)
-    axis = safeUnit(axis, YAXIS)
-    local h = radians * 0.5
-    return M.quat(axis.X * math.sin(h), axis.Y * math.sin(h), axis.Z * math.sin(h), math.cos(h))
-end
-
-local function inertiaFor(shape, mass)
-    if mass <= 0 then return ZERO end
-    if shape.kind == SHAPE_SPHERE then
-        local i = 0.4 * mass * shape.radius * shape.radius
-        local inv = if i > EPS then 1 / i else 0
-        return vector.create(inv, inv, inv)
-    elseif shape.kind == SHAPE_BOX then
-        local h = shape.halfExtents
-        local ix = (mass / 3) * (h.Y*h.Y + h.Z*h.Z)
-        local iy = (mass / 3) * (h.X*h.X + h.Z*h.Z)
-        local iz = (mass / 3) * (h.X*h.X + h.Y*h.Y)
-        return vector.create(if ix > EPS then 1/ix else 0, if iy > EPS then 1/iy else 0, if iz > EPS then 1/iz else 0)
-    elseif shape.kind == SHAPE_CAPSULE then
-        -- Capsule: compact approximation by a box enclosing the swept sphere.
-        local r, hh = shape.radius, shape.halfHeight
-        local hx, hy, hz = r, hh + r, r
-        local ix = (mass / 3) * (hy*hy + hz*hz)
-        local iy = (mass / 3) * (hx*hx + hz*hz)
-        local iz = (mass / 3) * (hx*hx + hy*hy)
-        return vector.create(if ix > EPS then 1/ix else 0, if iy > EPS then 1/iy else 0, if iz > EPS then 1/iz else 0)
-    elseif shape.kind == SHAPE_COMPOUND then
-        -- Conservative compound inertia: enclosing cuboid about the declared body origin,
-        -- including a parallel-axis term when the child bounds are offset.
-        local h=(shape.localMax-shape.localMin)*0.5
-        local c=(shape.localMax+shape.localMin)*0.5
-        local ix=(mass/3)*(h.Y*h.Y+h.Z*h.Z)+mass*(c.Y*c.Y+c.Z*c.Z)
-        local iy=(mass/3)*(h.X*h.X+h.Z*h.Z)+mass*(c.X*c.X+c.Z*c.Z)
-        local iz=(mass/3)*(h.X*h.X+h.Y*h.Y)+mass*(c.X*c.X+c.Y*c.Y)
-        return vector.create(if ix>EPS then 1/ix else 0,if iy>EPS then 1/iy else 0,if iz>EPS then 1/iz else 0)
-    end
-    return ZERO
-end
 
 local World = {}
 World.__index = World
@@ -565,21 +271,6 @@ local function emitFaceManifold(self,a,b,n,feature,bestPen)
 end
 
 
---- The three corners of a mesh's triangle, in the mesh's own space.
-local function meshTriangle({indices, vertices}, triangle: number): (vector, vector, vector)
-  local offset = triangle * 12
-  local first, second, third = buffer.readu32(indices, offset), buffer.readu32(indices, offset + 4), buffer.readu32(indices, offset + 8)
-
-  return readVec3(vertices, first), readVec3(vertices, second), readVec3(vertices, third)
-end
-
---- A heightfield's sample at a column and row, as a point in the heightfield's own space.
-local function heightVertex({heights, width, origin, cellSizeX, cellSizeZ}, column: number, row: number): vector
-  local height = buffer.readf32(heights, (row * width + column) * 4)
-
-  return vector.create(origin.X + column * cellSizeX, origin.Y + height, origin.Z + row * cellSizeZ)
-end
-
 
 
 function World:_check(handle)
@@ -641,11 +332,11 @@ function World:addBody(desc)
     local turn, turnW = ZERO, 1
 
     if rotation ~= nil then
-        if type(rotation) ~= 'table' or typeof(rotation.v) ~= 'vector' or type(rotation.w) ~= 'number' then
+        if type(rotation) ~= 'table' or typeof(rotation.turn) ~= 'vector' or type(rotation.turnW) ~= 'number' then
             error('physik.addBody: rotation must come from physik.quat/axisAngle', 2)
         end
 
-        turn, turnW = qNormalize(rotation.v, rotation.w)
+        turn, turnW = qNormalize(rotation.turn, rotation.turnW)
     end
 
     local i = self:_allocSlot()
@@ -756,7 +447,7 @@ function World:getBody(handle)
         handle = handle,
         type = if self.bodyType[i] == BODY_STATIC then "static" elseif self.bodyType[i] == BODY_KINEMATIC then "kinematic" else "dynamic",
         position = self.pos[i],
-        rotation = { v = self.qv[i], w = self.qw[i] },
+        rotation = { turn = self.qv[i], turnW = self.qw[i] },
         velocity = self.linVel[i],
         angularVelocity = self.angVel[i],
         sleeping = self.sleeping[i],
@@ -775,7 +466,7 @@ end
 
 function World:setRotation(handle,q,wake)
     local i=self:_check(handle)
-    self.qv[i],self.qw[i]=qNormalize(q.v,q.w)
+    self.qv[i],self.qw[i]=qNormalize(q.turn,q.turnW)
     self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.qv[i],self.qw[i])
     self.gridValid=false
     if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
@@ -789,8 +480,8 @@ function World:driveKinematic(handle,targetPosition,targetRotation,dt)
     assert(typeof(targetPosition)=="vector" and type(dt)=="number" and dt>0,"physik.driveKinematic: target position must be a vector and dt > 0")
     self.linVel[i]=(targetPosition-self.pos[i])/dt
     if targetRotation then
-        assert(type(targetRotation)=="table" and typeof(targetRotation.v)=="vector" and type(targetRotation.w)=="number","physik.driveKinematic: rotation must come from physik.quat/axisAngle")
-        local tv,tw=qNormalize(targetRotation.v,targetRotation.w)
+        assert(type(targetRotation)=="table" and typeof(targetRotation.turn)=="vector" and type(targetRotation.turnW)=="number","physik.driveKinematic: rotation must come from physik.quat/axisAngle")
+        local tv,tw=qNormalize(targetRotation.turn,targetRotation.turnW)
         local dv,dw=qMul(tv,tw,-self.qv[i],self.qw[i])
         if dw<0 then dv,dw=-dv,-dw end
         dw=clamp(dw,-1,1)
@@ -1121,7 +812,7 @@ function World:_testGeomTriangle(prim,geom,la,lb,lc,flip)
     if ps.kind==SHAPE_COMPOUND then
         local bp,bqv,bqw=self.pos[prim],self.qv[prim],self.qw[prim]
         for k=1,ps.count do
-            local cv,cw=qMul(bqv,bqw,ps.qv[k],ps.qw[k])
+            local cv,cw=qMul(bqv,bqw,ps.turns[k],ps.turnWs[k])
             local cp=bp+qRotate(bqv,bqw,ps.positions[k])
             local ok,n,p,pen=primitiveTriangleContact(ps.shapes[k],cp,cv,cw,a,b,c,self.contactMargin)
             if ok then if flip then n=-n end;self:_pushGeomContact(n,p,pen) end
@@ -1156,7 +847,7 @@ function World:_narrowMesh(prim,geom,flip)
         if key then
             local node=shape.heads[key] or 0
             while node~=0 do
-                self:_meshTriangleOnce(prim,geom,shape,shape.nodeTri[node],flip,epoch)
+                self:_meshTriangleOnce(prim,geom,shape,shape.nodeTriangle[node],flip,epoch)
                 node=shape.nextNode[node]
             end
         end
@@ -1205,10 +896,10 @@ end
 --- lists given. Returns how many pieces there are.
 local function placePieces(self, body: number, centres: { vector }, turns: { vector }, turnWs: { number }): number
   local centre, turn, turnW = self.pos[body], self.qv[body], self.qw[body]
-  local {positions, qv, qw, count} = self.shape[body]
+  local {positions, turns: pieceTurns, turnWs: pieceTurnWs, count} = self.shape[body]
 
   for piece = 1, count do
-    turns[piece], turnWs[piece] = qMul(turn, turnW, qv[piece], qw[piece])
+    turns[piece], turnWs[piece] = qMul(turn, turnW, pieceTurns[piece], pieceTurnWs[piece])
     centres[piece] = centre + qRotate(turn, turnW, positions[piece])
   end
 
@@ -2643,7 +2334,7 @@ function World:_sweepSphereMesh(geom,startPos,endPos,radius)
             if key then
                 local node=shape.heads[key] or 0
                 while node~=0 do
-                    local t=shape.nodeTri[node]
+                    local t=shape.nodeTriangle[node]
                     if self.meshMarks[t]~=epoch then
                         self.meshMarks[t]=epoch
                         local a,b,c=meshTriangle(shape,t)
@@ -2700,7 +2391,7 @@ function World:_sweepSphereCompound(geom,startPos,endPos,radius)
     local bestT,bestN=1,nil
     for k=1,shape.count do
         local cp=bp+qRotate(bqv,bqw,shape.positions[k])
-        local cqv,cqw=qMul(bqv,bqw,shape.qv[k],shape.qw[k])
+        local cqv,cqw=qMul(bqv,bqw,shape.turns[k],shape.turnWs[k])
         local child=shape.shapes[k]
         local t,n
         if child.kind==SHAPE_SPHERE then
@@ -2919,7 +2610,7 @@ function World:_rayMesh(i,origin,dir,maxDist)
             if key then
                 local node=shape.heads[key] or 0
                 while node~=0 do
-                    local tri=shape.nodeTri[node]
+                    local tri=shape.nodeTriangle[node]
                     local tt=self:_rayMeshTriangleT(shape,tri,lo,ld,bestT,epoch)
                     if tt and tt<bestT then bestT,bestTri=tt,tri end
                     node=shape.nextNode[node]
@@ -2974,7 +2665,7 @@ function World:_rayCompound(i,origin,dir,maxDist)
     local bestT,bestN,bestP=maxDist,nil,nil
     for k=1,shape.count do
         local cp=bp+qRotate(bqv,bqw,shape.positions[k])
-        local cqv,cqw=qMul(bqv,bqw,shape.qv[k],shape.qw[k])
+        local cqv,cqw=qMul(bqv,bqw,shape.turns[k],shape.turnWs[k])
         local t,n,p=rayPrimitiveShape(shape.shapes[k],cp,cqv,cqw,origin,dir,bestT)
         if t and t<bestT then bestT,bestN,bestP=t,n,p end
     end
@@ -3341,7 +3032,7 @@ local function gatherTriangles(self, geom: number, centre: vector, reach: number
   end
 
   local epoch = self.meshMarkEpoch + 1
-  local marks, heads, nextNode, nodeTriangle = self.meshMarks, shape.heads, shape.nextNode, shape.nodeTri
+  local marks, heads, nextNode, nodeTriangle = self.meshMarks, shape.heads, shape.nextNode, shape.nodeTriangle
 
   self.meshMarkEpoch = epoch
 
@@ -3448,7 +3139,7 @@ function World:_capsuleCastAmong(handles, count, startPos, motion, length, radiu
       local at, turn, turnW = pos[body], qv[body], qw[body]
 
       for piece = 1, target.count do
-        local pieceTurn, pieceTurnW = qMul(turn, turnW, target.qv[piece], target.qw[piece])
+        local pieceTurn, pieceTurnW = qMul(turn, turnW, target.turns[piece], target.turnWs[piece])
         local nearer, facing, touched = sweepCapsule(
           radius,
           halfHeight,
@@ -3562,7 +3253,7 @@ function World:_capsuleContactsAmong(found, count, position, radius, halfHeight,
       local at, turn, turnW = pos[body], qv[body], qw[body]
 
       for piece = 1, target.count do
-        local pieceTurn, pieceTurnW = qMul(turn, turnW, target.qv[piece], target.qw[piece])
+        local pieceTurn, pieceTurnW = qMul(turn, turnW, target.turns[piece], target.turnWs[piece])
         local met, normal, point, depth = collidePrimitives(
           capsule, position, ZERO, 1, target.shapes[piece], at + qRotate(turn, turnW, target.positions[piece]), pieceTurn, pieceTurnW, 0
         )

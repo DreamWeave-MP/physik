@@ -1,0 +1,423 @@
+--!strict
+--!native
+-- Shapes: what a body is the shape of. Making them, which is where what a caller hands over is
+-- checked; what is inside a mesh and a heightfield; and how hard each is to turn.
+local cells = require './cells'
+local data = require '@dream/data'
+local geometry = require './geometry'
+local types = require './types'
+
+local shape = {}
+
+local Zero = vector.zero
+local Up = vector.create(0, 1, 0)
+local Tiny = 1e-8
+
+function shape.sphere(radius: number): types.Sphere
+  assert(type(radius) == 'number' and radius > 0, 'physik.sphere: radius must be > 0')
+
+  return table.freeze({ kind = 'sphere' :: 'sphere', radius = radius })
+end
+
+function shape.box(halfExtents: vector): types.Box
+  assert(typeof(halfExtents) == 'vector', 'physik.box: halfExtents must be a vector')
+  assert(halfExtents.x > 0 and halfExtents.y > 0 and halfExtents.z > 0, 'physik.box: extents must be > 0')
+
+  return table.freeze({ kind = 'box' :: 'box', halfExtents = halfExtents })
+end
+
+function shape.capsule(radius: number, halfHeight: number): types.Capsule
+  assert(type(radius) == 'number' and radius > 0, 'physik.capsule: radius must be > 0')
+  assert(type(halfHeight) == 'number' and halfHeight >= 0, 'physik.capsule: halfHeight must be >= 0')
+
+  return table.freeze({ kind = 'capsule' :: 'capsule', radius = radius, halfHeight = halfHeight })
+end
+
+--- A rotation from the four parts of a quaternion, which need not be of length one.
+function shape.quat(partX: number, partY: number, partZ: number, partW: number): types.Rotation
+  local turn, turnW = geometry.normalizeTurn(vector.create(partX, partY, partZ), partW)
+
+  return table.freeze({ turn = turn, turnW = turnW })
+end
+
+function shape.axisAngle(axis: vector, radians: number): types.Rotation
+  local about = geometry.unit(axis, Up)
+  local half = radians * 0.5
+
+  return shape.quat(about.x * math.sin(half), about.y * math.sin(half), about.z * math.sin(half), math.cos(half))
+end
+
+--- The vertex at an index of a buffer of packed f32 triples.
+local function vertexAt(packed: buffer, index: number): vector
+  local offset = index * 12
+
+  return vector.create(buffer.readf32(packed, offset), buffer.readf32(packed, offset + 4), buffer.readf32(packed, offset + 8))
+end
+
+--- The three corners of a mesh's triangle, in the mesh's own space.
+function shape.meshTriangle(mesh: types.Mesh, triangle: number): (vector, vector, vector)
+  local indices, vertices = mesh.indices, mesh.vertices
+  local offset = triangle * 12
+
+  return vertexAt(vertices, buffer.readu32(indices, offset)),
+    vertexAt(vertices, buffer.readu32(indices, offset + 4)),
+    vertexAt(vertices, buffer.readu32(indices, offset + 8))
+end
+
+--- A heightfield's sample at a column and row, as a point in the heightfield's own space.
+function shape.heightVertex(field: types.Heightfield, column: number, row: number): vector
+  local origin = field.origin
+  local height = buffer.readf32(field.heights, (row * field.width + column) * 4)
+
+  return vector.create(origin.x + column * field.cellSizeX, origin.y + height, origin.z + row * field.cellSizeZ)
+end
+
+--- Sorts a mesh's triangles into a grid: each into every cell its bounds touch. One that
+--- touches more than `cellLimit` cells, or a cell too far out to have a number, is kept apart
+--- instead, to be tested every time.
+local function buildGrid(
+  vertices: buffer,
+  indices: buffer,
+  triangleCount: number,
+  cellSize: number,
+  cellLimit: number
+): ({ [number]: number }, { number }, { number }, { number })
+  local heads: { [number]: number }, nextNode: { number }, nodeTriangle: { number }, overflow: { number } = {}, {}, {}, {}
+  local nodeCount = 0
+
+  for triangle = 0, triangleCount - 1 do
+    local offset = triangle * 12
+    local first = vertexAt(vertices, buffer.readu32(indices, offset))
+    local second = vertexAt(vertices, buffer.readu32(indices, offset + 4))
+    local third = vertexAt(vertices, buffer.readu32(indices, offset + 8))
+    local low = vector.create(math.min(first.x, second.x, third.x), math.min(first.y, second.y, third.y), math.min(first.z, second.z, third.z))
+    local high = vector.create(math.max(first.x, second.x, third.x), math.max(first.y, second.y, third.y), math.max(first.z, second.z, third.z))
+    local firstColumn, firstRow, firstLayer = math.floor(low.x / cellSize), math.floor(low.y / cellSize), math.floor(low.z / cellSize)
+    local lastColumn, lastRow, lastLayer = math.floor(high.x / cellSize), math.floor(high.y / cellSize), math.floor(high.z / cellSize)
+    local count = (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1)
+
+    -- Every cell between two that have numbers has one.
+    if
+      not (count <= cellLimit)
+      or not cells.pack(firstColumn, firstRow, firstLayer)
+      or not cells.pack(lastColumn, lastRow, lastLayer)
+    then
+      table.insert(overflow, triangle)
+      continue
+    end
+
+    for column = firstColumn, lastColumn do
+      for row = firstRow, lastRow do
+        for layer = firstLayer, lastLayer do
+          local key = cells.pack(column, row, layer) :: number
+
+          nodeCount += 1
+          nodeTriangle[nodeCount] = triangle
+          nextNode[nodeCount] = heads[key] or 0
+          heads[key] = nodeCount
+        end
+      end
+    end
+  end
+
+  return heads, nextNode, nodeTriangle, overflow
+end
+
+-- The data plane's readers of what shapes pack: a mesh's vertices, three f32 to each, and a
+-- heightfield's samples.
+local VertexFields: dream_data_Kind_f32 = data.f32(12)
+local Samples: dream_data_Kind_f32 = data.f32()
+
+--- The least and the greatest of a run of packed numbers, as comparing each with the bound so
+--- far finds them: one that is not a number is in neither. The data plane's own bounds keep
+--- such a number when it comes first, and only then is the run asked for again, filtered.
+local function boundsOf(reader: dream_data_Kind_f32, packed: buffer, offset: number, count: number): (number, number)
+  local lowest = reader:min(packed, offset, count)
+  local highest = reader:max(packed, offset, count)
+  if lowest ~= lowest then lowest = reader:minLt(packed, offset, count, math.huge) or math.huge end
+  if highest ~= highest then highest = reader:maxGt(packed, offset, count, -math.huge) or -math.huge end
+
+  return lowest or math.huge, highest or -math.huge
+end
+
+export type MeshOptions = {
+  --- The side of a cell of the mesh's grid. Fitted to the mesh unless given.
+  cellSize: number?,
+  --- The most cells a triangle is sorted into before it is kept apart. 64 unless given.
+  maxCellsPerTriangle: number?,
+}
+
+--- A mesh of triangles. `vertices` is a list of vectors or a buffer of packed f32 triples.
+--- `indices` is a list of one-based indices, a buffer of zero-based u32, or nothing, when every
+--- three vertices are a triangle.
+function shape.triangleMesh(vertices: { vector } | buffer, indices: ({ number } | buffer)?, options: MeshOptions?): types.Mesh
+  local given: MeshOptions = options or {}
+  local packed: buffer, vertexCount: number
+
+  if typeof(vertices) == 'buffer' then
+    assert(buffer.len(vertices) % 12 == 0, 'physik.triangleMesh: vertex buffer must contain packed f32 xyz triples')
+    packed, vertexCount = vertices, buffer.len(vertices) / 12
+  else
+    assert(type(vertices) == 'table' and #vertices >= 3, 'physik.triangleMesh: vertices must be a vector array or packed f32 buffer')
+    vertexCount = #vertices
+    packed = buffer.create(vertexCount * 12)
+
+    for index, vertex in vertices do
+      assert(typeof(vertex) == 'vector', 'physik.triangleMesh: every vertex must be a vector')
+
+      local offset = (index - 1) * 12
+
+      buffer.writef32(packed, offset, vertex.x)
+      buffer.writef32(packed, offset + 4, vertex.y)
+      buffer.writef32(packed, offset + 8, vertex.z)
+    end
+  end
+
+  local triangles: buffer, indexCount: number
+
+  if not indices then
+    assert(vertexCount % 3 == 0, 'physik.triangleMesh: without indices, vertex count must be divisible by 3')
+    indexCount = vertexCount
+    triangles = buffer.create(indexCount * 4)
+    into(triangles, 'u32')[for index in range(0, indexCount - 1) => index]
+  elseif typeof(indices) == 'buffer' then
+    assert(buffer.len(indices) % 12 == 0, 'physik.triangleMesh: index buffer length must be divisible by 3 u32 indices')
+    triangles, indexCount = indices, buffer.len(indices) / 4
+  else
+    assert(type(indices) == 'table' and #indices % 3 == 0, 'physik.triangleMesh: indices must be a triangle-list table or u32 buffer')
+    indexCount = #indices
+    triangles = buffer.create(indexCount * 4)
+
+    for position, index in indices do
+      assert(
+        type(index) == 'number' and index % 1 == 0 and index >= 1 and index <= vertexCount,
+        'physik.triangleMesh: table indices are 1-based and must reference a vertex'
+      )
+
+      buffer.writeu32(triangles, (position - 1) * 4, index - 1)
+    end
+  end
+
+  local triangleCount = indexCount / 3
+  assert(triangleCount >= 1, 'physik.triangleMesh: mesh must contain at least one triangle')
+
+  -- No vertices have no bounds: the least is then above everything and the greatest below.
+  local lowX, highX = boundsOf(VertexFields, packed, 0, vertexCount)
+  local lowY, highY = boundsOf(VertexFields, packed, 4, vertexCount)
+  local lowZ, highZ = boundsOf(VertexFields, packed, 8, vertexCount)
+  local low, high = vector.create(lowX, lowY, lowZ), vector.create(highX, highY, highZ)
+  local extent = high - low
+  local longest = math.max(extent.x, extent.y, extent.z)
+  local cellSize = given.cellSize or math.max(longest / math.max(math.sqrt(triangleCount) * 0.5, 1), 0.25)
+  assert(type(cellSize) == 'number' and cellSize > 0, 'physik.triangleMesh: cellSize must be > 0')
+
+  local heads, nextNode, nodeTriangle, overflow = buildGrid(packed, triangles, triangleCount, cellSize, given.maxCellsPerTriangle or 64)
+
+  return table.freeze({
+    kind = 'mesh' :: 'mesh',
+    vertices = packed,
+    indices = triangles,
+    vertexCount = vertexCount,
+    triangleCount = triangleCount,
+    localMin = low,
+    localMax = high,
+    cellSize = cellSize,
+    heads = heads,
+    nextNode = nextNode,
+    nodeTriangle = nodeTriangle,
+    overflow = overflow,
+  })
+end
+
+export type HeightfieldOptions = {
+  --- How far apart the samples are, across and along. 1 unless given.
+  cellSize: number?,
+  cellSizeX: number?,
+  cellSizeZ: number?,
+  --- Where the first sample is, in the body's own space. The body's origin unless given.
+  origin: vector?,
+}
+
+--- Ground as heights: `width` by `depth` of them, row by row, as a list or packed f32.
+function shape.heightfield(width: number, depth: number, heights: { number } | buffer, options: HeightfieldOptions?): types.Heightfield
+  local given: HeightfieldOptions = options or {}
+
+  assert(type(width) == 'number' and width % 1 == 0 and width >= 2, 'physik.heightfield: width must be an integer >= 2')
+  assert(type(depth) == 'number' and depth % 1 == 0 and depth >= 2, 'physik.heightfield: depth must be an integer >= 2')
+
+  local count = width * depth
+  local samples: buffer
+
+  if typeof(heights) == 'buffer' then
+    assert(buffer.len(heights) == count * 4, 'physik.heightfield: height buffer must contain width*depth f32 values')
+    samples = heights
+  else
+    assert(type(heights) == 'table' and #heights == count, 'physik.heightfield: heights must contain width*depth values')
+    samples = buffer.create(count * 4)
+
+    for index, height in heights do
+      assert(type(height) == 'number', 'physik.heightfield: heights must be numbers')
+      buffer.writef32(samples, (index - 1) * 4, height)
+    end
+  end
+
+  local cellSizeX = given.cellSizeX or given.cellSize or 1
+  local cellSizeZ = given.cellSizeZ or given.cellSize or 1
+  assert(cellSizeX > 0 and cellSizeZ > 0, 'physik.heightfield: cell sizes must be > 0')
+
+  local origin = given.origin or Zero
+  assert(typeof(origin) == 'vector', 'physik.heightfield: origin must be a vector')
+
+  local lowest, highest = boundsOf(Samples, samples, 0, count)
+
+  return table.freeze({
+    kind = 'heightfield' :: 'heightfield',
+    width = width,
+    depth = depth,
+    heights = samples,
+    cellSizeX = cellSizeX,
+    cellSizeZ = cellSizeZ,
+    origin = origin,
+    localMin = vector.create(origin.x, origin.y + lowest, origin.z),
+    localMax = vector.create(origin.x + (width - 1) * cellSizeX, origin.y + highest, origin.z + (depth - 1) * cellSizeZ),
+  })
+end
+
+--- How far a primitive reaches each way from its middle, turned as it is.
+local function reachOf(primitive: types.Primitive, turn: vector, turnW: number): vector
+  if primitive.kind == 'sphere' then return vector.create(primitive.radius, primitive.radius, primitive.radius) end
+
+  local axis0, axis1, axis2 = geometry.axesOf(turn, turnW)
+
+  if primitive.kind == 'box' then
+    local half = primitive.halfExtents
+
+    return vector.create(
+      math.abs(axis0.x) * half.x + math.abs(axis1.x) * half.y + math.abs(axis2.x) * half.z,
+      math.abs(axis0.y) * half.x + math.abs(axis1.y) * half.y + math.abs(axis2.y) * half.z,
+      math.abs(axis0.z) * half.x + math.abs(axis1.z) * half.y + math.abs(axis2.z) * half.z
+    )
+  end
+
+  local halfHeight, radius = primitive.halfHeight, primitive.radius
+
+  return vector.create(
+    math.abs(axis1.x) * halfHeight + radius,
+    math.abs(axis1.y) * halfHeight + radius,
+    math.abs(axis1.z) * halfHeight + radius
+  )
+end
+
+export type Piece = { shape: types.Primitive, position: vector?, rotation: types.Rotation? }
+
+--- Several primitives as one shape, each where and how `pieces` says it is.
+function shape.compound(pieces: { Piece }): types.Compound
+  assert(type(pieces) == 'table' and #pieces >= 1, 'physik.compound: children must be a non-empty array')
+
+  local shapes: { types.Primitive }, positions: { vector }, turns: { vector }, turnWs: { number } = {}, {}, {}, {}
+  local low = vector.create(math.huge, math.huge, math.huge)
+  local high = vector.create(-math.huge, -math.huge, -math.huge)
+
+  for index, piece in pieces do
+    assert(type(piece) == 'table' and type(piece.shape) == 'table', 'physik.compound: every child needs a shape')
+
+    local primitive = piece.shape
+    local kind: string = primitive.kind
+    assert(kind == 'sphere' or kind == 'box' or kind == 'capsule', 'physik.compound: children must be sphere, box, or capsule shapes')
+
+    local at = piece.position or Zero
+    assert(typeof(at) == 'vector', 'physik.compound: child position must be a vector')
+
+    local rotation = piece.rotation
+    local turn, turnW = Zero, 1
+
+    if rotation then
+      assert(
+        type(rotation) == 'table' and typeof(rotation.turn) == 'vector' and type(rotation.turnW) == 'number',
+        'physik.compound: child rotation must come from physik.quat/axisAngle'
+      )
+      turn, turnW = geometry.normalizeTurn(rotation.turn, rotation.turnW)
+    end
+
+    shapes[index], positions[index], turns[index], turnWs[index] = primitive, at, turn, turnW
+
+    local reach = reachOf(primitive, turn, turnW)
+    local pieceLow, pieceHigh = at - reach, at + reach
+
+    low = vector.create(math.min(low.x, pieceLow.x), math.min(low.y, pieceLow.y), math.min(low.z, pieceLow.z))
+    high = vector.create(math.max(high.x, pieceHigh.x), math.max(high.y, pieceHigh.y), math.max(high.z, pieceHigh.z))
+  end
+
+  return table.freeze({
+    kind = 'compound' :: 'compound',
+    count = #pieces,
+    shapes = shapes,
+    positions = positions,
+    turns = turns,
+    turnWs = turnWs,
+    localMin = low,
+    localMax = high,
+  })
+end
+
+--- One over a moment of inertia, or nothing for one too small to divide by.
+local function inverse(moment: number): number
+  return if moment > Tiny then 1 / moment else 0
+end
+
+--- One over the moments of a cuboid of half extents `half` about its three axes, when its
+--- middle is `offset` from what it turns about.
+local function cuboidInverseInertia(mass: number, half: vector, offset: vector): vector
+  local third = mass / 3
+
+  return vector.create(
+    inverse(third * (half.y * half.y + half.z * half.z) + mass * (offset.y * offset.y + offset.z * offset.z)),
+    inverse(third * (half.x * half.x + half.z * half.z) + mass * (offset.x * offset.x + offset.z * offset.z)),
+    inverse(third * (half.x * half.x + half.y * half.y) + mass * (offset.x * offset.x + offset.y * offset.y))
+  )
+end
+
+--- How easily a body of a shape and a mass turns about each of its own axes: one over each
+--- moment of inertia. Nothing for a mesh or a heightfield, which never turn by themselves.
+function shape.inverseInertia(body: types.Shape, mass: number): vector
+  if mass <= 0 then return Zero end
+
+  if body.kind == 'sphere' then
+    local each = inverse(0.4 * mass * body.radius * body.radius)
+
+    return vector.create(each, each, each)
+  end
+
+  if body.kind == 'box' then
+    local half = body.halfExtents
+    local third = mass / 3
+
+    return vector.create(
+      inverse(third * (half.y * half.y + half.z * half.z)),
+      inverse(third * (half.x * half.x + half.z * half.z)),
+      inverse(third * (half.x * half.x + half.y * half.y))
+    )
+  end
+
+  -- A capsule as the box that holds it.
+  if body.kind == 'capsule' then
+    local radius, tall = body.radius, body.halfHeight + body.radius
+    local third = mass / 3
+
+    return vector.create(
+      inverse(third * (tall * tall + radius * radius)),
+      inverse(third * (radius * radius + radius * radius)),
+      inverse(third * (radius * radius + tall * tall))
+    )
+  end
+
+  -- A compound as the box that holds its pieces, about the body's origin and not the box's own
+  -- middle, which is what the second term is for.
+  if body.kind == 'compound' then
+    return cuboidInverseInertia(mass, (body.localMax - body.localMin) * 0.5, (body.localMax + body.localMin) * 0.5)
+  end
+
+  return Zero
+end
+
+return shape
