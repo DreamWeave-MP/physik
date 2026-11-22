@@ -1330,6 +1330,7 @@ function World:addBody(desc)
     self.gridTopologyDirty=true
     self.gridKey[i]=nil
     self.rest[i],self.seenPos[i]=false,nil
+    self.changed=true
     self.nearEpoch[i]=0
     if kind==BODY_STATIC then
         self.stillDirty=true
@@ -1350,9 +1351,19 @@ function World:removeBody(handle)
     self.alive[i] = false
     self.aliveCount -= 1
     self.rest[i] = false
+    self.changed = true
     if self.bodyType[i]==BODY_STATIC then self.stillDirty=true else self.moversDirty=true end
     if self.ccd[i] then self.ccdCount-=1 end
-    self.free[#self.free+1] = i
+    -- The free slots are kept highest first, so the lowest is the next one taken: a world that
+    -- has had bodies taken out of it then gives the same slots to the same bodies as a new one,
+    -- and steps as a new one does.
+    local free = self.free
+    local low, high = 1, #free + 1
+    while low < high do
+        local middle = (low + high) // 2
+        if free[middle] > i then low = middle + 1 else high = middle end
+    end
+    table.insert(free, low, i)
     self.userData[i] = nil
     self.sleeping[i] = false
     -- A destroyed slot must not turn into a "stay" event if the numeric slot is reused.
@@ -1372,6 +1383,7 @@ end
 function World:_unsettle(i)
     self.stillDirty=true
     self.rest[i]=false
+    self.changed=true
     table.insert(self.unsettled,i)
 end
 
@@ -2519,9 +2531,20 @@ end
 local function carryContacts(self, movers: { number })
   local {rest, sleeping, pos, qv, qw, seenPos, seenTurn, seenTurnW} = self
 
+  local stirring = 0
+
   for _, body in movers do
-    rest[body] = sleeping[body] and pos[body] == seenPos[body] and qv[body] == seenTurn[body] and qw[body] == seenTurnW[body]
+    local still = sleeping[body] and pos[body] == seenPos[body] and qv[body] == seenTurn[body] and qw[body] == seenTurnW[body]
+
+    rest[body] = still
+    if not still then stirring += 1 end
   end
+
+  self.stirring = stirring
+
+  -- Nothing stirred last step either, and nothing has been added, removed or moved since: the
+  -- contacts are last step's, all of them, as they lie.
+  if stirring == 0 and self.quiet and not self.changed then return true end
 
   local {ca: bodiesA, cb: bodiesB, cn: normals, cp: points, cpen: depths} = self
   local {cnormalImpulse: normalImpulses, ctangentImpulse1: tangentImpulses1, ctangentImpulse2: tangentImpulses2} = self
@@ -2546,6 +2569,8 @@ local function carryContacts(self, movers: { number })
   self.contactCount = kept
   self.candidateCount = pairs
   self.manifoldCount = pairs
+
+  return false
 end
 
 --- Notes where each sleeping body is, now that what it touches there is known, and takes the
@@ -2554,6 +2579,8 @@ local function settle(self, movers: { number })
   local {rest, sleeping, pos, qv, qw, seenPos, seenTurn, seenTurnW, unsettled, alive, bodyType} = self
 
   for _, body in movers do
+    if rest[body] then continue end
+
     if sleeping[body] then
       seenPos[body], seenTurn[body], seenTurnW[body] = pos[body], qv[body], qw[body]
     else
@@ -2561,6 +2588,7 @@ local function settle(self, movers: { number })
     end
   end
 
+  self.stillWasMoved = #unsettled > 0
   if #unsettled == 0 then return end
 
   for _, body in unsettled do
@@ -2573,7 +2601,10 @@ end
 function World:_collide()
     local movers=listMovers(self)
     self.cacheEpoch+=1
-    carryContacts(self,movers)
+    if carryContacts(self,movers) then
+        self.stillWasMoved=false
+        return
+    end
     if self.broadphase=="sap" then
         if self.stillDirty then self:_rebuildStill() end
         local rest=self.rest
@@ -2583,6 +2614,8 @@ function World:_collide()
         self:_collideGrid()
     end
     settle(self,movers)
+    self.quiet=self.stirring==0
+    self.changed=false
 end
 
 local function pointVelocity(self,i,r)
@@ -3452,7 +3485,11 @@ function World:step(dt,substeps)
         self:_ccd()
         self:_collide()
         if self.trackContactEvents then self:_buildContactEvents() else self.contactEventCount=0 end
-        if self.contactCount==0 and self.jointCount==0 then
+        if self.stirring==0 and self.jointCount==0 and #self.unsettled==0 and not self.stillWasMoved then
+            -- Everything is at rest, and touches as it did: nothing is woken, joined or solved.
+            self.activeContactCount=0
+            self.warmStartedCount=0
+        elseif self.contactCount==0 and self.jointCount==0 then
             -- With no contact/joint graph every dynamic body is an independent island. Avoid
             -- building union-find state merely to rediscover that fact.
             self.activeContactCount=0
@@ -3473,8 +3510,9 @@ function World:step(dt,substeps)
             self:_sleep(h)
         end
         -- Position correction can move bodies after the collision broadphase was built.
-        -- Queries rebuild lazily only if a query is actually issued.
-        self.gridValid=false
+        -- Queries rebuild lazily only if a query is actually issued. Nothing has moved when
+        -- nothing stirred.
+        if self.stirring>0 then self.gridValid=false end
     end
     self.frame+=1
     return self.contactCount
@@ -4746,6 +4784,7 @@ function M.newWorld(opts)
     w.gridTopologyReady=false;w.gridTopologyDirty=true
     w.stillDirty=true;w.stillRoot=0;w.movers={};w.moversDirty=true
     w.nearStill={};w.nearLow={};w.nearHigh={};w.nearEpoch={};w.stillEpoch=0
+    w.stirring=0;w.stillWasMoved=false;w.quiet=false;w.changed=true
     w.rest={};w.unsettled={};w.seenPos={};w.seenTurn={};w.seenTurnW={}
     w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={}
     w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
