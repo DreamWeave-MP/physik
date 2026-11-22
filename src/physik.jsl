@@ -1326,7 +1326,8 @@ function World:addBody(desc)
     self:_updateAabb(i)
     self.gridValid=false
     self.gridTopologyDirty=true
-    if kind==BODY_STATIC then self.stillDirty=true end
+    self.gridKey[i]=nil
+    if kind==BODY_STATIC then self.stillDirty=true else self.moversDirty=true end
     if self.ccd[i] then self.ccdCount+=1 end
     return makeHandle(i,self.generation[i])
 end
@@ -1339,7 +1340,7 @@ function World:removeBody(handle)
     end
     self.alive[i] = false
     self.aliveCount -= 1
-    if self.bodyType[i]==BODY_STATIC then self.stillDirty=true end
+    if self.bodyType[i]==BODY_STATIC then self.stillDirty=true else self.moversDirty=true end
     if self.ccd[i] then self.ccdCount-=1 end
     self.free[#self.free+1] = i
     self.userData[i] = nil
@@ -2075,20 +2076,42 @@ local function buildStill(self, members: { number }): number
   return node
 end
 
---- Builds the tree of the oversized bodies that are static. A level is mostly these, and they
---- neither move nor touch each other, so they are kept out of every step's sweep and found by
---- what does move.
+--- The bodies that are not static, in the order of their slots: what a step has to visit. A
+--- level is mostly static bodies, and a step that asked each of them whether it moves would
+--- spend its time on that.
+local function listMovers(self): { number }
+  local movers = self.movers
+  if not self.moversDirty then return movers end
+
+  local {alive, bodyType} = self
+  local count = 0
+
+  for body = 1, self.high do
+    if not alive[body] or bodyType[body] == BODY_STATIC then continue end
+
+    count += 1
+    movers[count] = body
+  end
+
+  for index = #movers, count + 1, -1 do
+    movers[index] = nil
+  end
+
+  self.moversDirty = false
+
+  return movers
+end
+
+--- Builds the tree of the static bodies. They neither move nor touch each other, so they are
+--- kept out of the grid and of every step's sweep, and found by what does move.
 function World:_rebuildStill()
-  local {gridLarge: large, bodyType, stillLarge} = self
+  local {alive, bodyType} = self
   local members = {}
 
-  table.clear(stillLarge)
-
-  for _, body in large do
-    if bodyType[body] ~= BODY_STATIC then continue end
+  for body = 1, self.high do
+    if not alive[body] or bodyType[body] ~= BODY_STATIC then continue end
 
     self:_updateAabb(body)
-    stillLarge[body] = true
     table.insert(members, body)
   end
 
@@ -2099,12 +2122,11 @@ end
 
 function World:_buildGridIndex(refreshAabbs)
   local {gridHeads: heads, gridKeys: keys, gridNext: nextIn, gridLarge: large, gridOccupied: occupied} = self
-  local {alive, sphereRadius: radii, pos, aabbMin, aabbMax, gridKey, gridX, gridY, gridZ} = self
-  local {bodyType, gridLargeMoving: moving} = self
+  local {sphereRadius: radii, pos, aabbMin, aabbMax, gridKey, gridX, gridY, gridZ} = self
   local cellSize, margin = self.broadphaseCellSize, self.contactMargin
+  local movers = listMovers(self)
 
-  -- A static body is where it was, and as big, unless something has said otherwise.
-  local stillMoved = self.stillDirty
+  if self.stillDirty then self:_rebuildStill() end
 
   -- Most coherent worlds keep bodies in the same broad-phase cells for many frames. Validate
   -- membership first; when topology is unchanged, retain bucket chains and occupied-neighbor
@@ -2112,9 +2134,7 @@ function World:_buildGridIndex(refreshAabbs)
   if self.gridTopologyReady and not self.gridTopologyDirty then
     local same = true
 
-    for body = 1, self.high do
-      if not alive[body] or not (stillMoved or bodyType[body] ~= BODY_STATIC) then continue end
-
+    for _, body in movers do
       local radius = radii[body]
       local width, height, depth
 
@@ -2151,16 +2171,14 @@ function World:_buildGridIndex(refreshAabbs)
     end
 
     if same then
-      if stillMoved then self:_rebuildStill() end
-
       self.gridValid = true
       return false
     end
   end
 
   if refreshAabbs and (not self.gridTopologyReady or self.gridTopologyDirty) then
-    for body = 1, self.high do
-      if alive[body] and not radii[body] and (stillMoved or bodyType[body] ~= BODY_STATIC) then self:_updateAabb(body) end
+    for _, body in movers do
+      if not radii[body] then self:_updateAabb(body) end
     end
   end
 
@@ -2168,18 +2186,12 @@ function World:_buildGridIndex(refreshAabbs)
   table.clear(heads)
   table.clear(keys)
   table.clear(large)
-  table.clear(moving)
   buffer.fill(occupied, 0, 0)
 
   local {gridKeyX: columns, gridKeyY: rows, gridKeyZ: layers} = self
   local smallCount, keyCount = 0, 0
 
-  for body = 1, self.high do
-    if not alive[body] then
-      gridKey[body] = nil
-      continue
-    end
-
+  for _, body in movers do
     local radius = radii[body]
     local width, height, depth
 
@@ -2198,8 +2210,6 @@ function World:_buildGridIndex(refreshAabbs)
     if not key then
       gridKey[body] = nil
       table.insert(large, body)
-      if bodyType[body] ~= BODY_STATIC then table.insert(moving, body) end
-
       continue
     end
 
@@ -2226,8 +2236,6 @@ function World:_buildGridIndex(refreshAabbs)
   self.gridTopologyReady = true
   self.gridTopologyDirty = false
   self:_rebuildGridPairs()
-  if stillMoved then self:_rebuildStill() end
-
   self.gridValid = true
 
   return true
@@ -2277,22 +2285,16 @@ function World:_collideGrid()
     end
   end
 
-  -- Bodies wider than one grid cell stay out of the hash grid. Pair anything involving
-  -- them with a coherent X sweep instead of the old O(L^2) fallback. Small-small pairs
-  -- are skipped here because the grid already emitted them.
-  local {gridLargeMoving: large, alive, gridKey, bodyType, stillLarge} = self
+  local {gridLarge: large, alive, gridKey, bodyType, movers} = self
   local root = self.stillRoot
 
-  -- The oversized bodies that are static are in a tree, and everything that is not static looks
-  -- itself up in it.
+  -- The static bodies are in a tree, and everything else looks itself up in it.
   if root ~= 0 then
     local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = self
     local {sphereRadius: radii, pos, aabbMin, aabbMax} = self
     local margin = self.contactMargin
 
-    for body = 1, self.high do
-      if not alive[body] or bodyType[body] == BODY_STATIC then continue end
-
+    for _, body in movers do
       -- One body is no tree, and the pair is tested on its own bounds.
       if root < 0 then
         tryPair(self, -root, body)
@@ -2343,7 +2345,9 @@ function World:_collideGrid()
     end
   end
 
-  -- What is left is the oversized bodies that can move, against each other and what is in the grid.
+  -- Bodies wider than one grid cell stay out of the hash grid. Pair anything involving them
+  -- directly while they are few, and with a coherent X sweep when they are not. Small-small pairs
+  -- are skipped here because the grid already emitted them.
   local largeCount = #large
   if largeCount == 0 then return end
 
@@ -2351,10 +2355,8 @@ function World:_collideGrid()
     for index = 1, largeCount do
       local first = large[index]
 
-      for second = 1, self.high do
-        if alive[second] and second ~= first and not stillLarge[second] and (gridKey[second] or second > first) then
-          tryPair(self, first, second)
-        end
+      for _, second in movers do
+        if second ~= first and (gridKey[second] or second > first) then tryPair(self, first, second) end
       end
     end
 
@@ -2365,8 +2367,8 @@ function World:_collideGrid()
   -- moves: the grid asks no more of a sphere than its centre.
   local radii = self.sphereRadius
 
-  for body = 1, self.high do
-    if alive[body] and radii[body] then self:_updateAabb(body) end
+  for _, body in movers do
+    if radii[body] then self:_updateAabb(body) end
   end
 
   self:_sortOrder()
@@ -2375,14 +2377,14 @@ function World:_collideGrid()
 
   for position = 1, count do
     local first = order[position]
-    if not alive[first] or stillLarge[first] then continue end
+    if not alive[first] or bodyType[first] == BODY_STATIC then continue end
 
     local reach = aabbMax[first].X
     local firstLarge = not gridKey[first]
 
     for after = position + 1, count do
       local second = order[after]
-      if not alive[second] or stillLarge[second] then continue end
+      if not alive[second] or bodyType[second] == BODY_STATIC then continue end
       if aabbMin[second].X > reach then break end
       if firstLarge or not gridKey[second] then tryPair(self, first, second) end
     end
@@ -2395,7 +2397,8 @@ function World:_collide()
     self.manifoldCount=0
     self.cacheEpoch+=1
     if self.broadphase=="sap" then
-        for i=1,self.high do if self.alive[i] then self:_updateAabb(i) end end
+        if self.stillDirty then self:_rebuildStill() end
+        for _,i in listMovers(self) do self:_updateAabb(i) end
         self:_collideSap()
     else
         self:_collideGrid()
@@ -2447,10 +2450,11 @@ end
 
 function World:_buildIslands()
   local {islandParent: parent, islandSize: size, islandAwake: awake, islandRoots: roots} = self
-  local {alive, bodyType, sensor, sleeping, generation, joints, high, ca: bodiesA, cb: bodiesB} = self
+  local {alive, bodyType, sensor, sleeping, generation, joints, ca: bodiesA, cb: bodiesB} = self
+  local movers = listMovers(self)
 
-  for body = 1, high do
-    local dynamic = alive[body] and bodyType[body] == BODY_DYNAMIC
+  for _, body in movers do
+    local dynamic = bodyType[body] == BODY_DYNAMIC
 
     parent[body] = if dynamic then body else 0
     size[body] = if dynamic then 1 else 0
@@ -2479,11 +2483,11 @@ function World:_buildIslands()
   table.clear(roots)
   local count = 0
 
-  for body = 1, high do
+  for _, body in movers do
     awake[body] = false
   end
 
-  for body = 1, high do
+  for _, body in movers do
     if parent[body] == 0 then continue end
 
     local root = unionRoot(parent, body)
@@ -2499,7 +2503,7 @@ function World:_buildIslands()
 
   -- Wake is an island property: an explicit impulse or meaningful impact on one member
   -- wakes every dynamically-connected member before solving.
-  for body = 1, high do
+  for _, body in movers do
     local root = parent[body]
     if root ~= 0 and awake[root] then sleeping[body] = false end
   end
@@ -2995,12 +2999,10 @@ function World:_correctPositions()
 end
 
 function World:_integrate(dt)
-  local {alive, bodyType, sleeping, invMass, ccd, pos, prevPos, linVel, angVel, force, torque, qv, qw} = self
+  local {bodyType, sleeping, invMass, ccd, pos, prevPos, linVel, angVel, force, torque, qv, qw} = self
   local {gravity, linearDamping, angularDamping} = self
 
-  for body = 1, self.high do
-    if not alive[body] then continue end
-
+  for _, body in listMovers(self) do
     local kind = bodyType[body]
 
     if kind == BODY_KINEMATIC then
@@ -3185,12 +3187,12 @@ end
 function World:_sleepIndependent(dt)
   if not self.allowSleep then return end
 
-  local {alive, bodyType, sleeping, linVel, angVel, sleepTime, sleepDelay} = self
+  local {bodyType, sleeping, linVel, angVel, sleepTime, sleepDelay} = self
   local linear, angular = self.sleepLinear * self.sleepLinear, self.sleepAngular * self.sleepAngular
   local count = 0
 
-  for body = 1, self.high do
-    if not alive[body] or bodyType[body] ~= BODY_DYNAMIC then continue end
+  for _, body in listMovers(self) do
+    if bodyType[body] ~= BODY_DYNAMIC then continue end
 
     count += 1
     if sleeping[body] then continue end
@@ -3218,15 +3220,16 @@ function World:_sleep(dt)
   if not self.allowSleep then return end
 
   local {islandParent: parent, islandCanSleep: canSleep, islandMinTime: leastRest, islandRoots: roots} = self
-  local {linVel, angVel, sleepTime, sleeping, sleepDelay, high} = self
+  local {linVel, angVel, sleepTime, sleeping, sleepDelay} = self
   local linear, angular = self.sleepLinear * self.sleepLinear, self.sleepAngular * self.sleepAngular
+  local movers = listMovers(self)
 
   for _, root in roots do
     canSleep[root] = true
     leastRest[root] = math.huge
   end
 
-  for body = 1, high do
+  for _, body in movers do
     local root = parent[body]
     if root == 0 then continue end
 
@@ -3234,7 +3237,7 @@ function World:_sleep(dt)
     if vector.dot(velocity, velocity) >= linear or vector.dot(spin, spin) >= angular then canSleep[root] = false end
   end
 
-  for body = 1, high do
+  for _, body in movers do
     local root = parent[body]
     if root == 0 then continue end
 
@@ -3249,7 +3252,7 @@ function World:_sleep(dt)
     if rested < leastRest[root] then leastRest[root] = rested end
   end
 
-  for body = 1, high do
+  for _, body in movers do
     local root = parent[body]
 
     if root ~= 0 and canSleep[root] and leastRest[root] >= sleepDelay then
@@ -3515,7 +3518,7 @@ function World:_raycastRaw(origin, direction, maxDistance, mask)
   local bestDistance = maxDistance
   local bestBody, bestNormal, bestPoint
 
-  for _, body in self.gridLargeMoving do
+  for _, body in self.gridLarge do
     local distance, normal, point = raycastBody(self, body, origin, dir, bestDistance, mask)
 
     if distance and distance < bestDistance then
@@ -3874,7 +3877,7 @@ local function queryAabbGrid(
   local count = 0
 
   -- Oversized bodies are outside the grid and are normally few.
-  for _, body in self.gridLargeMoving do
+  for _, body in self.gridLarge do
     if alive[body] and bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(self, body, low, high) then
       count += 1
       out[count] = makeHandle(body, generation[body])
@@ -4239,7 +4242,7 @@ function M.newWorld(opts)
     w.gridOccupied = buffer.create(GridFilterSize)
     w.gridDenseKeys={};w.gridPairA={};w.gridPairB={};w.gridDenseCount=0;w.gridPairCount=0
     w.gridTopologyReady=false;w.gridTopologyDirty=true
-    w.stillDirty=true;w.gridLargeMoving={};w.stillLarge={};w.stillRoot=0
+    w.stillDirty=true;w.stillRoot=0;w.movers={};w.moversDirty=true
     w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={}
     w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
     w.frame=0
