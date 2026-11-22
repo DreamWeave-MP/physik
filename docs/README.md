@@ -6,7 +6,7 @@
 local physik = require("@dream/physik")
 ```
 
-Current package version: **0.3.2**.
+Current package version: **0.4.0**.
 
 ## v0.3 architecture
 
@@ -18,7 +18,9 @@ The hot path is data-oriented and allocation-averse:
 - reusable SoA contact storage;
 - cached body bases reused by SAT and inverse-inertia work;
 - isotropic sphere inertia fast path;
-- numeric 3D hash-grid broadphase for compact bodies;
+- numeric 3D hash-grid broadphase for compact bodies that can move;
+- a tree of the static bodies, built only when one changes, so a level costs a step nothing;
+- contacts between bodies at rest kept from step to step, and a step in which nothing stirs skipped;
 - adaptive oversized-body path: direct large-vs-world when only a few large bodies exist, coherent X sweep when many do;
 - 2-4 point clipped box-face manifolds;
 - local-anchor contact matching across frames;
@@ -200,6 +202,27 @@ local hit = world:sphereCast(startPos, endPos, radius, mask, ignoreHandle)
 world:sphereCastBatchSoA(starts, ends, radii, masks, ignoreHandles, reusable)
 ```
 
+Capsule sweep, for anything that stands upright:
+
+```luau
+local hit = world:capsuleCast(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
+```
+
+The capsule's axis is along Y, and `radius` and `halfHeight` are what `physik.capsule` takes. The hit has the same fields as a sphere cast's: `handle`, `fraction`, `distance`, `center`, `point`, `normal` and `userData`, the normal pointing at the capsule. It is swept against every shape, a compound piece by piece and a mesh or a heightfield triangle by triangle. A capsule that starts inside something meets it at a fraction of 0, unless it is on its way out, which is what lets a character walk out of what it has been pushed into. A sweep stops `0.001` short of what it meets.
+
+What a capsule overlaps where it stands, as columns:
+
+```luau
+local overlaps, count = world:capsuleContacts(position, radius, halfHeight, mask, ignoreHandle, reusable)
+
+-- overlaps.handles
+-- overlaps.normals   -- pointing at the capsule
+-- overlaps.depths
+-- overlaps.points
+```
+
+`world:hasBody(handle)` says whether a handle is still good, without throwing.
+
 Raycasts and AABB queries lazily reuse Physik's body grid. Large bodies are checked directly, compact bodies are traversed spatially, and pathological huge query ranges fall back to a linear scan rather than walking unbounded cell counts.
 
 Sphere casts reuse the same TOI kernels as CCD against spheres, boxes, capsules, compounds, triangle meshes, and heightfields.
@@ -283,6 +306,64 @@ maxCatchUpSteps            default 8
 contactEvents              default false
 ```
 
+## Levels
+
+A level is mostly static bodies, and a step is not charged for them. Every static body, whatever its size, is kept in a tree that is built when one is added, removed or moved, and not otherwise; the grid and the sweep are of the bodies that can move, and a step visits only those. What moves looks itself up in the tree, and keeps the answer until it has moved a little way.
+
+- Add a level's geometry as `type = 'static'` boxes, meshes and heightfields. A thousand of them cost a step nothing, and a ray or a sweep through them walks the tree.
+- Move a static body with `setPosition` or `setRotation` and the tree is built again, at that step. Something that moves every step, a lift or a door, is `type = 'kinematic'`, driven with `driveKinematic`.
+- A world that has had bodies taken out of it steps as a new one does: a freed slot is given out lowest first, so the same bodies added in the same order get the same slots.
+
+## Bodies at rest
+
+A body that is asleep where it was asleep at the last step is at rest, and so is a static body nobody has moved. Two bodies at rest touch exactly as they did, so the pair is not offered, tested or solved again: its contacts are kept from the step before, and still come out of `writeContacts`, `contacts`, `stats` and the contact events as they always did. A step in which nothing has stirred since the last one does nothing but notice that. The one thing that reads differently is `stats().candidates`, which counts a pair at rest only if it touches.
+
+So a heap of debris costs what it costs while it is falling, and nothing once it lies still. Whether it ever lies still is `sleepLinear`, `sleepAngular` and `sleepDelay`, and the defaults are tight for small pieces: a box a hand across, rocking in a heap, turns faster than `0.05` radians a second for good and keeps its whole island awake. A game with debris wants something like:
+
+```luau
+local world = physik.newWorld({ sleepLinear = 0.3, sleepAngular = 0.6, sleepDelay = 0.4 })
+```
+
+## Characters
+
+```luau
+local character = require("@dream/physik/character")
+```
+
+A character is not a body. It is an upright capsule that is moved by asking the world what is in its way: it slides along what it meets, walks up steps and walkable slopes, follows the ground down a step or a slope, is pushed out of whatever moves into it, and says what it is standing on. How fast it runs, how it jumps and what gravity does to it are the game's, which is why this is a module of its own and not in the kernel.
+
+```luau
+local who = character.new(world, {
+    radius = 0.35,        -- the capsule's
+    height = 1.8,         -- soles to crown
+    stepHeight = 0.3,     -- the tallest step walked up without a jump
+    snapDistance = 0.2,   -- how far down the ground is followed
+    slopeDegrees = 50,    -- steeper than this is a wall
+    mask = nil,           -- which bodies it meets
+    ignore = nil,         -- a body of its own, if it has one in the world
+    position = vector.create(0, 0, 0), -- its soles
+})
+
+-- Every tick: how far the game wants it to go.
+character.move(who, velocity * dt)
+
+-- Then take out of the game's velocity what it ran into.
+velocity = character.slide(who, velocity)
+
+who.position      -- where its soles are; set it to put the character somewhere
+who.grounded      -- whether it is standing on something
+who.groundNormal
+who.ground        -- the handle of what it is standing on
+```
+
+- **Steps and edges.** A wall in the way of someone on the ground may be a step: the character goes up, across and down again, and takes that if it gets further and lands no higher than `stepHeight`. The round foot of a capsule touches the edge of a step at whatever angle it happens to be over it, so an edge is judged by the surface it belongs to and by whether there is ground under the capsule's axis within a step's height. On a stair there is; past the edge of a ledge there is not, and the character falls.
+- **Slopes.** A surface whose normal rises less than `slopeDegrees` allows is a wall to someone walking: they are turned along it, not up it.
+- **Lifts.** `character.groundVelocity(who)` is how the ground under its soles is moving. Add it to the motion and the character rides a kinematic lift up and down; a lift that comes up under a character who was not told pushes them up all the same.
+- **Jumps.** A move that rises does not look for ground, so a jump leaves it.
+- `character.fits(who, position)` says whether the character would be clear of everything there.
+
+A move asks the world once for everything it could meet and sweeps against that, so it costs two or three sweeps whatever the size of the level.
+
 ## Measured sandbox performance
 
 These are regression-direction samples from the supplied Jess binary in the ChatGPT Linux sandbox, not hardware-independent promises. Recent unprofiled v0.3 samples:
@@ -334,7 +415,8 @@ Not implemented yet:
 - edge/edge multi-point manifolds;
 - general dynamic-vs-dynamic TOI islands;
 - moving-box/capsule/compound CCD and rotational TOI;
-- character-controller policy;
+- a character that crouches, swims or climbs: `@dream/physik/character` walks, steps, slides and rides, and the rest is the game's;
+- capsule sweeps of a capsule that is not upright;
 - deterministic fixed-point simulation or cross-architecture bitwise determinism;
 - solver parallelism across independent islands.
 

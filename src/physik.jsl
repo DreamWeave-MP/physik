@@ -476,23 +476,6 @@ local function supportBoxAxes(center,a0,a1,a2,half,dir)
         + a2 * (if vector.dot(dir,a2)>=0 then half.Z else -half.Z)
 end
 
-local function testBoxAxis(axis,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,feature,margin)
-    local l2=vector.dot(axis,axis)
-    if l2<=1e-10 then return true,bestPen,bestAxis,bestFeature end
-    local n=if math.abs(l2-1)<1e-5 then axis else axis/math.sqrt(l2)
-    local ra=ah.X*math.abs(vector.dot(n,a0))+ah.Y*math.abs(vector.dot(n,a1))+ah.Z*math.abs(vector.dot(n,a2))
-    local rb=bh.X*math.abs(vector.dot(n,b0))+bh.Y*math.abs(vector.dot(n,b1))+bh.Z*math.abs(vector.dot(n,b2))
-    local dn=vector.dot(d,n)
-    local pen=ra+rb-math.abs(dn)
-    if pen<=-(margin or 0) then return false,bestPen,bestAxis,bestFeature end
-    if pen<bestPen then
-        bestPen=pen
-        bestAxis=if dn>=0 then n else -n
-        bestFeature=feature
-    end
-    return true,bestPen,bestAxis,bestFeature
-end
-
 local function closestPointSegment(p, a, b)
     local ab = b - a
     local d = vector.dot(ab, ab)
@@ -592,26 +575,45 @@ local function sphereBox(sp, radius, bp, bqv, bqw, half, margin)
     return true, qRotate(bqv, bqw, nLocal), bp + qRotate(bqv, bqw, pointLocal), penetration
 end
 
+-- The fifteen axes two boxes can be apart along: each box's three, then the nine crosses of one
+-- of each. Kept between calls, and filled a stage at a time, since most pairs are apart on an
+-- early axis.
+local BoxAxes = table.create(15, ZERO)
+
 local function boxBox(ap,a0,a1,a2,ah,bp,b0,b1,b2,bh,margin)
     local d=bp-ap
     local bestPen,bestAxis,bestFeature=math.huge,nil,0
-    local ok
+    local axes=BoxAxes
+    local slack=-(margin or 0)
+    local ahx,ahy,ahz,bhx,bhy,bhz=ah.X,ah.Y,ah.Z,bh.X,bh.Y,bh.Z
 
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(a0,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,1,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(a1,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,2,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(a2,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,3,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(b0,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,4,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(b1,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,5,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(b2,d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,6,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a0,b0),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,7,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a0,b1),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,8,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a0,b2),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,9,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a1,b0),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,10,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a1,b1),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,11,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a1,b2),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,12,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a2,b0),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,13,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a2,b1),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,14,margin); if not ok then return false end
-    ok,bestPen,bestAxis,bestFeature=testBoxAxis(vector.cross(a2,b2),d,a0,a1,a2,ah,b0,b1,b2,bh,bestPen,bestAxis,bestFeature,15,margin); if not ok then return false end
+    axes[1],axes[2],axes[3],axes[4],axes[5],axes[6]=a0,a1,a2,b0,b1,b2
+
+    for feature=1,15 do
+        if feature==7 then
+            axes[7],axes[8],axes[9]=vector.cross(a0,b0),vector.cross(a0,b1),vector.cross(a0,b2)
+            axes[10],axes[11],axes[12]=vector.cross(a1,b0),vector.cross(a1,b1),vector.cross(a1,b2)
+            axes[13],axes[14],axes[15]=vector.cross(a2,b0),vector.cross(a2,b1),vector.cross(a2,b2)
+        end
+
+        -- One axis: how far the boxes reach along it, against how far apart their centres are.
+        local axis=axes[feature]
+        local l2=vector.dot(axis,axis)
+        if l2<=1e-10 then continue end
+
+        local n=if math.abs(l2-1)<1e-5 then axis else axis/math.sqrt(l2)
+        local ra=ahx*math.abs(vector.dot(n,a0))+ahy*math.abs(vector.dot(n,a1))+ahz*math.abs(vector.dot(n,a2))
+        local rb=bhx*math.abs(vector.dot(n,b0))+bhy*math.abs(vector.dot(n,b1))+bhz*math.abs(vector.dot(n,b2))
+        local dn=vector.dot(d,n)
+        local pen=ra+rb-math.abs(dn)
+        if pen<=slack then return false end
+
+        if pen<bestPen then
+            bestPen=pen
+            bestAxis=if dn>=0 then n else -n
+            bestFeature=feature
+        end
+    end
 
     local n=bestAxis or safeUnit(d,YAXIS)
     local sa=supportBoxAxes(ap,a0,a1,a2,ah,n)
@@ -1252,11 +1254,25 @@ function World:_check(handle)
 end
 
 function World:_allocSlot()
-    local n = #self.free
+    local free = self.free
+    local n = #free
     local i
     if n > 0 then
-        i = self.free[n]
-        self.free[n] = nil
+        -- The lowest free slot, off the top of the heap, and the last one sifted down from there.
+        i = free[1]
+        local last = free[n]
+        free[n] = nil
+        n -= 1
+        local at = 1
+        while true do
+            local below = at * 2
+            if below > n then break end
+            if below < n and free[below + 1] < free[below] then below += 1 end
+            if free[below] >= last then break end
+            free[at] = free[below]
+            at = below
+        end
+        if n > 0 then free[at] = last end
         self.generation[i] += 1
     else
         i = self.high + 1
@@ -1266,7 +1282,12 @@ function World:_allocSlot()
     end
     self.alive[i] = true
     self.aliveCount += 1
-    self.order[#self.order+1] = i
+    -- A slot that is taken again before the sweep's order was compacted is still listed in it,
+    -- and listing it twice would offer each of its pairs twice.
+    if not self.inOrder[i] then
+        self.inOrder[i] = true
+        self.order[#self.order+1] = i
+    end
     return i
 end
 
@@ -1321,6 +1342,16 @@ function World:addBody(desc)
     self:_updateAabb(i)
     self.gridValid=false
     self.gridTopologyDirty=true
+    self.gridKey[i]=nil
+    self.rest[i],self.seenPos[i]=false,nil
+    self.changed=true
+    self.nearEpoch[i]=0
+    if kind==BODY_STATIC then
+        self.stillDirty=true
+        table.insert(self.unsettled,i)
+    else
+        self.moversDirty=true
+    end
     if self.ccd[i] then self.ccdCount+=1 end
     return makeHandle(i,self.generation[i])
 end
@@ -1333,8 +1364,22 @@ function World:removeBody(handle)
     end
     self.alive[i] = false
     self.aliveCount -= 1
+    self.rest[i] = false
+    self.changed = true
+    if self.bodyType[i]==BODY_STATIC then self.stillDirty=true else self.moversDirty=true end
     if self.ccd[i] then self.ccdCount-=1 end
-    self.free[#self.free+1] = i
+    -- The free slots are a heap with the lowest on top, which is the next one taken: a world
+    -- that has had bodies taken out of it then gives the same slots to the same bodies as a new
+    -- one, and steps as a new one does.
+    local free = self.free
+    local at = #free + 1
+    while at > 1 do
+        local above = at // 2
+        if free[above] <= i then break end
+        free[at] = free[above]
+        at = above
+    end
+    free[at] = i
     self.userData[i] = nil
     self.sleeping[i] = false
     -- A destroyed slot must not turn into a "stay" event if the numeric slot is reused.
@@ -1347,6 +1392,26 @@ function World:removeBody(handle)
     end
     self.gridValid=false
     self.gridTopologyDirty=true
+end
+
+--- A static body has been moved: the tree is to be built again, and what the body touches is to
+--- be found again.
+function World:_unsettle(i)
+    self.stillDirty=true
+    self.rest[i]=false
+    self.changed=true
+    table.insert(self.unsettled,i)
+end
+
+--- Whether `handle` is of a body that is still in the world.
+function World:hasBody(handle)
+    if type(handle) ~= "number" then return false end
+    local i,g = splitHandle(handle)
+    return i >= 1 and self.alive[i] == true and self.generation[i] == g
+end
+
+function World:_handleOf(i)
+    return makeHandle(i,self.generation[i])
 end
 
 function World:getBody(handle)
@@ -1368,6 +1433,7 @@ function World:setPosition(handle, p, wake)
     local i = self:_check(handle)
     self.pos[i] = p
     self.gridValid=false
+    if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
     if wake ~= false then self:wake(handle) end
 end
 
@@ -1376,6 +1442,7 @@ function World:setRotation(handle,q,wake)
     self.qv[i],self.qw[i]=qNormalize(q.v,q.w)
     self.axis0[i],self.axis1[i],self.axis2[i]=qAxes(self.qv[i],self.qw[i])
     self.gridValid=false
+    if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
     if wake~=false then self:wake(handle) end
 end
 
@@ -1417,6 +1484,7 @@ function World:shiftOrigin(delta)
   end
 
   self.gridValid = false
+  self.stillDirty = true
 
   return self
 end
@@ -1623,7 +1691,7 @@ local function sortOrderByKeys(self, order: { number }, count: number): boolean
 end
 
 function World:_sortOrder()
-  local {order, alive, aabbMin} = self
+  local {order, alive, aabbMin, inOrder} = self
   local count = #order
 
   -- Compact dead slots opportunistically.
@@ -1632,7 +1700,11 @@ function World:_sortOrder()
 
     for index = 1, count do
       local body = order[index]
-      if not alive[body] then continue end
+
+      if not alive[body] then
+        inOrder[body] = nil
+        continue
+      end
 
       kept += 1
       order[kept] = body
@@ -1906,6 +1978,10 @@ end
 --- bounds are apart. Most pairs a broadphase offers are apart, and nothing else is read for those:
 --- a sphere is bounded by its centre and radius, anything else by its box.
 local function tryPair(self, first: number, second: number)
+  -- Two bodies at rest touch as they did, and their contacts have been kept.
+  local rest = self.rest
+  if rest[first] and rest[second] then return end
+
   local radii, pos = self.sphereRadius, self.pos
   local firstRadius, secondRadius = radii[first], radii[second]
 
@@ -2020,10 +2096,102 @@ function World:_rebuildGridPairs()
   self.gridPairCount = pairCount
 end
 
-function World:_buildGridIndex(refreshAabbs)
+--- Makes a tree of the boxes round `members`, which are bodies, and returns its root: a node,
+--- or the one body there is, negated. A node halves its bodies along the axis their centres are
+--- spread furthest on.
+local function buildStill(self, members: { number }): number
+  if #members == 1 then return -members[1] end
+
+  local {aabbMin, aabbMax} = self
+  local low, high = aabbMin[members[1]], aabbMax[members[1]]
+  local least, most = low + high, low + high
+
+  for _, body in members do
+    local bodyLow, bodyHigh = aabbMin[body], aabbMax[body]
+    local centre = bodyLow + bodyHigh
+
+    low, high = vector.min(low, bodyLow), vector.max(high, bodyHigh)
+    least, most = vector.min(least, centre), vector.max(most, centre)
+  end
+
+  local spread = most - least
+  local axis = if spread.X >= spread.Y and spread.X >= spread.Z then 'X' elseif spread.Y >= spread.Z then 'Y' else 'Z'
+
+  -- Bodies whose centres are level, or are not numbers, stay in the order of their slots.
+  table.sort(members, function(first: number, second: number)
+    local firstCentre, secondCentre = aabbMin[first][axis] + aabbMax[first][axis], aabbMin[second][axis] + aabbMax[second][axis]
+    if firstCentre < secondCentre then return true end
+    if secondCentre < firstCentre then return false end
+
+    return first < second
+  end)
+
+  local node = self.stillNodeCount + 1
+  local half = #members // 2
+
+  self.stillNodeCount = node
+  self.stillLow[node], self.stillHigh[node] = low, high
+  self.stillLeft[node] = buildStill(self, table.move(members, 1, half, 1, {}))
+  self.stillRight[node] = buildStill(self, table.move(members, half + 1, #members, 1, {}))
+
+  return node
+end
+
+-- How much bigger than a body the box is that the tree of static bodies is asked about for it.
+local NearPad = vector.create(0.3, 0.3, 0.3)
+
+--- The bodies that are not static, in the order of their slots: what a step has to visit. A
+--- level is mostly static bodies, and a step that asked each of them whether it moves would
+--- spend its time on that.
+local function listMovers(self): { number }
+  local movers = self.movers
+  if not self.moversDirty then return movers end
+
+  local {alive, bodyType} = self
+  local count = 0
+
+  for body = 1, self.high do
+    if not alive[body] or bodyType[body] == BODY_STATIC then continue end
+
+    count += 1
+    movers[count] = body
+  end
+
+  for index = #movers, count + 1, -1 do
+    movers[index] = nil
+  end
+
+  self.moversDirty = false
+
+  return movers
+end
+
+--- Builds the tree of the static bodies. They neither move nor touch each other, so they are
+--- kept out of the grid and of every step's sweep, and found by what does move.
+function World:_rebuildStill()
+  local {alive, bodyType} = self
+  local members = {}
+
+  for body = 1, self.high do
+    if not alive[body] or bodyType[body] ~= BODY_STATIC then continue end
+
+    self:_updateAabb(body)
+    table.insert(members, body)
+  end
+
+  self.stillNodeCount = 0
+  self.stillRoot = if #members == 0 then 0 else buildStill(self, members)
+  self.stillDirty = false
+  self.stillEpoch += 1
+end
+
+function World:_buildGridIndex(refreshAabbs, resting)
   local {gridHeads: heads, gridKeys: keys, gridNext: nextIn, gridLarge: large, gridOccupied: occupied} = self
-  local {alive, sphereRadius: radii, pos, aabbMin, aabbMax, gridKey, gridX, gridY, gridZ} = self
+  local {sphereRadius: radii, pos, aabbMin, aabbMax, gridKey, gridX, gridY, gridZ} = self
   local cellSize, margin = self.broadphaseCellSize, self.contactMargin
+  local movers = listMovers(self)
+
+  if self.stillDirty then self:_rebuildStill() end
 
   -- Most coherent worlds keep bodies in the same broad-phase cells for many frames. Validate
   -- membership first; when topology is unchanged, retain bucket chains and occupied-neighbor
@@ -2031,8 +2199,12 @@ function World:_buildGridIndex(refreshAabbs)
   if self.gridTopologyReady and not self.gridTopologyDirty then
     local same = true
 
-    for body = 1, self.high do
-      if not alive[body] then continue end
+    -- In a step, a body at rest is where it was and as it was. Outside one nothing has said
+    -- which bodies are at rest since they last moved.
+    local rest = if resting then self.rest else nil
+
+    for _, body in movers do
+      if rest and rest[body] then continue end
 
       local radius = radii[body]
       local width, height, depth
@@ -2076,8 +2248,8 @@ function World:_buildGridIndex(refreshAabbs)
   end
 
   if refreshAabbs and (not self.gridTopologyReady or self.gridTopologyDirty) then
-    for body = 1, self.high do
-      if alive[body] and not radii[body] then self:_updateAabb(body) end
+    for _, body in movers do
+      if not radii[body] then self:_updateAabb(body) end
     end
   end
 
@@ -2090,12 +2262,7 @@ function World:_buildGridIndex(refreshAabbs)
   local {gridKeyX: columns, gridKeyY: rows, gridKeyZ: layers} = self
   local smallCount, keyCount = 0, 0
 
-  for body = 1, self.high do
-    if not alive[body] then
-      gridKey[body] = nil
-      continue
-    end
-
+  for _, body in movers do
     local radius = radii[body]
     local width, height, depth
 
@@ -2151,8 +2318,12 @@ function World:_ensureQueryGrid()
 end
 
 function World:_collideGrid()
-  self:_buildGridIndex(true)
+  self:_buildGridIndex(true, true)
   local {gridHeads: heads, gridNext: nextIn, gridDenseKeys: dense, gridPairA: pairA, gridPairB: pairB} = self
+  local {sphereRadius: radii, aabbMin: lows, aabbMax: highs} = self
+
+  -- In a heap most of the pairs a cell offers are apart, and two bodies that are not spheres are
+  -- told apart here by their boxes, without the call: a sphere's box is not kept as it moves.
 
   -- Same-cell pairs only exist in cells cached as non-singleton during the most recent topology
   -- rebuild. Their body membership is stable until a center crosses a cell boundary.
@@ -2162,9 +2333,27 @@ function World:_collideGrid()
     while first ~= 0 do
       local second = nextIn[first] or 0
 
-      while second ~= 0 do
-        tryPair(self, first, second)
-        second = nextIn[second] or 0
+      if radii[first] then
+        while second ~= 0 do
+          tryPair(self, first, second)
+          second = nextIn[second] or 0
+        end
+      else
+        local low, high = lows[first], highs[first]
+
+        while second ~= 0 do
+          local other = second
+          second = nextIn[second] or 0
+
+          if not radii[other] then
+            local otherLow, otherHigh = lows[other], highs[other]
+            if otherLow.X > high.X or otherHigh.X < low.X then continue end
+            if otherLow.Y > high.Y or otherHigh.Y < low.Y then continue end
+            if otherLow.Z > high.Z or otherHigh.Z < low.Z then continue end
+          end
+
+          tryPair(self, first, other)
+        end
       end
 
       first = nextIn[first] or 0
@@ -2180,19 +2369,134 @@ function World:_collideGrid()
     while first ~= 0 do
       local second = head
 
-      while second ~= 0 do
-        tryPair(self, first, second)
-        second = nextIn[second] or 0
+      if radii[first] then
+        while second ~= 0 do
+          tryPair(self, first, second)
+          second = nextIn[second] or 0
+        end
+      else
+        local low, high = lows[first], highs[first]
+
+        while second ~= 0 do
+          local other = second
+          second = nextIn[second] or 0
+
+          if not radii[other] then
+            local otherLow, otherHigh = lows[other], highs[other]
+            if otherLow.X > high.X or otherHigh.X < low.X then continue end
+            if otherLow.Y > high.Y or otherHigh.Y < low.Y then continue end
+            if otherLow.Z > high.Z or otherHigh.Z < low.Z then continue end
+          end
+
+          tryPair(self, first, other)
+        end
       end
 
       first = nextIn[first] or 0
     end
   end
 
-  -- Bodies wider than one grid cell stay out of the hash grid. Pair anything involving
-  -- them with a coherent X sweep instead of the old O(L^2) fallback. Small-small pairs
+  local {gridLarge: large, alive, gridKey, bodyType, movers} = self
+  local root = self.stillRoot
+
+  -- The static bodies are in a tree, and everything else looks itself up in it.
+  if root ~= 0 then
+    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = self
+    local {sphereRadius: radii, pos, aabbMin, aabbMax} = self
+    local margin = self.contactMargin
+    local rest, stillSettled = self.rest, #self.unsettled == 0
+    local {nearStill, nearLow: nearLows, nearHigh: nearHighs, nearEpoch: nearEpochs, stillEpoch: epoch} = self
+
+    for _, body in movers do
+      -- A body at rest touches the static bodies it did, unless one of those has been moved.
+      if stillSettled and rest[body] then continue end
+
+      -- One body is no tree, and the pair is tested on its own bounds.
+      if root < 0 then
+        tryPair(self, -root, body)
+        continue
+      end
+
+      local low, high
+      local radius = radii[body]
+
+      if radius then
+        local reach = radius + margin
+        local centre = pos[body]
+        low, high = centre - vector.create(reach, reach, reach), centre + vector.create(reach, reach, reach)
+      else
+        low, high = aabbMin[body], aabbMax[body]
+      end
+
+      -- The tree is asked about a box a little bigger than the body's, and the answer is kept
+      -- until the body leaves that box or the tree changes: most steps a body is offered the
+      -- few static bodies it was near last step, in the order the tree gave them.
+      local near = nearStill[body]
+      local nearLow, nearHigh = nearLows[body], nearHighs[body]
+
+      if
+        nearEpochs[body] ~= epoch
+        or low.X < nearLow.X
+        or low.Y < nearLow.Y
+        or low.Z < nearLow.Z
+        or high.X > nearHigh.X
+        or high.Y > nearHigh.Y
+        or high.Z > nearHigh.Z
+      then
+        if not near then
+          near = {}
+          nearStill[body] = near
+        end
+
+        low, high = low - NearPad, high + NearPad
+        nearLows[body], nearHighs[body], nearEpochs[body] = low, high, epoch
+
+        local entry, top, count = root, 0, 0
+
+        while true do
+          if entry < 0 then
+            count += 1
+            near[count] = -entry
+          else
+            local nodeLow, nodeHigh = lows[entry], highs[entry]
+
+            if
+              not (
+                low.X > nodeHigh.X
+                or high.X < nodeLow.X
+                or low.Y > nodeHigh.Y
+                or high.Y < nodeLow.Y
+                or low.Z > nodeHigh.Z
+                or high.Z < nodeLow.Z
+              )
+            then
+              top += 1
+              stack[top] = rights[entry]
+              entry = lefts[entry]
+              continue
+            end
+          end
+
+          if top == 0 then break end
+
+          entry = stack[top]
+          top -= 1
+        end
+
+        for index = #near, count + 1, -1 do
+          near[index] = nil
+        end
+      end
+
+      for _, still in near do
+        tryPair(self, still, body)
+      end
+    end
+  end
+
+  -- Bodies wider than one grid cell stay out of the hash grid. Pair anything involving them
+  -- directly while they are few, and with a coherent X sweep when they are not. Small-small pairs
   -- are skipped here because the grid already emitted them.
-  local {gridLarge: large, alive, gridKey} = self
   local largeCount = #large
   if largeCount == 0 then return end
 
@@ -2200,8 +2504,8 @@ function World:_collideGrid()
     for index = 1, largeCount do
       local first = large[index]
 
-      for second = 1, self.high do
-        if alive[second] and second ~= first and (gridKey[second] or second > first) then tryPair(self, first, second) end
+      for _, second in movers do
+        if second ~= first and (gridKey[second] or second > first) then tryPair(self, first, second) end
       end
     end
 
@@ -2212,8 +2516,8 @@ function World:_collideGrid()
   -- moves: the grid asks no more of a sphere than its centre.
   local radii = self.sphereRadius
 
-  for body = 1, self.high do
-    if alive[body] and radii[body] then self:_updateAabb(body) end
+  for _, body in movers do
+    if radii[body] then self:_updateAabb(body) end
   end
 
   self:_sortOrder()
@@ -2222,31 +2526,126 @@ function World:_collideGrid()
 
   for position = 1, count do
     local first = order[position]
-    if not alive[first] then continue end
+    if not alive[first] or bodyType[first] == BODY_STATIC then continue end
 
     local reach = aabbMax[first].X
     local firstLarge = not gridKey[first]
 
     for after = position + 1, count do
       local second = order[after]
-      if not alive[second] then continue end
+      if not alive[second] or bodyType[second] == BODY_STATIC then continue end
       if aabbMin[second].X > reach then break end
       if firstLarge or not gridKey[second] then tryPair(self, first, second) end
     end
   end
 end
 
+--- Says which bodies are at rest, and keeps the contacts between two of them from the step
+--- before, where everything else's are found again. A body is at rest when it is static and has
+--- not been moved, or is asleep exactly where it was asleep at the last step: two such bodies
+--- touch as they did, so the pair is neither offered nor tested, however long a pile lies there.
+local function carryContacts(self, movers: { number })
+  local {rest, sleeping, pos, qv, qw, seenPos, seenTurn, seenTurnW} = self
+
+  local unseen = self.unseen
+  local stirring, unseenCount = 0, 0
+
+  for _, body in movers do
+    -- Awake: not at rest, and where it last slept is no longer where it sleeps.
+    if not sleeping[body] then
+      stirring += 1
+      if rest[body] then rest[body] = false end
+      if seenPos[body] then seenPos[body] = nil end
+
+      continue
+    end
+
+    local still = pos[body] == seenPos[body] and qv[body] == seenTurn[body] and qw[body] == seenTurnW[body]
+
+    rest[body] = still
+
+    -- Asleep somewhere new: where is noted once what it touches there has been found.
+    if not still then
+      stirring += 1
+      unseenCount += 1
+      unseen[unseenCount] = body
+    end
+  end
+
+  for index = #unseen, unseenCount + 1, -1 do
+    unseen[index] = nil
+  end
+
+  self.stirring = stirring
+
+  -- Nothing stirred last step either, and nothing has been added, removed or moved since: the
+  -- contacts are last step's, all of them, as they lie.
+  if stirring == 0 and self.quiet and not self.changed then return true end
+
+  local {ca: bodiesA, cb: bodiesB, cn: normals, cp: points, cpen: depths} = self
+  local {cnormalImpulse: normalImpulses, ctangentImpulse1: tangentImpulses1, ctangentImpulse2: tangentImpulses2} = self
+  local kept, pairs, lastFirst, lastSecond = 0, 0, 0, 0
+
+  for contact = 1, self.contactCount do
+    local first, second = bodiesA[contact], bodiesB[contact]
+    if not (rest[first] and rest[second]) then continue end
+
+    kept += 1
+    bodiesA[kept], bodiesB[kept] = first, second
+    normals[kept], points[kept], depths[kept] = normals[contact], points[contact], depths[contact]
+    normalImpulses[kept], tangentImpulses1[kept], tangentImpulses2[kept] = 0, 0, 0
+
+    -- A pair's contacts are together, so a change of pair is one more pair.
+    if first ~= lastFirst or second ~= lastSecond then
+      pairs += 1
+      lastFirst, lastSecond = first, second
+    end
+  end
+
+  self.contactCount = kept
+  self.candidateCount = pairs
+  self.manifoldCount = pairs
+
+  return false
+end
+
+--- Notes where each sleeping body is, now that what it touches there is known, and takes the
+--- static bodies that had been moved to be at rest again.
+local function settle(self, movers: { number })
+  local {rest, pos, qv, qw, seenPos, seenTurn, seenTurnW, unsettled, alive, bodyType} = self
+
+  for _, body in self.unseen do
+    seenPos[body], seenTurn[body], seenTurnW[body] = pos[body], qv[body], qw[body]
+  end
+
+  self.stillWasMoved = #unsettled > 0
+  if #unsettled == 0 then return end
+
+  for _, body in unsettled do
+    rest[body] = alive[body] and bodyType[body] == BODY_STATIC
+  end
+
+  table.clear(unsettled)
+end
+
 function World:_collide()
-    self.contactCount=0
-    self.candidateCount=0
-    self.manifoldCount=0
+    local movers=listMovers(self)
     self.cacheEpoch+=1
+    if carryContacts(self,movers) then
+        self.stillWasMoved=false
+        return
+    end
     if self.broadphase=="sap" then
-        for i=1,self.high do if self.alive[i] then self:_updateAabb(i) end end
+        if self.stillDirty then self:_rebuildStill() end
+        local rest=self.rest
+        for _,i in movers do if not rest[i] then self:_updateAabb(i) end end
         self:_collideSap()
     else
         self:_collideGrid()
     end
+    settle(self,movers)
+    self.quiet=self.stirring==0
+    self.changed=false
 end
 
 local function pointVelocity(self,i,r)
@@ -2294,10 +2693,11 @@ end
 
 function World:_buildIslands()
   local {islandParent: parent, islandSize: size, islandAwake: awake, islandRoots: roots} = self
-  local {alive, bodyType, sensor, sleeping, generation, joints, high, ca: bodiesA, cb: bodiesB} = self
+  local {alive, bodyType, sensor, sleeping, generation, joints, ca: bodiesA, cb: bodiesB} = self
+  local movers = listMovers(self)
 
-  for body = 1, high do
-    local dynamic = alive[body] and bodyType[body] == BODY_DYNAMIC
+  for _, body in movers do
+    local dynamic = bodyType[body] == BODY_DYNAMIC
 
     parent[body] = if dynamic then body else 0
     size[body] = if dynamic then 1 else 0
@@ -2326,11 +2726,11 @@ function World:_buildIslands()
   table.clear(roots)
   local count = 0
 
-  for body = 1, high do
+  for _, body in movers do
     awake[body] = false
   end
 
-  for body = 1, high do
+  for _, body in movers do
     if parent[body] == 0 then continue end
 
     local root = unionRoot(parent, body)
@@ -2346,7 +2746,7 @@ function World:_buildIslands()
 
   -- Wake is an island property: an explicit impulse or meaningful impact on one member
   -- wakes every dynamically-connected member before solving.
-  for body = 1, high do
+  for _, body in movers do
     local root = parent[body]
     if root ~= 0 and awake[root] then sleeping[body] = false end
   end
@@ -2842,12 +3242,10 @@ function World:_correctPositions()
 end
 
 function World:_integrate(dt)
-  local {alive, bodyType, sleeping, invMass, ccd, pos, prevPos, linVel, angVel, force, torque, qv, qw} = self
+  local {bodyType, sleeping, invMass, ccd, pos, prevPos, linVel, angVel, force, torque, qv, qw} = self
   local {gravity, linearDamping, angularDamping} = self
 
-  for body = 1, self.high do
-    if not alive[body] then continue end
-
+  for _, body in listMovers(self) do
     local kind = bodyType[body]
 
     if kind == BODY_KINEMATIC then
@@ -3032,12 +3430,12 @@ end
 function World:_sleepIndependent(dt)
   if not self.allowSleep then return end
 
-  local {alive, bodyType, sleeping, linVel, angVel, sleepTime, sleepDelay} = self
+  local {bodyType, sleeping, linVel, angVel, sleepTime, sleepDelay} = self
   local linear, angular = self.sleepLinear * self.sleepLinear, self.sleepAngular * self.sleepAngular
   local count = 0
 
-  for body = 1, self.high do
-    if not alive[body] or bodyType[body] ~= BODY_DYNAMIC then continue end
+  for _, body in listMovers(self) do
+    if bodyType[body] ~= BODY_DYNAMIC then continue end
 
     count += 1
     if sleeping[body] then continue end
@@ -3065,15 +3463,16 @@ function World:_sleep(dt)
   if not self.allowSleep then return end
 
   local {islandParent: parent, islandCanSleep: canSleep, islandMinTime: leastRest, islandRoots: roots} = self
-  local {linVel, angVel, sleepTime, sleeping, sleepDelay, high} = self
+  local {linVel, angVel, sleepTime, sleeping, sleepDelay} = self
   local linear, angular = self.sleepLinear * self.sleepLinear, self.sleepAngular * self.sleepAngular
+  local movers = listMovers(self)
 
   for _, root in roots do
     canSleep[root] = true
     leastRest[root] = math.huge
   end
 
-  for body = 1, high do
+  for _, body in movers do
     local root = parent[body]
     if root == 0 then continue end
 
@@ -3081,7 +3480,7 @@ function World:_sleep(dt)
     if vector.dot(velocity, velocity) >= linear or vector.dot(spin, spin) >= angular then canSleep[root] = false end
   end
 
-  for body = 1, high do
+  for _, body in movers do
     local root = parent[body]
     if root == 0 then continue end
 
@@ -3096,7 +3495,7 @@ function World:_sleep(dt)
     if rested < leastRest[root] then leastRest[root] = rested end
   end
 
-  for body = 1, high do
+  for _, body in movers do
     local root = parent[body]
 
     if root ~= 0 and canSleep[root] and leastRest[root] >= sleepDelay then
@@ -3116,7 +3515,11 @@ function World:step(dt,substeps)
         self:_ccd()
         self:_collide()
         if self.trackContactEvents then self:_buildContactEvents() else self.contactEventCount=0 end
-        if self.contactCount==0 and self.jointCount==0 then
+        if self.stirring==0 and self.jointCount==0 and #self.unsettled==0 and not self.stillWasMoved then
+            -- Everything is at rest, and touches as it did: nothing is woken, joined or solved.
+            self.activeContactCount=0
+            self.warmStartedCount=0
+        elseif self.contactCount==0 and self.jointCount==0 then
             -- With no contact/joint graph every dynamic body is an independent island. Avoid
             -- building union-find state merely to rediscover that fact.
             self.activeContactCount=0
@@ -3137,8 +3540,9 @@ function World:step(dt,substeps)
             self:_sleep(h)
         end
         -- Position correction can move bodies after the collision broadphase was built.
-        -- Queries rebuild lazily only if a query is actually issued.
-        self.gridValid=false
+        -- Queries rebuild lazily only if a query is actually issued. Nothing has moved when
+        -- nothing stirred.
+        if self.stirring>0 then self.gridValid=false end
     end
     self.frame+=1
     return self.contactCount
@@ -3370,6 +3774,60 @@ function World:_raycastRaw(origin, direction, maxDistance, mask)
     end
   end
 
+  -- The static ones, through their tree. Of two struck at one distance the lower slot is the
+  -- hit, as it was when they were tested in the order of their slots.
+  local entry = self.stillRoot
+
+  if entry ~= 0 then
+    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack, stillNear: nears} = self
+    local {aabbMin, aabbMax} = self
+    local top = 0
+
+    -- The nearer half of a node first, so that what is struck there rules out the further half
+    -- before it is entered. A half no nearer than what has been struck is still entered when it
+    -- is exactly as near, for the body of a lower slot that may be in it.
+    while true do
+      if entry < 0 then
+        local distance, normal, point = raycastBody(self, -entry, origin, dir, bestDistance, mask)
+
+        if distance and (distance < bestDistance or (distance == bestDistance and bestBody and -entry < bestBody)) then
+          bestDistance, bestBody, bestNormal, bestPoint = distance, -entry, normal, point
+        end
+      else
+        local left, right = lefts[entry], rights[entry]
+        local leftAt = if left < 0
+          then rayAabbInterval(origin, dir, bestDistance, aabbMin[-left], aabbMax[-left])
+          else rayAabbInterval(origin, dir, bestDistance, lows[left], highs[left])
+        local rightAt = if right < 0
+          then rayAabbInterval(origin, dir, bestDistance, aabbMin[-right], aabbMax[-right])
+          else rayAabbInterval(origin, dir, bestDistance, lows[right], highs[right])
+
+        if leftAt and rightAt then
+          if rightAt < leftAt then
+            left, right, leftAt, rightAt = right, left, rightAt, leftAt
+          end
+
+          top += 1
+          stack[top], nears[top] = right, rightAt
+          entry = left
+          continue
+        elseif leftAt or rightAt then
+          entry = if leftAt then left else right
+          continue
+        end
+      end
+
+      while top > 0 and nears[top] > bestDistance do
+        top -= 1
+      end
+
+      if top == 0 then break end
+
+      entry = stack[top]
+      top -= 1
+    end
+  end
+
   if self.gridSmallCount == 0 then return bestBody, bestDistance, bestPoint, bestNormal end
 
   -- If the ray is effectively unbounded and oversized geometry did not cap it, a DDA could walk
@@ -3570,6 +4028,356 @@ function World:sphereCastBatchSoA(starts,ends,radii,masks,ignoreHandles,out)
     return out,count
 end
 
+-- How near a swept capsule comes to what it meets before it is said to touch it.
+local SweepSkin = 1e-3
+
+--- Gathers the triangles of a mesh or a heightfield that a ball round `centre` could touch, in
+--- world space, three corners each. Returns how many triangles.
+local function gatherTriangles(self, geom: number, centre: vector, reach: number, out: { vector }): number
+  local shape = self.shape[geom]
+  local turn, turnW, origin = self.qv[geom], self.qw[geom], self.pos[geom]
+  local inside = qInvRotate(turn, turnW, centre - origin)
+  local count = 0
+
+  local function take(first: vector, second: vector, third: vector)
+    out[count + 1] = origin + qRotate(turn, turnW, first)
+    out[count + 2] = origin + qRotate(turn, turnW, second)
+    out[count + 3] = origin + qRotate(turn, turnW, third)
+    count += 3
+  end
+
+  if shape.kind == SHAPE_HEIGHTFIELD then
+    local base = shape.origin
+    local firstColumn = clamp(math.floor((inside.X - reach - base.X) / shape.cellSizeX), 0, shape.width - 2)
+    local lastColumn = clamp(math.floor((inside.X + reach - base.X) / shape.cellSizeX), 0, shape.width - 2)
+    local firstRow = clamp(math.floor((inside.Z - reach - base.Z) / shape.cellSizeZ), 0, shape.depth - 2)
+    local lastRow = clamp(math.floor((inside.Z + reach - base.Z) / shape.cellSizeZ), 0, shape.depth - 2)
+
+    for row = firstRow, lastRow do
+      for column = firstColumn, lastColumn do
+        local near, across = heightVertex(shape, column, row), heightVertex(shape, column + 1, row + 1)
+
+        take(near, heightVertex(shape, column + 1, row), across)
+        take(near, across, heightVertex(shape, column, row + 1))
+      end
+    end
+
+    return count // 3
+  end
+
+  local cellSize = shape.cellSize
+  local firstColumn, lastColumn = math.floor((inside.X - reach) / cellSize), math.floor((inside.X + reach) / cellSize)
+  local firstRow, lastRow = math.floor((inside.Y - reach) / cellSize), math.floor((inside.Y + reach) / cellSize)
+  local firstLayer, lastLayer = math.floor((inside.Z - reach) / cellSize), math.floor((inside.Z + reach) / cellSize)
+  local cells = (lastColumn - firstColumn + 1) * (lastRow - firstRow + 1) * (lastLayer - firstLayer + 1)
+
+  if cells > self.meshQueryCellLimit then
+    for triangle = 0, shape.triangleCount - 1 do
+      take(meshTriangle(shape, triangle))
+    end
+
+    return count // 3
+  end
+
+  local epoch = self.meshMarkEpoch + 1
+  local marks, heads, nextNode, nodeTriangle = self.meshMarks, shape.heads, shape.nextNode, shape.nodeTri
+
+  self.meshMarkEpoch = epoch
+
+  for column = firstColumn, lastColumn do
+    for row = firstRow, lastRow do
+      for layer = firstLayer, lastLayer do
+        local key = packCell(column, row, layer)
+        local node = key and heads[key] or 0
+
+        while node ~= 0 do
+          local triangle = nodeTriangle[node]
+
+          if marks[triangle] ~= epoch then
+            marks[triangle] = epoch
+            take(meshTriangle(shape, triangle))
+          end
+
+          node = nextNode[node]
+        end
+      end
+    end
+  end
+
+  for _, triangle in shape.overflow do
+    if marks[triangle] == epoch then continue end
+
+    marks[triangle] = epoch
+    take(meshTriangle(shape, triangle))
+  end
+
+  return count // 3
+end
+
+--- Sweeps an upright capsule along `motion` at a primitive, or at a triangle when `target` is
+--- nil, no further than the fraction `limit`. Returns the fraction at which they touch, the
+--- normal there, which points at the capsule, and the point on what was met; or nil.
+---
+--- Both are convex, so the capsule can close on the other no faster than it moves along the line
+--- between their nearest points: it is advanced by the gap over that speed until there is no gap,
+--- and is past it for good once it is not closing. A capsule that starts inside is met at once,
+--- unless it is on its way out.
+local function sweepCapsule(
+  capsule,
+  start: vector,
+  motion: vector,
+  length: number,
+  limit: number,
+  target,
+  at: vector?,
+  turn: vector?,
+  turnW: number?,
+  first: vector?,
+  second: vector?,
+  third: vector?
+): (number?, vector?, vector?)
+  local fraction = 0
+  local normal, point
+
+  for _ = 1, 32 do
+    local centre = start + motion * fraction
+    local reach = length * (limit - fraction) + SweepSkin
+    local met, depth
+
+    if target then
+      met, normal, point, depth = collidePrimitives(capsule, centre, ZERO, 1, target, at, turn, turnW, reach)
+    else
+      met, normal, point, depth = capsuleTriangle(centre, ZERO, 1, capsule.radius, capsule.halfHeight, first, second, third, reach)
+    end
+
+    if not met then return nil end
+
+    -- Motion along a surface is not into it, to within what the arithmetic can tell.
+    local closing = vector.dot(motion, normal)
+    if closing <= length * 1e-4 then return nil end
+    if -depth <= SweepSkin then return fraction, ZERO - normal, point end
+
+    fraction += (-depth - SweepSkin * 0.5) / closing
+    if fraction >= limit then return nil end
+  end
+
+  -- Thirty-two advances and still closing on it: it is no nearer than this, which is safe to
+  -- take as where they meet.
+  return fraction, ZERO - normal, point
+end
+
+function World:_capsuleCastRaw(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
+  assert(
+    typeof(startPos) == 'vector'
+      and typeof(endPos) == 'vector'
+      and type(radius) == 'number'
+      and radius > 0
+      and type(halfHeight) == 'number'
+      and halfHeight >= 0,
+    'physik.capsuleCast: expected start/end vectors, radius > 0 and half height >= 0'
+  )
+
+  local motion = endPos - startPos
+  local length = vector.magnitude(motion)
+  if not (length > EPS) then return nil end
+
+  mask = if mask == nil then 0xffffffff else mask
+
+  local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
+  local reach = vector.create(radius, halfHeight + radius, radius)
+  local handles, count = self:queryAabb(vector.min(startPos, endPos) - reach, vector.max(startPos, endPos) + reach, mask, self.castCandidates)
+
+  self.castCandidates = handles
+
+  return self:_capsuleCastAmong(handles, count, startPos, motion, length, radius, halfHeight, ignored)
+end
+
+--- Sweeps an upright capsule at the bodies a box query has just answered with, which is how
+--- something that sweeps several times in one place, as a character does, asks the world once.
+--- `ignored` is a slot, not a handle. Returns as `_capsuleCastRaw` does.
+function World:_capsuleCastAmong(handles, count, startPos, motion, length, radius, halfHeight, ignored)
+  local {shape, pos, qv, qw, aabbMin, aabbMax, castCapsule: capsule, castTriangles: triangles} = self
+  local reach = vector.create(radius, halfHeight + radius, radius)
+  local heading = motion / length
+  local bestFraction = 1
+  local bestNormal, bestPoint, bestBody
+
+  capsule.radius, capsule.halfHeight = radius, halfHeight
+
+  for index = 1, count do
+    -- A handle the query has just written is current, and its low bits are the body's slot.
+    local body = handles[index] % HANDLE_STRIDE
+    if body == ignored then continue end
+
+    local target = shape[body]
+    local kind = target.kind
+    local fraction, normal, point
+
+    -- The capsule's centre has to come within the capsule's own reach of a body's box, and
+    -- sooner than what has been met already. A sphere's box is not kept as it moves.
+    if
+      kind ~= SHAPE_SPHERE
+      and not rayAabbInterval(startPos, heading, length * bestFraction, aabbMin[body] - reach, aabbMax[body] + reach)
+    then
+      continue
+    end
+
+    if kind == SHAPE_MESH or kind == SHAPE_HEIGHTFIELD then
+      local gathered = gatherTriangles(self, body, startPos + motion * 0.5, length * 0.5 + halfHeight + radius, triangles)
+
+      for corner = 1, gathered * 3, 3 do
+        local limit = fraction or bestFraction
+        local nearer, facing, touched = sweepCapsule(
+          capsule, startPos, motion, length, limit, nil, nil, nil, nil, triangles[corner], triangles[corner + 1], triangles[corner + 2]
+        )
+
+        if nearer then
+          fraction, normal, point = nearer, facing, touched
+        end
+      end
+    elseif kind == SHAPE_COMPOUND then
+      local at, turn, turnW = pos[body], qv[body], qw[body]
+
+      for piece = 1, target.count do
+        local pieceTurn, pieceTurnW = qMul(turn, turnW, target.qv[piece], target.qw[piece])
+        local nearer, facing, touched = sweepCapsule(
+          capsule,
+          startPos,
+          motion,
+          length,
+          fraction or bestFraction,
+          target.shapes[piece],
+          at + qRotate(turn, turnW, target.positions[piece]),
+          pieceTurn,
+          pieceTurnW
+        )
+
+        if nearer then
+          fraction, normal, point = nearer, facing, touched
+        end
+      end
+    else
+      fraction, normal, point = sweepCapsule(capsule, startPos, motion, length, bestFraction, target, pos[body], qv[body], qw[body])
+    end
+
+    if fraction and fraction < bestFraction then
+      bestFraction, bestNormal, bestPoint, bestBody = fraction, normal, point, body
+    end
+  end
+
+  if not bestBody then return nil end
+
+  return bestBody, bestFraction, bestNormal, bestPoint
+end
+
+--- Sweeps an upright capsule, its axis along Y, from one place to another. `radius` is the
+--- capsule's and `halfHeight` is half the length of its axis, as `physik.capsule` takes them.
+--- Returns nil when nothing is in the way, and otherwise what was met first: where the capsule's
+--- centre is when they touch, the point on what was met, and the normal there, which points at the
+--- capsule. A capsule that starts inside something meets it at a fraction of 0, unless it is on
+--- its way out.
+function World:capsuleCast(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
+  local body, fraction, normal, point = self:_capsuleCastRaw(startPos, endPos, radius, halfHeight, mask, ignoreHandle)
+  if not body then return nil end
+
+  local motion = endPos - startPos
+
+  return {
+    handle = makeHandle(body, self.generation[body]),
+    fraction = fraction,
+    distance = vector.magnitude(motion) * fraction,
+    center = startPos + motion * fraction,
+    point = point,
+    normal = normal,
+    userData = self.userData[body],
+  }
+end
+
+--- Writes what an upright capsule at `position` overlaps as columns of `out`: `handles`,
+--- `normals`, which point at the capsule, `depths` and `points`. A mesh or a heightfield gives one
+--- row for each triangle touched, and a compound one for each piece. Returns `out` and how many.
+function World:capsuleContacts(position, radius, halfHeight, mask, ignoreHandle, out)
+  assert(
+    typeof(position) == 'vector' and type(radius) == 'number' and radius > 0 and type(halfHeight) == 'number' and halfHeight >= 0,
+    'physik.capsuleContacts: expected a position vector, radius > 0 and half height >= 0'
+  )
+
+  mask = if mask == nil then 0xffffffff else mask
+  out = out or {}
+
+  local ignored = if ignoreHandle ~= nil then self:_check(ignoreHandle) else nil
+  local reach = vector.create(radius, halfHeight + radius, radius)
+  local found, count = self:queryAabb(position - reach, position + reach, mask, self.castCandidates)
+
+  self.castCandidates = found
+
+  return self:_capsuleContactsAmong(found, count, position, radius, halfHeight, ignored, out)
+end
+
+--- What an upright capsule overlaps of the bodies a box query has just answered with. `ignored`
+--- is a slot, not a handle. Returns as `capsuleContacts` does.
+function World:_capsuleContactsAmong(found, count, position, radius, halfHeight, ignored, out)
+  local {shape, pos, qv, qw, castCapsule: capsule, castTriangles: triangles} = self
+  local handles, normals, depths, points = out.handles or {}, out.normals or {}, out.depths or {}, out.points or {}
+  local rows = 0
+
+  capsule.radius, capsule.halfHeight = radius, halfHeight
+  out.handles, out.normals, out.depths, out.points = handles, normals, depths, points
+
+  for index = 1, count do
+    local handle = found[index]
+    local body = handle % HANDLE_STRIDE
+    if body == ignored then continue end
+
+    local target = shape[body]
+    local kind = target.kind
+
+    if kind == SHAPE_MESH or kind == SHAPE_HEIGHTFIELD then
+      local gathered = gatherTriangles(self, body, position, halfHeight + radius, triangles)
+
+      for corner = 1, gathered * 3, 3 do
+        local met, normal, point, depth = capsuleTriangle(
+          position, ZERO, 1, radius, halfHeight, triangles[corner], triangles[corner + 1], triangles[corner + 2], 0
+        )
+
+        if met and depth > 0 then
+          rows += 1
+          handles[rows], normals[rows], depths[rows], points[rows] = handle, ZERO - normal, depth, point
+        end
+      end
+    elseif kind == SHAPE_COMPOUND then
+      local at, turn, turnW = pos[body], qv[body], qw[body]
+
+      for piece = 1, target.count do
+        local pieceTurn, pieceTurnW = qMul(turn, turnW, target.qv[piece], target.qw[piece])
+        local met, normal, point, depth = collidePrimitives(
+          capsule, position, ZERO, 1, target.shapes[piece], at + qRotate(turn, turnW, target.positions[piece]), pieceTurn, pieceTurnW, 0
+        )
+
+        if met and depth > 0 then
+          rows += 1
+          handles[rows], normals[rows], depths[rows], points[rows] = handle, ZERO - normal, depth, point
+        end
+      end
+    else
+      local met, normal, point, depth = collidePrimitives(capsule, position, ZERO, 1, target, pos[body], qv[body], qw[body], 0)
+
+      if met and depth > 0 then
+        rows += 1
+        handles[rows], normals[rows], depths[rows], points[rows] = handle, ZERO - normal, depth, point
+      end
+    end
+  end
+
+  for index = #handles, rows + 1, -1 do
+    handles[index], normals[index], depths[index], points[index] = nil, nil, nil, nil
+  end
+
+  out.count = rows
+
+  return out, rows
+end
+
 function World:raycast(origin,direction,maxDistance,mask)
     local i,t,p,n=self:_raycastRaw(origin,direction,maxDistance,mask)
     if not i then return nil end
@@ -3698,6 +4506,51 @@ local function queryAabbGrid(
       out[count] = makeHandle(body, generation[body])
     end
   end
+
+  -- The static ones, through their tree.
+  local entry = self.stillRoot
+
+  if entry ~= 0 then
+    local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = self
+    local top = 0
+
+    while true do
+      if entry < 0 then
+        local body = -entry
+
+        if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(self, body, low, high) then
+          count += 1
+          out[count] = makeHandle(body, generation[body])
+        end
+      else
+        local nodeLow, nodeHigh = lows[entry], highs[entry]
+
+        if
+          not (
+            low.X > nodeHigh.X
+            or high.X < nodeLow.X
+            or low.Y > nodeHigh.Y
+            or high.Y < nodeLow.Y
+            or low.Z > nodeHigh.Z
+            or high.Z < nodeLow.Z
+          )
+        then
+          top += 1
+          stack[top] = rights[entry]
+          entry = lefts[entry]
+          continue
+        end
+      end
+
+      if top == 0 then break end
+
+      entry = stack[top]
+      top -= 1
+    end
+  end
+
+  -- A grid with nothing in it has no cells to walk.
+  if self.gridSmallCount == 0 then return count end
 
   -- Where every cell of the range can be packed, a cell's key is one more than the key before it.
   local packable = firstColumn >= -CELL_OFFSET
@@ -3868,6 +4721,7 @@ function World:applyTransforms(data,wake)
         if ang and ang[n] then self.angVel[i]=ang[n] end
         self.prevPos[i]=self.pos[i]
         self:_updateAabb(i)
+        if self.bodyType[i]==BODY_STATIC then self:_unsettle(i) end
         if wake~=false and self.bodyType[i]==BODY_DYNAMIC then self.sleeping[i]=false;self.sleepTime[i]=0 end
     end
     -- Topology is unchanged, but authoritative teleports invalidate persistent anchors and query cells.
@@ -4014,6 +4868,12 @@ function M.newWorld(opts)
     w.gridOccupied = buffer.create(GridFilterSize)
     w.gridDenseKeys={};w.gridPairA={};w.gridPairB={};w.gridDenseCount=0;w.gridPairCount=0
     w.gridTopologyReady=false;w.gridTopologyDirty=true
+    w.stillDirty=true;w.stillRoot=0;w.movers={};w.moversDirty=true
+    w.nearStill={};w.nearLow={};w.nearHigh={};w.nearEpoch={};w.stillEpoch=0
+    w.unseen={}
+    w.stirring=0;w.stillWasMoved=false;w.quiet=false;w.changed=true
+    w.rest={};w.unsettled={};w.seenPos={};w.seenTurn={};w.seenTurnW={}
+    w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={};w.stillNear={}
     w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
     w.frame=0
     w.cacheEpoch=0
@@ -4023,6 +4883,7 @@ function M.newWorld(opts)
     w.aliveCount=0
     w.free={}
     w.order={}
+    w.inOrder={}
     w.generation={}
     w.alive={}
     w.bodyType={}
@@ -4075,6 +4936,7 @@ function M.newWorld(opts)
     w.firstPieceCentres, w.firstPieceTurns, w.firstPieceTurnWs = {}, {}, {}
     w.secondPieceCentres, w.secondPieceTurns, w.secondPieceTurnWs = {}, {}, {}
     w.meshMarks={};w.meshMarkEpoch=0
+    w.castCapsule={kind=SHAPE_CAPSULE,radius=0,halfHeight=0};w.castTriangles={}
     w.islandParent={};w.islandSize={};w.islandAwake={};w.islandRoots={};w.islandCanSleep={};w.islandMinTime={}
     w.joints={};w.jointNoCollide={};w.nextJoint=1;w.jointCount=0
     return w
