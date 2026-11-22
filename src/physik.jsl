@@ -1328,6 +1328,7 @@ function World:addBody(desc)
     self.gridTopologyDirty=true
     self.gridKey[i]=nil
     self.rest[i],self.seenPos[i]=false,nil
+    self.nearEpoch[i]=0
     if kind==BODY_STATIC then
         self.stillDirty=true
         table.insert(self.unsettled,i)
@@ -2106,6 +2107,9 @@ local function buildStill(self, members: { number }): number
   return node
 end
 
+-- How much bigger than a body the box is that the tree of static bodies is asked about for it.
+local NearPad = vector.create(0.3, 0.3, 0.3)
+
 --- The bodies that are not static, in the order of their slots: what a step has to visit. A
 --- level is mostly static bodies, and a step that asked each of them whether it moves would
 --- spend its time on that.
@@ -2148,6 +2152,7 @@ function World:_rebuildStill()
   self.stillNodeCount = 0
   self.stillRoot = if #members == 0 then 0 else buildStill(self, members)
   self.stillDirty = false
+  self.stillEpoch += 1
 end
 
 function World:_buildGridIndex(refreshAabbs, resting)
@@ -2285,6 +2290,10 @@ end
 function World:_collideGrid()
   self:_buildGridIndex(true, true)
   local {gridHeads: heads, gridNext: nextIn, gridDenseKeys: dense, gridPairA: pairA, gridPairB: pairB} = self
+  local {sphereRadius: radii, aabbMin: lows, aabbMax: highs} = self
+
+  -- In a heap most of the pairs a cell offers are apart, and two bodies that are not spheres are
+  -- told apart here by their boxes, without the call: a sphere's box is not kept as it moves.
 
   -- Same-cell pairs only exist in cells cached as non-singleton during the most recent topology
   -- rebuild. Their body membership is stable until a center crosses a cell boundary.
@@ -2294,9 +2303,27 @@ function World:_collideGrid()
     while first ~= 0 do
       local second = nextIn[first] or 0
 
-      while second ~= 0 do
-        tryPair(self, first, second)
-        second = nextIn[second] or 0
+      if radii[first] then
+        while second ~= 0 do
+          tryPair(self, first, second)
+          second = nextIn[second] or 0
+        end
+      else
+        local low, high = lows[first], highs[first]
+
+        while second ~= 0 do
+          local other = second
+          second = nextIn[second] or 0
+
+          if not radii[other] then
+            local otherLow, otherHigh = lows[other], highs[other]
+            if otherLow.X > high.X or otherHigh.X < low.X then continue end
+            if otherLow.Y > high.Y or otherHigh.Y < low.Y then continue end
+            if otherLow.Z > high.Z or otherHigh.Z < low.Z then continue end
+          end
+
+          tryPair(self, first, other)
+        end
       end
 
       first = nextIn[first] or 0
@@ -2312,9 +2339,27 @@ function World:_collideGrid()
     while first ~= 0 do
       local second = head
 
-      while second ~= 0 do
-        tryPair(self, first, second)
-        second = nextIn[second] or 0
+      if radii[first] then
+        while second ~= 0 do
+          tryPair(self, first, second)
+          second = nextIn[second] or 0
+        end
+      else
+        local low, high = lows[first], highs[first]
+
+        while second ~= 0 do
+          local other = second
+          second = nextIn[second] or 0
+
+          if not radii[other] then
+            local otherLow, otherHigh = lows[other], highs[other]
+            if otherLow.X > high.X or otherHigh.X < low.X then continue end
+            if otherLow.Y > high.Y or otherHigh.Y < low.Y then continue end
+            if otherLow.Z > high.Z or otherHigh.Z < low.Z then continue end
+          end
+
+          tryPair(self, first, other)
+        end
       end
 
       first = nextIn[first] or 0
@@ -2330,6 +2375,7 @@ function World:_collideGrid()
     local {sphereRadius: radii, pos, aabbMin, aabbMax} = self
     local margin = self.contactMargin
     local rest, stillSettled = self.rest, #self.unsettled == 0
+    local {nearStill, nearLow: nearLows, nearHigh: nearHighs, nearEpoch: nearEpochs, stillEpoch: epoch} = self
 
     for _, body in movers do
       -- A body at rest touches the static bodies it did, unless one of those has been moved.
@@ -2352,35 +2398,68 @@ function World:_collideGrid()
         low, high = aabbMin[body], aabbMax[body]
       end
 
-      local entry, top = root, 0
+      -- The tree is asked about a box a little bigger than the body's, and the answer is kept
+      -- until the body leaves that box or the tree changes: most steps a body is offered the
+      -- few static bodies it was near last step, in the order the tree gave them.
+      local near = nearStill[body]
+      local nearLow, nearHigh = nearLows[body], nearHighs[body]
 
-      while true do
-        if entry < 0 then
-          tryPair(self, -entry, body)
-        else
-          local nodeLow, nodeHigh = lows[entry], highs[entry]
-
-          if
-            not (
-              low.X > nodeHigh.X
-              or high.X < nodeLow.X
-              or low.Y > nodeHigh.Y
-              or high.Y < nodeLow.Y
-              or low.Z > nodeHigh.Z
-              or high.Z < nodeLow.Z
-            )
-          then
-            top += 1
-            stack[top] = rights[entry]
-            entry = lefts[entry]
-            continue
-          end
+      if
+        nearEpochs[body] ~= epoch
+        or low.X < nearLow.X
+        or low.Y < nearLow.Y
+        or low.Z < nearLow.Z
+        or high.X > nearHigh.X
+        or high.Y > nearHigh.Y
+        or high.Z > nearHigh.Z
+      then
+        if not near then
+          near = {}
+          nearStill[body] = near
         end
 
-        if top == 0 then break end
+        low, high = low - NearPad, high + NearPad
+        nearLows[body], nearHighs[body], nearEpochs[body] = low, high, epoch
 
-        entry = stack[top]
-        top -= 1
+        local entry, top, count = root, 0, 0
+
+        while true do
+          if entry < 0 then
+            count += 1
+            near[count] = -entry
+          else
+            local nodeLow, nodeHigh = lows[entry], highs[entry]
+
+            if
+              not (
+                low.X > nodeHigh.X
+                or high.X < nodeLow.X
+                or low.Y > nodeHigh.Y
+                or high.Y < nodeLow.Y
+                or low.Z > nodeHigh.Z
+                or high.Z < nodeLow.Z
+              )
+            then
+              top += 1
+              stack[top] = rights[entry]
+              entry = lefts[entry]
+              continue
+            end
+          end
+
+          if top == 0 then break end
+
+          entry = stack[top]
+          top -= 1
+        end
+
+        for index = #near, count + 1, -1 do
+          near[index] = nil
+        end
+      end
+
+      for _, still in near do
+        tryPair(self, still, body)
       end
     end
   end
@@ -4664,6 +4743,7 @@ function M.newWorld(opts)
     w.gridDenseKeys={};w.gridPairA={};w.gridPairB={};w.gridDenseCount=0;w.gridPairCount=0
     w.gridTopologyReady=false;w.gridTopologyDirty=true
     w.stillDirty=true;w.stillRoot=0;w.movers={};w.moversDirty=true
+    w.nearStill={};w.nearLow={};w.nearHigh={};w.nearEpoch={};w.stillEpoch=0
     w.rest={};w.unsettled={};w.seenPos={};w.seenTurn={};w.seenTurnW={}
     w.stillLow={};w.stillHigh={};w.stillLeft={};w.stillRight={};w.stillStack={}
     w.gridValid=false;w.gridSmallCount=0;w.queryMarks={};w.queryMarkEpoch=0;w.castCandidates={}
