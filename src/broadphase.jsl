@@ -420,10 +420,16 @@ local function buildStill(state: State, members: { number }): number
     elseif spread.y >= spread.z then vector.create(0, 1, 0)
     else vector.create(0, 0, 1)
 
+  -- Where each centre is along it, worked out once a body rather than once a comparison.
+  local centres = state.stillCentres
+
+  for _, body in members do
+    centres[body] = vector.dot(boundsLow[body] + boundsHigh[body], along)
+  end
+
   -- Bodies whose centres are level, or are not numbers, stay in the order of their slots.
   table.sort(members, function(first: number, second: number)
-    local firstCentre = vector.dot(boundsLow[first] + boundsHigh[first], along)
-    local secondCentre = vector.dot(boundsLow[second] + boundsHigh[second], along)
+    local firstCentre, secondCentre = centres[first], centres[second]
     if firstCentre < secondCentre then return true end
     if secondCentre < firstCentre then return false end
 
