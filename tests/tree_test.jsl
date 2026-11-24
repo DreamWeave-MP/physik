@@ -1,0 +1,404 @@
+local character = require('@dream/physik/character')
+local physik = require('@dream/physik')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+type World = physik.World
+type Random = (low: number, high: number) -> number
+
+-- Both ways a world finds its pairs: a case that holds for one is run for the other.
+local Broadphases: { 'grid' | 'sap' } = { 'grid', 'sap' }
+
+--- A source of numbers in [low, high), the same ones for the same seed everywhere.
+local function generator(seed: number): Random
+  local state = seed
+
+  return function(low: number, high: number): number
+    state = bit32.band(state * 1664525 + 1013904223, 0xffffffff)
+
+    return low + (high - low) * (state / 4294967296)
+  end
+end
+
+local function pick(random: Random, count: number): number
+  return math.min(count, 1 + math.floor(random(0, count)))
+end
+
+local function pin(value: number): string
+  return string.format('%.17g', value)
+end
+
+local function pinVector(value: vector): string
+  return `{pin(value.x)} {pin(value.y)} {pin(value.z)}`
+end
+
+--- Has the tree of a world's static bodies built again from nothing when it is next asked
+--- about, as an empty tree always is. A question looks at the tree only when the grid is to be
+--- looked over again.
+local function fromScratch(world: World)
+  world.stillRoot = 0
+  world.stillDirty = true
+  world.gridValid = false
+end
+
+--- Checks the tree of a world's static bodies is whole: every node hangs from the node it says
+--- it does and is exactly the box round its children and one taller than the taller of them, and
+--- the bodies in it are the world's static bodies, each once. Returns how tall it is and how many
+--- bodies are in it.
+local function inspect(world: World): (number, number)
+  local seen: { [number]: boolean } = {}
+  local leaves = 0
+
+  local function walk(entry: number, parent: number): (vector, vector, number)
+    if entry < 0 then
+      local body = -entry
+
+      expect(seen[body]).toBe(nil)
+      expect(world.stillLeafParent[body]).toBe(parent)
+      seen[body] = true
+      leaves += 1
+
+      return world.boundsLow[body], world.boundsHigh[body], 0
+    end
+
+    expect(world.stillParent[entry]).toBe(parent)
+
+    local leftLow, leftHigh, leftHeight = walk(world.stillLeft[entry], entry)
+    local rightLow, rightHigh, rightHeight = walk(world.stillRight[entry], entry)
+    local height = 1 + math.max(leftHeight, rightHeight)
+
+    expect(world.stillLow[entry]).toBe(vector.min(leftLow, rightLow))
+    expect(world.stillHigh[entry]).toBe(vector.max(leftHigh, rightHigh))
+    expect(world.stillHeight[entry]).toBe(height)
+
+    return world.stillLow[entry], world.stillHigh[entry], height
+  end
+
+  local height = 0
+  if world.stillRoot ~= 0 then height = select(3, walk(world.stillRoot, 0)) end
+
+  for body = 1, world.high do
+    expect(seen[body] == true).toBe(world.alive[body] and world.bodyType[body] == 'static')
+  end
+
+  expect(world.stillCount).toBe(leaves)
+
+  return height, leaves
+end
+
+--- Fails at the first line two accounts of a world differ in, naming it.
+local function sameLines(actual: string, expected: string, what: string)
+  local actualLines, expectedLines = string.split(actual, '\n'), string.split(expected, '\n')
+
+  for index = 1, math.max(#actualLines, #expectedLines) do
+    if actualLines[index] == expectedLines[index] then continue end
+
+    error(`{what}, line {index}: {actualLines[index] or 'nothing'}, where built from nothing: {expectedLines[index] or 'nothing'}`, 2)
+  end
+end
+
+--- Brings the tree up to date without stepping: a question is answered from it.
+local function settleTree(world: World)
+  world:queryAabb(vector.create(0, 0, 0), vector.create(0, 0, 0))
+end
+
+local function randomStatic(world: World, random: Random): number
+  local kind = pick(random, 3)
+  local at = vector.create(random(-24, 24), random(-1, 3), random(-24, 24))
+  local rotation = physik.quat(random(-1, 1), random(-1, 1), random(-1, 1), random(0.2, 1))
+  local shape = if kind == 1
+    then physik.box(vector.create(random(0.3, 2), random(0.2, 1), random(0.3, 2)))
+    elseif kind == 2 then physik.capsule(random(0.2, 0.6), random(0.3, 3))
+    else physik.sphere(random(0.3, 1.5))
+
+  return world:addBody({ type = 'static', shape = shape, position = at, rotation = rotation })
+end
+
+local function randomMover(world: World, random: Random): number
+  local shape = if random(0, 1) < 0.5
+    then physik.sphere(random(0.2, 0.5))
+    else physik.box(vector.create(random(0.2, 0.4), random(0.2, 0.4), random(0.2, 0.4)))
+
+  return world:addBody({
+    shape = shape,
+    position = vector.create(random(-20, 20), random(2, 6), random(-20, 20)),
+    velocity = vector.create(random(-3, 3), random(-2, 0), random(-3, 3)),
+  })
+end
+
+--- Everything a world says about where its bodies are and what touches what, to the bit.
+local function stepped(world: World): string
+  local lines = {}
+
+  for _, contact in world:contacts() do
+    table.insert(
+      lines,
+      `{contact.first} {contact.second} {pinVector(contact.normal)} {pinVector(contact.point)} `
+        .. `{pin(contact.penetration)} {pin(contact.normalImpulse)}`
+    )
+  end
+
+  local state, count = world:writeTransforms({})
+
+  for index = 1, count do
+    table.insert(lines, `{state.handles[index]} {pinVector(state.positions[index])} {pinVector(state.velocities[index])}`)
+  end
+
+  local stats = world:stats()
+  table.insert(lines, `{stats.contacts} {stats.candidates} {stats.manifolds}`)
+
+  return table.concat(lines, '\n')
+end
+
+--- What a world answers to rays, boxes, sweeps and overlaps about the same places, to the bit.
+local function answered(world: World, seed: number): string
+  local random = generator(seed)
+  local lines = {}
+
+  for _ = 1, 48 do
+    local origin = vector.create(random(-26, 26), random(-2, 8), random(-26, 26))
+    local direction = vector.create(random(-1, 1), random(-1, 0.3), random(-1, 1))
+    local hit = world:raycast(origin, direction, 40)
+
+    if hit then
+      table.insert(lines, `ray {hit.handle} {pin(hit.distance)} {pinVector(hit.point)} {pinVector(hit.normal)}`)
+    else
+      table.insert(lines, 'ray none')
+    end
+
+    local centre = vector.create(random(-24, 24), random(-1, 3), random(-24, 24))
+    local reach = vector.create(random(0.5, 6), random(0.5, 3), random(0.5, 6))
+    local handles, count = world:queryAabb(centre - reach, centre + reach)
+
+    table.insert(lines, `box {table.concat(handles, ' ', 1, count)}`)
+
+    local finish = origin + direction * 12
+    local cast = world:sphereCast(origin, finish, 0.4)
+
+    if cast then
+      table.insert(lines, `sphere {cast.handle} {pin(cast.fraction)} {pinVector(cast.point)} {pinVector(cast.normal)}`)
+    else
+      table.insert(lines, 'sphere none')
+    end
+
+    local swept = world:capsuleCast(origin, origin + vector.create(direction.x, 0, direction.z) * 12, 0.4, 0.5)
+
+    if swept then
+      table.insert(lines, `capsule {swept.handle} {pin(swept.fraction)} {pinVector(swept.point)} {pinVector(swept.normal)}`)
+    else
+      table.insert(lines, 'capsule none')
+    end
+
+    local overlaps = world:capsuleContacts(centre, 0.6, 0.8)
+    local touched = {}
+
+    for index = 1, overlaps.count do
+      table.insert(touched, `{overlaps.handles[index]} {pin(overlaps.depths[index])} {pinVector(overlaps.normals[index])}`)
+    end
+
+    table.insert(lines, `overlaps {table.concat(touched, ', ')}`)
+  end
+
+  return table.concat(lines, '\n')
+end
+
+--- Two worlds told the same things, seeded: the first keeps its tree of static bodies up to date
+--- as they are added, removed and moved, and the second has it built again from nothing before
+--- every question and every step. Each round adds static bodies, takes some out, moves and turns
+--- others, throws in a body that can move now and then, steps both, walks a character through
+--- both, which has to come out in the same place in each, and asks both the same questions. Calls `each` with both worlds after every round.
+local function twins(broadphase: 'grid' | 'sap', seed: number, rounds: number, each: (World, World, number) -> ())
+  local kept, rebuilt = physik.newWorld({ broadphase = broadphase }), physik.newWorld({ broadphase = broadphase })
+  local random = generator(seed)
+  local statics: { number } = {}
+
+  -- The two worlds are told the same things in the same order, so their bodies are in the same
+  -- slots and have the same handles.
+  local function both(act: (World) -> ())
+    act(kept)
+    fromScratch(rebuilt)
+    act(rebuilt)
+  end
+
+  for _ = 1, 40 do
+    local handle = randomStatic(kept, generator(seed + #statics))
+    randomStatic(rebuilt, generator(seed + #statics))
+    table.insert(statics, handle)
+  end
+
+  local walkers = {
+    character.new(kept, { radius = 0.4, height = 1.8, position = vector.create(0, 4, 0) }),
+    character.new(rebuilt, { radius = 0.4, height = 1.8, position = vector.create(0, 4, 0) }),
+  }
+
+  for round = 1, rounds do
+    local changes = generator(seed * 31 + round)
+
+    for _ = 1, pick(random, 12) do
+      local salt, handle = math.floor(random(0, 1e6)), 0
+
+      both(function(world: World)
+        handle = randomStatic(world, generator(salt))
+      end)
+
+      table.insert(statics, handle)
+    end
+
+    for _ = 1, pick(random, 8) do
+      if #statics < 2 then break end
+
+      local index = pick(changes, #statics)
+      local handle = table.remove(statics, index) :: number
+
+      both(function(world: World)
+        world:removeBody(handle)
+      end)
+    end
+
+    for _ = 1, pick(random, 6) do
+      local handle = statics[pick(changes, #statics)]
+      local to = vector.create(random(-24, 24), random(-1, 3), random(-24, 24))
+      local turn = physik.quat(random(-1, 1), random(-1, 1), random(-1, 1), random(0.2, 1))
+
+      both(function(world: World)
+        world:setPosition(handle, to)
+        world:setRotation(handle, turn)
+      end)
+    end
+
+    if round % 3 == 1 then
+      local salt = math.floor(random(0, 1e6))
+
+      both(function(world: World)
+        randomMover(world, generator(salt))
+      end)
+    end
+
+    if round % 7 == 0 then
+      local delta = vector.create(random(-4, 4), random(-1, 1), random(-4, 4))
+
+      both(function(world: World)
+        world:shiftOrigin(delta)
+      end)
+    end
+
+    both(function(world: World)
+      world:step(1 / 60)
+    end)
+
+    local heading = vector.create(math.sin(round) * 0.2, -0.05, math.cos(round * 0.7) * 0.2)
+
+    for index, world in { kept, rebuilt } do
+      if world == rebuilt then fromScratch(world) end
+      character.move(walkers[index], heading)
+    end
+
+    expect(pinVector(walkers[1].position)).toBe(pinVector(walkers[2].position))
+    expect(walkers[1].grounded).toBe(walkers[2].grounded)
+
+    each(kept, rebuilt, round)
+  end
+end
+
+suite.describe('the tree of static bodies', function()
+  for _, broadphase in Broadphases do
+    suite.it(`kept up to date answers and steps as one built from nothing does, by {broadphase}`, function()
+      for seed = 1, 3 do
+        twins(broadphase, seed, 30, function(kept: World, rebuilt: World, round: number)
+          sameLines(stepped(kept), stepped(rebuilt), `seed {seed}, round {round}, stepped`)
+
+          local answers = answered(kept, seed * 1000 + round)
+          fromScratch(rebuilt)
+          sameLines(answers, answered(rebuilt, seed * 1000 + round), `seed {seed}, round {round}, answered`)
+
+          inspect(kept)
+          inspect(rebuilt)
+        end)
+      end
+    end)
+  end
+
+  suite.it('stays shallow when bodies are added one at a time in a line, and taken out again', function()
+    local world = physik.newWorld()
+    local handles = {}
+
+    for index = 1, 2048 do
+      table.insert(
+        handles,
+        world:addBody({ type = 'static', shape = physik.box(vector.create(0.4, 0.4, 0.4)), position = vector.create(index, 0, 0) })
+      )
+
+      settleTree(world)
+    end
+
+    local height, count = inspect(world)
+    expect(count).toBe(2048)
+
+    -- An AVL tree of 2,048 is no taller than 1.44 times eleven, and a list of them is 2,047.
+    expect(height <= 16).toBe(true)
+
+    for index = 1, 2048, 2 do
+      world:removeBody(handles[index])
+      settleTree(world)
+    end
+
+    height, count = inspect(world)
+    expect(count).toBe(1024)
+    expect(height <= 15).toBe(true)
+  end)
+
+  suite.it('stays shallow under bodies added, moved and taken out at random', function()
+    local world = physik.newWorld()
+    local random = generator(5)
+    local handles = {}
+
+    for _ = 1, 64 do
+      table.insert(handles, randomStatic(world, random))
+    end
+
+    for _ = 1, 3000 do
+      local roll = random(0, 1)
+
+      if roll < 0.45 then
+        table.insert(handles, randomStatic(world, random))
+      elseif roll < 0.7 and #handles > 1 then
+        world:removeBody(table.remove(handles, pick(random, #handles)) :: number)
+      else
+        world:setPosition(handles[pick(random, #handles)], vector.create(random(-200, 200), random(-5, 5), random(-200, 200)))
+      end
+
+      if roll < 0.2 then settleTree(world) end
+    end
+
+    settleTree(world)
+
+    local height, count = inspect(world)
+    expect(count).toBe(#handles)
+    expect(height <= 2 * math.ceil(math.log(count, 2))).toBe(true)
+  end)
+
+  suite.it('is built again from nothing when more has changed than is in it', function()
+    local world = physik.newWorld()
+    local random = generator(8)
+
+    for _ = 1, 10 do
+      randomStatic(world, random)
+    end
+
+    settleTree(world)
+    expect(world.stillNodeCount).toBe(9)
+
+    -- Eleven more into a tree of ten: built again, its nodes numbered from the first.
+    for _ = 1, 11 do
+      randomStatic(world, random)
+    end
+
+    settleTree(world)
+    expect(world.stillNodeCount).toBe(20)
+    expect(#world.stillFree).toBe(0)
+    inspect(world)
+  end)
+end)
+
+return suite
