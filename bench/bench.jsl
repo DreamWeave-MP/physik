@@ -81,6 +81,9 @@ local Expected: { [string]: string } = {
   ['level: 256 capsules swept among 1,024 static boxes'] = '142 met, 930.984696956682 far',
   ['level: a character run 240 steps among 1,024 static boxes'] = '240 grounded, at 29.093298554420471',
   ['level: 48 boxes asleep among 1,024 static ones, 60 steps'] = '10260 contacts, 62 candidates, 62 manifolds, 0 warm, 48 asleep, 45 islands, 0 swept, checksum 36474.9623625776',
+
+  -- Ground streamed in and out, as 0.5.0 computes it too.
+  ['stream: 700 static capsules put into a world of 5,000 and taken out again, a step after each'] = '0 contacts, 59 grounded, at 1154.9158407449722',
 }
 
 --- What a ray or a sweep met, where a case expects it to have met something.
@@ -988,5 +991,79 @@ do
 
   workload('level: 48 boxes asleep among 1,024 static ones, 60 steps', function(): string
     return run(world, 60)
+  end)
+end
+
+-- Ground that streams in as a game is played: tiles of 128 metres, each a slab, 700 trunks and
+-- some rocks, seven of nine standing, and an eighth put in and taken out again. A step after a
+-- tile has come or gone is where the tree of static bodies is brought up to date.
+local function tile(world: World, random: Random, column: number, row: number, rocks: number): { number }
+  local corner = vector.create(column * 128, 0, row * 128)
+  local handles = {}
+
+  for _ = 1, 700 do
+    local height = random(3, 9)
+
+    table.insert(
+      handles,
+      world:addBody({
+        type = 'static',
+        shape = physik.capsule(random(0.15, 0.45), height / 2),
+        position = corner + vector.create(random(2, 126), height / 2, random(2, 126)),
+      })
+    )
+  end
+
+  for _ = 1, rocks do
+    table.insert(
+      handles,
+      world:addBody({
+        type = 'static',
+        shape = physik.box(vector.create(random(0.5, 2), random(0.3, 1), random(0.5, 2))),
+        position = corner + vector.create(random(2, 126), 0.3, random(2, 126)),
+        rotation = rotation(random),
+      })
+    )
+  end
+
+  return handles
+end
+
+do
+  local world = physik.newWorld()
+  local random = generator(128)
+
+  for index = 0, 8 do
+    local column, row = index % 3, index // 3
+
+    world:addBody({
+      type = 'static',
+      shape = physik.box(vector.create(64, 0.5, 64)),
+      position = vector.create(column * 128 + 64, -0.5, row * 128 + 64),
+    })
+
+    if index < 7 then tile(world, random, column, row, 14) end
+  end
+
+  world:step(1 / 60)
+
+  workload('stream: 700 static capsules put into a world of 5,000 and taken out again, a step after each', function(): string
+    local trunks = tile(world, generator(129), 1, 2, 0)
+    local stepped = world:step(1 / 60)
+    local who = character.new(world, { radius = 0.4, height = 1.8, position = vector.create(192, 0.01, 320) })
+    local grounded = 0
+
+    for step = 1, 60 do
+      character.move(who, vector.create(step % 7 / 7 - 0.4, -0.03, step % 5 / 5 - 0.3) * 0.15)
+      if who.grounded then grounded += 1 end
+    end
+
+    for _, handle in trunks do
+      world:removeBody(handle)
+    end
+
+    stepped += world:step(1 / 60)
+
+    return `{stepped} contacts, {grounded} grounded, at {pin(weigh(who.position))}`
   end)
 end
