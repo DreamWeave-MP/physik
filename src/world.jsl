@@ -153,19 +153,31 @@ export type State = {
   quiet: boolean,
   changed: boolean,
 
-  -- The tree of the static bodies, and each mover's answer from it.
+  -- The tree of the static bodies, and each mover's answer from it. A node's children are
+  -- nodes, or bodies negated; the root is 0 when the tree is empty.
   stillDirty: boolean,
   stillRoot: number,
   stillEpoch: number,
   stillNodeCount: number,
+  stillCount: number,
+  stillShifted: boolean,
   stillLow: { vector },
   stillHigh: { vector },
   stillLeft: { number },
   stillRight: { number },
-  stillStack: { number },
-  stillNear: { number },
+  stillParent: { number },
+  stillHeight: { number },
+  stillFree: { number },
+  --- The node each static body in the tree hangs from, 0 at the root, and nil for a body that
+  --- is not in it.
+  stillLeafParent: { [number]: number? },
+  --- The static bodies added, removed or moved since the tree was last brought up to date.
+  stillPending: { number },
+  stillPendingMark: { [number]: boolean? },
   stillFound: { number },
   stillCentres: { number },
+  stillStack: { number },
+  stillNear: { number },
   nearStill: { [number]: { number } },
   nearLows: { vector },
   nearHighs: { vector },
@@ -443,14 +455,22 @@ function world.new(options: Options?): State
     stillRoot = 0,
     stillEpoch = 0,
     stillNodeCount = 0,
+    stillCount = 0,
+    stillShifted = false,
     stillLow = {},
     stillHigh = {},
     stillLeft = {},
     stillRight = {},
-    stillStack = {},
-    stillNear = {},
+    stillParent = {},
+    stillHeight = {},
+    stillFree = {},
+    stillLeafParent = {},
+    stillPending = {},
+    stillPendingMark = {},
     stillFound = {},
     stillCentres = {},
+    stillStack = {},
+    stillNear = {},
     nearStill = {},
     nearLows = {},
     nearHighs = {},
@@ -741,6 +761,16 @@ export type BodyOptions = {
   read ccd: boolean?,
 }
 
+--- Notes that a static body, or a slot that held one, is to be put into the tree, taken out of
+--- it, or both, when the tree is next asked about: once, however often it changes before then.
+local function markStill(state: State, body: number)
+  state.stillDirty = true
+  if state.stillPendingMark[body] then return end
+
+  state.stillPendingMark[body] = true
+  table.insert(state.stillPending, body)
+end
+
 --- Adds a body and returns its handle.
 function world.addBody(state: State, options: BodyOptions?): number
   local given: BodyOptions = options or {}
@@ -811,7 +841,7 @@ function world.addBody(state: State, options: BodyOptions?): number
   state.nearEpochs[body] = 0
 
   if kind == 'static' then
-    state.stillDirty = true
+    markStill(state, body)
     table.insert(state.unsettled, body)
   else
     state.moversDirty = true
@@ -853,7 +883,7 @@ function world.removeBody(state: State, handle: number)
   state.changed = true
 
   if state.bodyType[body] == 'static' then
-    state.stillDirty = true
+    markStill(state, body)
   else
     state.moversDirty = true
   end
@@ -889,10 +919,10 @@ function world.removeBody(state: State, handle: number)
   state.gridTopologyDirty = true
 end
 
---- A static body has been moved: the tree is to be built again, and what the body touches is to
---- be found again.
+--- A static body has been moved: it is to be taken out of the tree and put back where it is now,
+--- and what it touches is to be found again.
 local function unsettle(state: State, body: number)
-  state.stillDirty = true
+  markStill(state, body)
   state.rest[body] = false
   state.changed = true
   table.insert(state.unsettled, body)
@@ -1026,8 +1056,10 @@ function world.shiftOrigin(state: State, delta: vector)
     contactPoint[contact] -= delta
   end
 
+  -- The tree keeps its shape, and is fitted again round where its bodies are now.
   state.gridValid = false
   state.stillDirty = true
+  state.stillShifted = true
 end
 
 function world.setVelocity(state: State, handle: number, velocity: vector)
