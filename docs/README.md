@@ -6,7 +6,7 @@
 local physik = require("@dream/physik")
 ```
 
-Current package version: **0.5.0**.
+Current package version: **0.6.0**.
 
 ## How it is laid out
 
@@ -27,6 +27,12 @@ physik is written in Jess's strict Luau throughout: `jess package check` passes 
 
 Two things decided where the lines between them are, and both were measured. Calls between modules are never inlined, so a few lines that are in the middle of every loop, as turning a vector by a rotation is, live in the module whose loops they are in: kept in one of their own they cost a tenth of a step on meshes and compounds. And annotated code compiles to much tighter native code than code that is not: typing the geometry alone, with not a line of arithmetic changed, made rays and sweeps one and a half to twice as fast.
 
+## Changed in 0.6.0
+
+- The tree of static bodies is kept up to date as they are added, removed and moved, where it was built again from all of them at the next step. Adding 700 static capsules to a world of 5,000 made that step take 34 ms; it takes 2. The tree is still built from nothing when it is empty and when more has changed than is left in it.
+- `shiftOrigin` fits the tree round where the static bodies are now, where it built it again.
+- A body is offered the static bodies near it in the order of their slots, and `queryAabb` gives the static bodies it finds in that order too, where both were in the order the tree gave them. A world steps and answers the same however its static bodies came to be where they are, and a world of the same bodies added in the same order steps as it did in 0.5.0 but where a body touched two static ones in a step: those pairs are solved in another order, which changes the last bits.
+
 ## Changed in 0.5.0
 
 - A rotation's two parts are `turn` and `turnW`, where they were `v` and `w`: in what `quat` and `axisAngle` return and in `getBody().rotation`.
@@ -46,7 +52,7 @@ The hot path is data-oriented and allocation-averse:
 - cached body bases reused by SAT and inverse-inertia work;
 - isotropic sphere inertia fast path;
 - numeric 3D hash-grid broadphase for compact bodies that can move;
-- a tree of the static bodies, built only when one changes, so a level costs a step nothing;
+- a tree of the static bodies, kept up to date as one is added, removed or moved, so a level costs a step nothing;
 - contacts between bodies at rest kept from step to step, and a step in which nothing stirs skipped;
 - adaptive oversized-body path: direct large-vs-world when only a few large bodies exist, coherent X sweep when many do;
 - 2-4 point clipped box-face manifolds;
@@ -335,12 +341,12 @@ contactEvents              default false
 
 ## Levels
 
-A level is mostly static bodies, and a step is not charged for them. Every static body, whatever its size, is kept in a tree that is built when one is added, removed or moved, and not otherwise; the grid and the sweep are of the bodies that can move, and a step visits only those. What moves looks itself up in the tree, and keeps the answer until it has moved a little way.
+A level is mostly static bodies, and a step is not charged for them. Every static body, whatever its size, is kept in a tree, and the tree is changed only where one is added, removed or moved; the grid and the sweep are of the bodies that can move, and a step visits only those. What moves looks itself up in the tree, and keeps the answer until it has moved a little way.
 
 - A world with up to a few hundred bodies moving in a level is quickest with `broadphase = 'sap'`: the sweep is of the movers alone, and the static bodies are found through the tree either way.
 - Add a level's geometry as `type = 'static'` boxes, meshes and heightfields. A thousand of them cost a step nothing, and a ray or a sweep through them walks the tree.
-- Move a static body with `setPosition` or `setRotation` and the tree is built again, at that step. Something that moves every step, a lift or a door, is `type = 'kinematic'`, driven with `driveKinematic`.
-- A world that has had bodies taken out of it steps as a new one does: a freed slot is given out lowest first, so the same bodies added in the same order get the same slots.
+- Add, remove or move a static body, with `setPosition` or `setRotation`, and it is put into the tree or taken out of it at the next step, which costs a few microseconds a body: ground streamed in a tile at a time costs the step it arrives in a millisecond or two, not the whole tree. Bodies added together are put in as a tree of their own where they are near each other. Something that moves every step, a lift or a door, is `type = 'kinematic'`, driven with `driveKinematic`.
+- A world that has had bodies taken out of it steps as a new one does: a freed slot is given out lowest first, so the same bodies added in the same order get the same slots, and the tree of static bodies, whatever shape it has grown into, gives them up in the order of their slots.
 
 ## Bodies at rest
 

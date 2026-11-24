@@ -2,6 +2,30 @@
 
 Measured with `bench/bench.jsl`, which checks what every workload computes, to the bit, before and after it times it. The numbers in `docs/README.md` and `docs/PROFILE.md` are older, from another machine and another Jess, and are not comparable with these.
 
+## 0.6.0: ground that streams in
+
+Measured on 2026-11-24, on the same machine as 0.5.0 below, with Jess 0.4.0, a verified release build. Base is 0.5.0 (`4400e3a`), timed by its own benchmark, and by 0.6.0's for the workload that is new; head is 0.6.0. The least of three runs each, taken turn about.
+
+A game's world is not one level loaded once. Ground streams in and out as the player walks, a tile at a time, and in 0.5.0 every static body added, removed or moved had the tree of all of them built again at the next step, a sort at every level of it. A game putting a tile of 128 metres with some 700 trunks into a world already holding 5,000 static bodies measured 29 ms for the step after; it had grouped its trunks into compound bodies to get that down to 8.
+
+The new workload is that: seven tiles of 700 capsules and a few rocks standing on nine slabs, an eighth tile put in, a step, a character walked 60 moves through it, the tile taken out, and a step. Microseconds per call.
+
+| Workload | 0.5.0 | 0.6.0 | 0.5.0 / 0.6.0 |
+| --- | ---: | ---: | ---: |
+| stream: 700 static capsules put into a world of 5,000 and taken out again, a step after each | 57,749.8 | 3,979.4 | 14.5 |
+
+Timed on their own, with 32 spheres about, the step after the tile came in went from 33.0 ms to 2.3 with the grid and from 36.6 to 1.9 with the sweep, and the step after it went from 28.4 to 1.0 and from 30.6 to 0.9. The first step of a world, which builds the tree of its 5,000 bodies from nothing, went from 29 ms to 20 to 25.
+
+Every other workload reads 0.95 to 1.10, which is the floor here: no other workload changes a static body after its first step.
+
+**What moved, and why.**
+
+- *Changing the tree where it changed (`77c2897`).* A body added is put in down the branch it grows least, as Box2D's dynamic tree does, and the nodes above it are fitted round it again and turned where one side has grown two taller than the other; a body taken out leaves its sibling in its parent's place; a body moved is taken out and put back. Bodies added together are built into a tree of their own first, by the same halving the whole tree is built by, and that is put in in pieces no bigger than a sixty-fourth of the world: a tile goes in nearly whole, and bodies added all over the world go in nearly one at a time. Put in a body at a time, a tile costs twice as long, and a tree that has had two tiles put in that way answers rays 44% slower than one built from nothing; put in as pieces, 20% slower. The tree is still built from nothing when it is empty, which is a world's first step, because a tree built that way answers rays fastest, and when more has changed than is left in it.
+- *`shiftOrigin`* fits the tree round where its bodies are now instead of building it again.
+- *A sort with the centres worked out once (`cde5ed0`).* Building the tree compared two bodies' centres by working both out, at every comparison; they are worked out once a level. The tree is the same tree, a third sooner.
+
+**What changed in what a world computes (`95ef3f3`).** A body was offered the static bodies near it in the order the tree gave them, and `queryAabb` gave its static bodies in that order too, so a tree of another shape would have had a world step differently. Both are in the order of the bodies' slots now, whatever shape the tree has grown into, and a world steps and answers to the bit as it would with the tree built from nothing; `tests/tree_test.jsl` holds it to that over seeded runs of adding, removing, moving and shifting. One workload computes something else for it: 200 boxes thrown among the level's, where a heap of pieces each touching several static boxes is solved in another order. Its expectation is 0.6.0's.
+
 ## 0.5.0: typed, in modules
 
 Measured on 2026-11-22, on the same machine and the same Jess as 0.4.0 below. Base is 0.4.0 as one untyped file (`9469625`) and head is 0.5.0, each timed by its own copy of the benchmark, since 0.5.0 renames what a contact's bodies are called. The least of three runs each, taken turn about.
