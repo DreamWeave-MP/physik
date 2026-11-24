@@ -298,6 +298,10 @@ local function offerStill(state: State, movers: { number })
       for index = #near, count + 1, -1 do
         near[index] = nil
       end
+
+      -- In the order of their slots, whatever shape the tree has grown into: a world steps the
+      -- same however its static bodies came to be where they are.
+      if count > 1 then table.sort(near) end
     end
 
     for _, still in near do

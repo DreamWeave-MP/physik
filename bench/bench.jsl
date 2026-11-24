@@ -70,10 +70,13 @@ local Expected: { [string]: string } = {
   ['sync: apply the transforms of 5,000 bodies'] = '5000 applied, checksum 3934695.0424996582',
 
   -- The level, which 0.3.2 has no character for, and steps differently every time bodies have
-  -- been taken out of it: these are as 0.4.0 computes them.
+  -- been taken out of it: these are as 0.4.0 computes them, but for the 200 thrown, as 0.6.0 does.
+  -- 0.6.0 offers a body the static ones near it in the order of their slots, where 0.5.0 offered
+  -- them in the order its tree gave them, and two hundred pieces in a heap are solved in an
+  -- order that differs with it.
   ['level: 1,024 static boxes and nothing moving, 60 steps'] = '0 contacts, 0 candidates, 0 manifolds, 0 warm, 0 asleep, 0 islands, 0 swept, checksum 37482.222238540649',
   ['level: 48 boxes thrown among 1,024 static ones and taken out again, 60 steps'] = '2539 contacts, 64 candidates, 55 manifolds, 144 warm, 0 asleep, 45 islands, 0 swept, checksum 37672.436927226612',
-  ['level: 200 boxes thrown among 1,024 static ones and taken out again, 60 steps'] = '13451 contacts, 424 candidates, 292 manifolds, 602 warm, 0 asleep, 123 islands, 0 swept, checksum 35935.988151607206',
+  ['level: 200 boxes thrown among 1,024 static ones and taken out again, 60 steps'] = '13500 contacts, 424 candidates, 292 manifolds, 606 warm, 0 asleep, 123 islands, 0 swept, checksum 35891.997965131268',
   ['level: 256 rays among 1,024 static boxes'] = '192 struck, 1575.0599460284282 far',
   ['level: 256 capsules swept among 1,024 static boxes'] = '142 met, 930.984696956682 far',
   ['level: a character run 240 steps among 1,024 static boxes'] = '240 grounded, at 29.093298554420471',

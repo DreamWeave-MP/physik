@@ -334,6 +334,7 @@ local function queryAabbGrid(
 
   -- The static ones, through their tree.
   local entry = state.stillRoot
+  local found, foundCount = state.stillFound, 0
 
   if entry ~= 0 then
     local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = state
@@ -344,8 +345,8 @@ local function queryAabbGrid(
         local body = -entry
 
         if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(state, body, low, high) then
-          count += 1
-          out[count] = generation[body] * HandleStride + body
+          foundCount += 1
+          found[foundCount] = body
         end
       else
         local nodeLow, nodeHigh = lows[entry], highs[entry]
@@ -372,6 +373,18 @@ local function queryAabbGrid(
       entry = stack[top]
       top -= 1
     end
+  end
+
+  -- In the order of their slots, as a scan finds them, whatever shape the tree has grown into.
+  for index = #found, foundCount + 1, -1 do
+    found[index] = nil
+  end
+
+  if foundCount > 1 then table.sort(found) end
+
+  for _, body in found do
+    count += 1
+    out[count] = generation[body] * HandleStride + body
   end
 
   -- A grid with nothing in it has no cells to walk.
