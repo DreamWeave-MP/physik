@@ -29,9 +29,10 @@ Two things decided where the lines between them are, and both were measured. Cal
 
 ## Changed in 0.6.0
 
-- The tree of static bodies is kept up to date as they are added, removed and moved, where it was built again from all of them at the next step. Adding 700 static capsules to a world of 5,000 made that step take 34 ms; it takes 2. The tree is still built from nothing when it is empty and when more has changed than is left in it.
+- The tree of static bodies is kept up to date as they are added, removed and moved, where it was built again from all of them at the next step. Adding 700 static capsules to a world of 5,000 made that step take 34 ms; it takes 2. The tree is still built from nothing when it is empty, when what is taken out of it is more than twice what is left untouched, and when what is put in is more than four times that. A tree that has had ground streamed through it answers as fast as one built from nothing.
 - `shiftOrigin` fits the tree round where the static bodies are now, where it built it again.
 - A body is offered the static bodies near it in the order of their slots, and `queryAabb` gives the static bodies it finds in that order too, where both were in the order the tree gave them. A world steps and answers the same however its static bodies came to be where they are, and a world of the same bodies added in the same order steps as it did in 0.5.0 but where a body touched two static ones in a step: those pairs are solved in another order, which changes the last bits.
+- A ray that meets a mesh, a heightfield or a compound at exactly the distance it has already met another body at meets it, as it always met a box, a sphere or a capsule, so of two bodies at one distance the lower slot is the hit whatever order the tree gives them in. It passed it by, and the hit was the one the tree gave first. A ray still meets only what is nearer than its reach.
 
 ## Changed in 0.5.0
 
