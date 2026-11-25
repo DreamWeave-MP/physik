@@ -2,6 +2,37 @@
 
 Measured with `bench/bench.jsl`, which checks what every workload computes, to the bit, before and after it times it. The numbers in `docs/README.md` and `docs/PROFILE.md` are older, from another machine and another Jess, and are not comparable with these.
 
+## 0.6.0: ground that streams in
+
+Measured on 2026-11-24, on the same machine as 0.5.0 below, with Jess 0.4.0, a verified release build. Base is 0.5.0 (`4400e3a`), timed by its own benchmark, and by 0.6.0's for the two workloads that are new; head is 0.6.0. The least of three runs each, taken turn about.
+
+A game's world is not one level loaded once. Ground streams in and out as the player walks, a tile at a time, and in 0.5.0 every static body added, removed or moved had the tree of all of them built again at the next step, a sort at every level of it. A game putting a tile of 128 metres with some 700 trunks into a world already holding 5,000 static bodies measured 29 ms for the step after; it had grouped its trunks into compound bodies to get that down to 8.
+
+The first new workload is that: seven tiles of 700 capsules and a few rocks standing on nine slabs, an eighth tile put in, a step, a character walked 60 moves through it, the tile taken out, and a step. The second is what a tree is left as: 5,000 static boxes over two kilometres, dense clusters of 500 put in and taken out sixty times, six standing at a time, and then boxes asked about all over it and among the clusters. Microseconds per call.
+
+| Workload | 0.5.0 | 0.6.0 | 0.5.0 / 0.6.0 |
+| --- | ---: | ---: | ---: |
+| stream: 700 static capsules put into a world of 5,000 and taken out again, a step after each | 57,408.9 | 4,487.8 | 12.8 |
+| query: 2,960 boxes among 5,000 static ones after 60 dense clusters were put in and taken out | 4,416.4 | 4,672.9 | 0.95 |
+
+0.5.0 answers the second from a tree built from nothing, every time anything changed; 0.6.0 from the tree it has kept. The tree as `77c2897` kept it, turned by height alone, answered it in 12,851.8.
+
+Timed on their own, with 32 spheres about, the step after the tile came in went from 33.0 ms to 2.2 with the grid and from 36.6 to 2.0 with the sweep, and the step after it went out from 28.4 to 1.6 and from 30.6 to 1.5. The first step of a world, which builds the tree of its 5,000 bodies from nothing, went from 29 ms to 20.
+
+Walking a player across forty tiles, a 3 by 3 of them kept loaded, three coming in and three going out at each crossing, one every fourth frame, 2,400 frames of a character's move and a step: the frames a tile came or went in took 1.8 ms at the median, 2.8 at the 99th percentile and 3.1 at worst, where 0.5.0 took 39.5, 43.9 and 45.8. At the end, 2,048 rays took 37.8 ms through the tree kept and 36.6 through the same world's built from nothing.
+
+Every other workload reads 0.92 to 1.01: none of them changes a static body after its first step, and the machine drifts by a tenth.
+
+**What moved, and why.**
+
+- *Changing the tree where it changed (`77c2897`, `ebaac3b`).* A body added is put in down the branch it grows least, as Box2D's dynamic tree does, and the nodes above it are fitted round it again; a body taken out leaves its sibling in its parent's place; a body moved is taken out and put back. On the way up each node is turned where swapping a child with a grandchild under the other makes a box smaller, as Box2D's third version does. It was turned by height, as an AVL tree is, and that kept the tree short and spoiled it: a node turned by height alone is handed children far apart, and the clusters' tree answered boxes three times slower than one built from nothing, a query visiting 91 entries where that visits 24. Turned by area it visits 23, it answers in the time a tree built from nothing does, and after tiles have streamed through it a ray is as quick as it is through a tree built from nothing, where turning by height left them 20% slower. What it costs is height: 22 where a tree built from nothing is 13, which nothing walks but the queries.
+- *Bodies added together.* They are built into a tree of their own first, by the same halving the whole tree is built by, and that is put in in pieces no bigger than a sixty-fourth of the world: a tile goes in nearly whole, and bodies added all over the world go in nearly one at a time. Put in a body at a time, a tile costs twice as long and answers rays no faster.
+- *When the tree is built from nothing (`bb49830`).* When it is empty, which is a world's first step, because a tree built that way answers rays fastest; when what is taken out of it, a body moved included, is more than twice what is left untouched; and when what is put in is more than four times what is left. It was built again only when more was pending than was in it, which taking bodies out or moving them never is, so emptying a world of all but one of 5,000 walked it 4,999 times. On 5,000 bodies a body taken out costs half of what a body costs to be built in: taking out 4,500 costs 8.0 ms a body at a time and 1.1 built again, taking out 2,500 costs 4.8 and 7.8. Moving 3,500 costs 19.6 and 19.2. Adding 5,001 to 5,000 costs 19 ms a body at a time and 42 built again.
+- *`shiftOrigin`* fits the tree round where its bodies are now instead of building it again.
+- *A sort with the centres worked out once (`cde5ed0`).* Building the tree compared two bodies' centres by working both out, at every comparison; they are worked out once a level. The tree is the same tree, a third sooner.
+
+**What changed in what a world computes (`95ef3f3`, `fd0fad7`).** A body was offered the static bodies near it in the order the tree gave them, and `queryAabb` gave its static bodies in that order too, so a tree of another shape would have had a world step differently. Both are in the order of the bodies' slots now, whatever shape the tree has grown into. A ray that met a mesh, a heightfield or a compound at exactly the distance it had already met another body at passed it by, so of two bodies at one distance the one the tree gave first was the hit; it meets it, and the lower slot is the hit, as it always was for boxes, spheres and capsules. A world steps and answers to the bit as it would with the tree built from nothing: `tests/tree_test.jsl` holds it to that over seeded runs of adding, removing, moving, shifting, drained states and slots taken again across kinds, comparing rotations, spins, sleep, sensors, contact events, every count a step keeps and what rays, boxes, sweeps and overlaps are told. One workload computes something else for it: 200 boxes thrown among the level's, where a heap of pieces each touching several static boxes is solved in another order. Its expectation is 0.6.0's.
+
 ## 0.5.0: typed, in modules
 
 Measured on 2026-11-22, on the same machine and the same Jess as 0.4.0 below. Base is 0.4.0 as one untyped file (`9469625`) and head is 0.5.0, each timed by its own copy of the benchmark, since 0.5.0 renames what a contact's bodies are called. The least of three runs each, taken turn about.

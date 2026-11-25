@@ -6,8 +6,8 @@
 -- The bodies that can move are in a grid, each in the cell its centre is in, and a pair is
 -- offered when two share a cell or are in neighbouring ones. A body wider than a cell is kept
 -- out of the grid and paired by a sweep along X. The static bodies are in a tree, which is
--- built when one of them changes and not otherwise, and what moves looks itself up in it: a
--- level is mostly static bodies, and a step is not charged for them.
+-- changed only where one of them is added, removed or moved, and what moves looks itself up in
+-- it: a level is mostly static bodies, and a step is not charged for them.
 --
 -- Bodies at rest are passed over. A body asleep exactly where it was asleep at the last step,
 -- or static and not moved, touches as it did, so a pair of them is not offered again: its
@@ -42,6 +42,21 @@ local GridFilterSize = worlds.GridFilterSize
 
 -- How much bigger than a body the box is that the tree of static bodies is asked about for it.
 local NearPad = vector.create(0.3, 0.3, 0.3)
+
+-- How big, next to the whole tree of static bodies, a piece of a tree of the ones added together
+-- may be and still be put into it whole. Measured on streamed tiles of ground and on bodies added
+-- all over a world: bigger, and a piece of bodies far apart is put in among what is between them,
+-- which a ray then has to look through twice; smaller, and a tile is put in a body at a time,
+-- which costs twice as long and answers a ray no faster.
+local SubtreeShare = 1 / 64
+
+-- The tree is built from nothing when what is taken out of it, a body moved included, is more
+-- than `RebuildRemoved` times what is left untouched, or what is put in is more than
+-- `RebuildInserted` times that. Measured on 5,000 bodies: a body taken out costs half of what a
+-- body costs to be built in, so past the first building costs less; past the second it costs
+-- at most half again what putting them in would, and gives a tree that answers a ray faster than
+-- one that is mostly put in, as a level loaded onto a world of a few bodies would be.
+local RebuildRemoved, RebuildInserted = 2, 4
 
 
 
@@ -298,6 +313,10 @@ local function offerStill(state: State, movers: { number })
       for index = #near, count + 1, -1 do
         near[index] = nil
       end
+
+      -- In the order of their slots, whatever shape the tree has grown into: a world steps the
+      -- same however its static bodies came to be where they are.
+      if count > 1 then table.sort(near) end
     end
 
     for _, still in near do
@@ -390,11 +409,24 @@ local function rebuildGridPairs(state: State)
   state.gridPairCount = pairCount
 end
 
---- Makes a tree of the boxes round `members`, which are bodies, and returns its root: a node,
---- or the one body there is, negated. A node halves its bodies along the axis their centres are
---- spread furthest on.
-local function buildStill(state: State, members: { number }): number
-  if #members == 1 then return -members[1] end
+--- A node of the tree of static bodies to use: one that has been let go of, or a new one.
+local function newStillNode(state: State): number
+  local node = table.remove(state.stillFree) or state.stillNodeCount + 1
+
+  state.stillNodeCount = math.max(state.stillNodeCount, node)
+
+  return node
+end
+
+--- Makes a tree of the boxes round `members`, which are bodies, under `parent`, and returns its
+--- root: a node, or the one body there is, negated. A node halves its bodies along the axis their
+--- centres are spread furthest on.
+local function buildStill(state: State, members: { number }, parent: number): number
+  if #members == 1 then
+    state.stillLeafParent[members[1]] = parent
+
+    return -members[1]
+  end
 
   local {boundsLow, boundsHigh} = state
   local low, high = boundsLow[members[1]], boundsHigh[members[1]]
@@ -416,29 +448,41 @@ local function buildStill(state: State, members: { number }): number
     elseif spread.y >= spread.z then vector.create(0, 1, 0)
     else vector.create(0, 0, 1)
 
+  -- Where each centre is along it, worked out once a body rather than once a comparison.
+  local centres = state.stillCentres
+
+  for _, body in members do
+    centres[body] = vector.dot(boundsLow[body] + boundsHigh[body], along)
+  end
+
   -- Bodies whose centres are level, or are not numbers, stay in the order of their slots.
   table.sort(members, function(first: number, second: number)
-    local firstCentre = vector.dot(boundsLow[first] + boundsHigh[first], along)
-    local secondCentre = vector.dot(boundsLow[second] + boundsHigh[second], along)
+    local firstCentre, secondCentre = centres[first], centres[second]
     if firstCentre < secondCentre then return true end
     if secondCentre < firstCentre then return false end
 
     return first < second
   end)
 
-  local node = state.stillNodeCount + 1
+  local node = newStillNode(state)
   local half = #members // 2
 
-  state.stillNodeCount = node
   state.stillLow[node], state.stillHigh[node] = low, high
-  state.stillLeft[node] = buildStill(state, table.move(members, 1, half, 1, {}))
-  state.stillRight[node] = buildStill(state, table.move(members, half + 1, #members, 1, {}))
+  state.stillParent[node] = parent
+
+  local left = buildStill(state, table.move(members, 1, half, 1, {}), node)
+  local right = buildStill(state, table.move(members, half + 1, #members, 1, {}), node)
+  local leftHeight = if left < 0 then 0 else state.stillHeight[left]
+  local rightHeight = if right < 0 then 0 else state.stillHeight[right]
+
+  state.stillLeft[node], state.stillRight[node] = left, right
+  state.stillHeight[node] = 1 + math.max(leftHeight, rightHeight)
 
   return node
 end
 
---- Builds the tree of the static bodies. They neither move nor touch each other, so they are
---- kept out of the grid and of every step's sweep, and found by what does move.
+--- Builds the tree of the static bodies from nothing. They neither move nor touch each other, so
+--- they are kept out of the grid and of every step's sweep, and found by what does move.
 local function rebuildStill(state: State)
   local {alive, bodyType} = state
   local members = {}
@@ -450,8 +494,325 @@ local function rebuildStill(state: State)
     table.insert(members, body)
   end
 
+  table.clear(state.stillLeafParent)
+  table.clear(state.stillFree)
+  table.clear(state.stillPending)
+  table.clear(state.stillPendingMark)
+
   state.stillNodeCount = 0
-  state.stillRoot = if #members == 0 then 0 else buildStill(state, members)
+  state.stillCount = #members
+  state.stillRoot = if #members == 0 then 0 else buildStill(state, members, 0)
+  state.stillDirty = false
+  state.stillShifted = false
+  state.stillEpoch += 1
+end
+
+--- The box round an entry of the tree: a node's, or a body's when the entry is one negated.
+local function stillBounds(state: State, entry: number): (vector, vector)
+  if entry < 0 then return state.boundsLow[-entry], state.boundsHigh[-entry] end
+
+  return state.stillLow[entry], state.stillHigh[entry]
+end
+
+local function stillHeightOf(state: State, entry: number): number
+  return if entry < 0 then 0 else state.stillHeight[entry]
+end
+
+--- Hangs an entry of the tree from `parent`, or from nothing when `parent` is 0.
+local function hangStill(state: State, entry: number, parent: number)
+  if entry < 0 then
+    state.stillLeafParent[-entry] = parent
+  else
+    state.stillParent[entry] = parent
+  end
+end
+
+--- Puts `entry` where `old` was: under `parent`, or at the root when `parent` is 0.
+local function replaceStill(state: State, parent: number, old: number, entry: number)
+  if parent == 0 then
+    state.stillRoot = entry
+  elseif state.stillLeft[parent] == old then
+    state.stillLeft[parent] = entry
+  else
+    state.stillRight[parent] = entry
+  end
+
+  hangStill(state, entry, parent)
+end
+
+--- Makes a node's box exactly the one round its two children, and its height one more than
+--- theirs.
+local function fitStill(state: State, node: number)
+  local left, right = state.stillLeft[node], state.stillRight[node]
+  local leftLow, leftHigh = stillBounds(state, left)
+  local rightLow, rightHigh = stillBounds(state, right)
+
+  state.stillLow[node], state.stillHigh[node] = vector.min(leftLow, rightLow), vector.max(leftHigh, rightHigh)
+  state.stillHeight[node] = 1 + math.max(stillHeightOf(state, left), stillHeightOf(state, right))
+end
+
+--- What a box costs where it stands in the tree: half its surface, which is what a query is
+--- likeliest to strike.
+local function surface(low: vector, high: vector): number
+  local size = high - low
+
+  return size.x * size.y + size.y * size.z + size.z * size.x
+end
+
+--- Swaps one child of a node with a grandchild under its other child, where that leaves the
+--- other child's box smaller, as Box2D's dynamic tree does since its third version: of the four
+--- swaps, the one that shrinks a box most, and none when none does. A node turned by height
+--- alone, as an AVL tree is, can be handed children far apart, and a tree of static bodies that
+--- has had dense clusters put in and taken out that way answered a box four times slower.
+local function rotateStill(state: State, node: number)
+  local {stillLeft: lefts, stillRight: rights} = state
+  local left, right = lefts[node], rights[node]
+  local leftLow, leftHigh = stillBounds(state, left)
+  local rightLow, rightHigh = stillBounds(state, right)
+  local best, choice = 0, 0
+
+  if right > 0 then
+    local area = surface(rightLow, rightHigh)
+    local innerLow, innerHigh = stillBounds(state, lefts[right])
+    local outerLow, outerHigh = stillBounds(state, rights[right])
+
+    -- The left child down beside the right's right, and the right's left up: and the other way.
+    local withOuter = area - surface(vector.min(leftLow, outerLow), vector.max(leftHigh, outerHigh))
+    local withInner = area - surface(vector.min(leftLow, innerLow), vector.max(leftHigh, innerHigh))
+
+    if withOuter > best then best, choice = withOuter, 1 end
+    if withInner > best then best, choice = withInner, 2 end
+  end
+
+  if left > 0 then
+    local area = surface(leftLow, leftHigh)
+    local outerLow, outerHigh = stillBounds(state, lefts[left])
+    local innerLow, innerHigh = stillBounds(state, rights[left])
+
+    local withOuter = area - surface(vector.min(rightLow, outerLow), vector.max(rightHigh, outerHigh))
+    local withInner = area - surface(vector.min(rightLow, innerLow), vector.max(rightHigh, innerHigh))
+
+    if withOuter > best then best, choice = withOuter, 3 end
+    if withInner > best then best, choice = withInner, 4 end
+  end
+
+  if choice == 0 then return end
+
+  if choice == 1 then
+    local up = lefts[right]
+
+    lefts[node], lefts[right] = up, left
+    hangStill(state, up, node)
+    hangStill(state, left, right)
+    fitStill(state, right)
+  elseif choice == 2 then
+    local up = rights[right]
+
+    lefts[node], rights[right] = up, left
+    hangStill(state, up, node)
+    hangStill(state, left, right)
+    fitStill(state, right)
+  elseif choice == 3 then
+    local up = rights[left]
+
+    rights[node], rights[left] = up, right
+    hangStill(state, up, node)
+    hangStill(state, right, left)
+    fitStill(state, left)
+  else
+    local up = lefts[left]
+
+    rights[node], lefts[left] = up, right
+    hangStill(state, up, node)
+    hangStill(state, right, left)
+    fitStill(state, left)
+  end
+end
+
+--- Fits every node from `node` up to the root round what is under it, turning each on the way.
+local function climbStill(state: State, node: number)
+  local parents = state.stillParent
+
+  while node ~= 0 do
+    rotateStill(state, node)
+    fitStill(state, node)
+    node = parents[node]
+  end
+end
+
+--- What putting a body beside `entry`, or somewhere under it, adds to the tree: the box it would
+--- make with the body, and for a node only what that box grows by, since the body goes further
+--- down.
+local function descentCost(state: State, entry: number, low: vector, high: vector): number
+  local entryLow, entryHigh = stillBounds(state, entry)
+  local grown = surface(vector.min(entryLow, low), vector.max(entryHigh, high))
+  if entry < 0 then return grown end
+
+  return grown - surface(entryLow, entryHigh)
+end
+
+--- Puts an entry into the tree, a static body negated or a tree of them, as Box2D's dynamic tree
+--- puts a body in: down the branch that grows the least, until it is as cheap to make the entry
+--- a sibling of where it is as to go further, then up again fitting and balancing what it went
+--- through.
+local function insertStill(state: State, entry: number)
+  local low, high = stillBounds(state, entry)
+  local {stillLeft: lefts, stillRight: rights} = state
+  local sibling = state.stillRoot
+
+  if sibling == 0 then
+    state.stillRoot = entry
+    hangStill(state, entry, 0)
+
+    return
+  end
+
+  while sibling > 0 do
+    local nodeLow, nodeHigh = state.stillLow[sibling], state.stillHigh[sibling]
+    local combined = surface(vector.min(nodeLow, low), vector.max(nodeHigh, high))
+
+    -- A new node over this one costs its whole box; going down costs what every node on the way
+    -- grows by, which this one's growth is a part of.
+    local here = 2 * combined
+    local inherited = 2 * (combined - surface(nodeLow, nodeHigh))
+    local left, right = lefts[sibling], rights[sibling]
+    local leftCost = descentCost(state, left, low, high) + inherited
+    local rightCost = descentCost(state, right, low, high) + inherited
+    if here < leftCost and here < rightCost then break end
+
+    sibling = if leftCost < rightCost then left else right
+  end
+
+  local parent = if sibling < 0 then state.stillLeafParent[-sibling] :: number else state.stillParent[sibling]
+  local node = newStillNode(state)
+
+  replaceStill(state, parent, sibling, node)
+  lefts[node], rights[node] = sibling, entry
+  hangStill(state, sibling, node)
+  hangStill(state, entry, node)
+  climbStill(state, node)
+end
+
+--- Puts a tree of static bodies built on its own into the tree, in as few pieces as can each be
+--- put in whole: a piece is small enough when its box is no more than `SubtreeShare` of the
+--- box round it and the whole tree, and a piece that is not is let go of and its halves tried.
+--- Bodies added together are mostly near each other, a tile of ground streamed in, and are
+--- better off in a tree built for them than put in one at a time, which leaves a tree that
+--- answers a ray more slowly; bodies added together all over the world are put in nearly one
+--- at a time.
+local function placeStill(state: State, entry: number)
+  if entry > 0 then
+    local rootLow, rootHigh = stillBounds(state, state.stillRoot)
+    local low, high = state.stillLow[entry], state.stillHigh[entry]
+    local whole = surface(vector.min(rootLow, low), vector.max(rootHigh, high))
+
+    if surface(low, high) > whole * SubtreeShare then
+      local left, right = state.stillLeft[entry], state.stillRight[entry]
+
+      table.insert(state.stillFree, entry)
+      placeStill(state, left)
+      placeStill(state, right)
+
+      return
+    end
+  end
+
+  insertStill(state, entry)
+end
+
+--- Takes a static body out of the tree: its sibling takes its parent's place, and everything
+--- above is fitted and balanced again.
+local function removeStill(state: State, body: number)
+  local parent = state.stillLeafParent[body] :: number
+
+  state.stillLeafParent[body] = nil
+  state.stillCount -= 1
+
+  if parent == 0 then
+    state.stillRoot = 0
+
+    return
+  end
+
+  local sibling = if state.stillLeft[parent] == -body then state.stillRight[parent] else state.stillLeft[parent]
+  local above = state.stillParent[parent]
+
+  replaceStill(state, above, parent, sibling)
+  table.insert(state.stillFree, parent)
+  climbStill(state, above)
+end
+
+--- Fits every node under `entry` round where its bodies are now, from the bottom up.
+local function refitStill(state: State, entry: number)
+  if entry < 0 then
+    worlds.refreshBounds(state, -entry)
+
+    return
+  end
+
+  refitStill(state, state.stillLeft[entry])
+  refitStill(state, state.stillRight[entry])
+  fitStill(state, entry)
+end
+
+--- Brings the tree of static bodies up to date with what has been added, removed and moved since
+--- it was last asked about. Each costs a walk down the tree and back, and nothing else is
+--- touched; the tree is built from nothing only when it is empty, or when so much of it has
+--- changed that building it is cheaper or not much dearer: see `RebuildRemoved`.
+local function updateStill(state: State)
+  local pending = state.stillPending
+  local {alive, bodyType, stillLeafParent: parents, stillPendingMark: marks} = state
+  local removed, inserted = 0, 0
+
+  -- A body moved is one of each.
+  for _, body in pending do
+    if parents[body] ~= nil then removed += 1 end
+    if alive[body] and bodyType[body] == 'static' then inserted += 1 end
+  end
+
+  local untouched = state.stillCount - removed
+
+  if state.stillRoot == 0 or removed > untouched * RebuildRemoved or inserted > untouched * RebuildInserted then
+    rebuildStill(state)
+
+    return
+  end
+
+  -- Everything that is to go is taken out first, so a box a body has been moved out of is
+  -- never fitted round again.
+  for _, body in pending do
+    marks[body] = nil
+    if parents[body] ~= nil then removeStill(state, body) end
+  end
+
+  if state.stillShifted then
+    if state.stillRoot ~= 0 then refitStill(state, state.stillRoot) end
+
+    state.stillShifted = false
+  end
+
+  local added = {}
+
+  for _, body in pending do
+    if not alive[body] or bodyType[body] ~= 'static' then continue end
+
+    worlds.refreshBounds(state, body)
+    table.insert(added, body)
+  end
+
+  table.clear(pending)
+  state.stillCount += #added
+
+  if #added > 0 then
+    local subtree = buildStill(state, added, 0)
+
+    if state.stillRoot == 0 then
+      state.stillRoot = subtree
+    else
+      placeStill(state, subtree)
+    end
+  end
+
   state.stillDirty = false
   state.stillEpoch += 1
 end
@@ -462,7 +823,7 @@ local function buildGridIndex(state: State, refresh: boolean, resting: boolean?)
   local cellSize, margin = state.broadphaseCellSize, state.contactMargin
   local movers = listMovers(state)
 
-  if state.stillDirty then rebuildStill(state) end
+  if state.stillDirty then updateStill(state) end
 
   -- Most coherent worlds keep bodies in the same broad-phase cells for many frames. Validate
   -- membership first; when topology is unchanged, retain bucket chains and occupied-neighbor
@@ -818,7 +1179,7 @@ local function collide(state: State)
   end
 
   if state.broadphase == 'sap' then
-    if state.stillDirty then rebuildStill(state) end
+    if state.stillDirty then updateStill(state) end
 
     local rest = state.rest
 

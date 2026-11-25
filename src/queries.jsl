@@ -192,7 +192,12 @@ local function rayMesh(state: State, ground: number, origin: vector, direction: 
     local first, second, third = shapes.meshTriangle(mesh, triangle)
     local distance = geometry.rayToTriangle(from, along, nearest, first, second, third)
 
-    if distance and distance < nearest then
+    -- Struck at `reach` itself is struck, as a box or a sphere is: a ray handed the distance of
+    -- the nearest body met so far finds a mesh just as near, whichever of them was tried first,
+    -- and the ray keeps the lower slot. A ray asked for keeps only what is nearer than its reach.
+    -- Of two triangles at one distance the lower is kept: they are listed from the grid or in
+    -- order, as far as the ray reaches decides, and so in another order.
+    if distance and (distance < nearest or not struck or (distance == nearest and triangle < struck)) then
       nearest, struck = distance, triangle
     end
   end
@@ -227,7 +232,8 @@ local function rayHeightfield(state: State, ground: number, origin: vector, dire
       local beside = shapes.heightVertex(field, column + 1, row)
       local distance = geometry.rayToTriangle(from, along, nearest, corner, beside, across)
 
-      if distance and distance < nearest then
+      -- Struck at `reach` itself is struck, as a mesh is.
+      if distance and (distance < nearest or not struckFirst) then
         nearest, struckFirst, struckSecond, struckThird = distance, corner, beside, across
       end
 
@@ -235,7 +241,7 @@ local function rayHeightfield(state: State, ground: number, origin: vector, dire
 
       distance = geometry.rayToTriangle(from, along, nearest, corner, across, beyond)
 
-      if distance and distance < nearest then
+      if distance and (distance < nearest or not struckFirst) then
         nearest, struckFirst, struckSecond, struckThird = distance, corner, across, beyond
       end
     end
@@ -259,7 +265,9 @@ local function rayCompound(state: State, body: number, origin: vector, direction
       geometry.placePiece(at, turn, turnW, compound.positions[piece], compound.turns[piece], compound.turnWs[piece])
     local distance, normal, point = geometry.rayToPrimitive(compound.shapes[piece], pieceAt, pieceTurn, pieceTurnW, origin, direction, nearest)
 
-    if distance and distance < nearest then
+    -- Struck at `reach` itself is struck, as a mesh is; of two pieces at one distance the first
+    -- is kept.
+    if distance and (distance < nearest or not facing) then
       nearest, facing, struck = distance, normal, point
     end
   end
@@ -334,6 +342,7 @@ local function queryAabbGrid(
 
   -- The static ones, through their tree.
   local entry = state.stillRoot
+  local found, foundCount = state.stillFound, 0
 
   if entry ~= 0 then
     local {stillLow: lows, stillHigh: highs, stillLeft: lefts, stillRight: rights, stillStack: stack} = state
@@ -344,8 +353,8 @@ local function queryAabbGrid(
         local body = -entry
 
         if bit32.band(mask, group[body]) ~= 0 and bodyOverlapsAabb(state, body, low, high) then
-          count += 1
-          out[count] = generation[body] * HandleStride + body
+          foundCount += 1
+          found[foundCount] = body
         end
       else
         local nodeLow, nodeHigh = lows[entry], highs[entry]
@@ -372,6 +381,18 @@ local function queryAabbGrid(
       entry = stack[top]
       top -= 1
     end
+  end
+
+  -- In the order of their slots, as a scan finds them, whatever shape the tree has grown into.
+  for index = #found, foundCount + 1, -1 do
+    found[index] = nil
+  end
+
+  if foundCount > 1 then table.sort(found) end
+
+  for _, body in found do
+    count += 1
+    out[count] = generation[body] * HandleStride + body
   end
 
   -- A grid with nothing in it has no cells to walk.
