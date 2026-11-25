@@ -385,26 +385,107 @@ suite.describe('the tree of static bodies', function()
     expect(height <= 2 * math.ceil(math.log(count, 2))).toBe(true)
   end)
 
-  suite.it('is built again from nothing when more has changed than is in it', function()
+  --- Whether the tree is as building it from nothing leaves it: no node let go of, and every node
+  --- numbered in the order it is reached going down the left of each first.
+  local function builtFromNothing(world: World): boolean
+    if #world.stillFree > 0 then return false end
+    if world.stillRoot <= 0 then return true end
+
+    local next = 0
+
+    local function walk(entry: number): boolean
+      if entry < 0 then return true end
+
+      next += 1
+      if entry ~= next then return false end
+
+      return walk(world.stillLeft[entry]) and walk(world.stillRight[entry])
+    end
+
+    return walk(world.stillRoot) and next == world.stillNodeCount
+  end
+
+  --- A world of `count` static boxes in a row, its tree built.
+  local function row(count: number): (World, { number })
     local world = physik.newWorld()
-    local random = generator(8)
+    local handles = [
+      for index in range(1, count) =>
+        world:addBody({ type = 'static', shape = physik.box(vector.create(0.4, 0.4, 0.4)), position = vector.create(index, 0, 0) })
+    ]
 
-    for _ = 1, 10 do
-      randomStatic(world, random)
+    settleTree(world)
+    expect(builtFromNothing(world)).toBe(true)
+
+    return world, handles
+  end
+
+  suite.it('is built again from nothing when most of it is taken out, and not when less is', function()
+    -- Seventy of a hundred out leaves thirty, and taking out a body costs a third of building one
+    -- in: walking costs less.
+    local world, handles = row(100)
+
+    for index = 1, 70 do
+      world:removeBody(handles[index])
     end
 
     settleTree(world)
-    expect(world.stillNodeCount).toBe(9)
-
-    -- Eleven more into a tree of ten: built again, its nodes numbered from the first.
-    for _ = 1, 11 do
-      randomStatic(world, random)
-    end
-
-    settleTree(world)
-    expect(world.stillNodeCount).toBe(20)
-    expect(#world.stillFree).toBe(0)
+    expect(builtFromNothing(world)).toBe(false)
     inspect(world)
+
+    -- Eighty out leaves twenty, which is less than a third of eighty.
+    world, handles = row(100)
+
+    for index = 1, 80 do
+      world:removeBody(handles[index])
+    end
+
+    settleTree(world)
+    expect(builtFromNothing(world)).toBe(true)
+    expect(select(2, inspect(world))).toBe(20)
+
+    -- All but one, and then the last.
+    world, handles = row(100)
+
+    for index = 1, 99 do
+      world:removeBody(handles[index])
+    end
+
+    settleTree(world)
+    expect(world.stillRoot).toBe(-(handles[100] % 1048576))
+    inspect(world)
+
+    world:removeBody(handles[100])
+    settleTree(world)
+    expect(world.stillRoot).toBe(0)
+    expect(select(2, inspect(world))).toBe(0)
+  end)
+
+  suite.it('is built again from nothing when most of it is moved, and not when less is', function()
+    for _, case in { { moved = 70, rebuilt = false }, { moved = 80, rebuilt = true } } do
+      local world, handles = row(100)
+
+      for index = 1, case.moved do
+        world:setPosition(handles[index], vector.create(index, 5, 3))
+      end
+
+      settleTree(world)
+      expect(builtFromNothing(world)).toBe(case.rebuilt)
+      expect(select(2, inspect(world))).toBe(100)
+    end
+  end)
+
+  suite.it('is built again from nothing when much more is added than is in it, and not when less is', function()
+    for _, case in { { added = 40, rebuilt = false }, { added = 41, rebuilt = true } } do
+      local world = row(10)
+
+      for index = 1, case.added do
+        world:addBody({ type = 'static', shape = physik.box(vector.create(0.4, 0.4, 0.4)), position = vector.create(index, 3, 0) })
+      end
+
+      settleTree(world)
+      expect(builtFromNothing(world)).toBe(case.rebuilt)
+      expect(select(2, inspect(world))).toBe(10 + case.added)
+    end
   end)
 
   -- Two bodies alike in the same place are struck at one distance, and the lower slot is the hit

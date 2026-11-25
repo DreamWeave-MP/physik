@@ -50,6 +50,14 @@ local NearPad = vector.create(0.3, 0.3, 0.3)
 -- which costs twice as long and answers a ray no faster.
 local SubtreeShare = 1 / 64
 
+-- The tree is built from nothing when what is taken out of it, a body moved included, is more
+-- than `RebuildRemoved` times what is left untouched, or what is put in is more than
+-- `RebuildInserted` times that. Measured on 5,000 bodies: a body taken out costs a third of what
+-- a body costs to be built in, so past the first building costs less; past the second it costs
+-- at most half again what putting them in would, and gives a tree that answers a ray faster than
+-- one that is mostly put in, as a level loaded onto a world of a few bodies would be.
+local RebuildRemoved, RebuildInserted = 3, 4
+
 
 
 
@@ -733,18 +741,26 @@ end
 
 --- Brings the tree of static bodies up to date with what has been added, removed and moved since
 --- it was last asked about. Each costs a walk down the tree and back, and nothing else is
---- touched; the tree is built from nothing only when it is empty, when the origin has moved, or
---- when more has changed than is left in it, which a walk each would cost more than.
+--- touched; the tree is built from nothing only when it is empty, or when so much of it has
+--- changed that building it is cheaper or not much dearer: see `RebuildRemoved`.
 local function updateStill(state: State)
   local pending = state.stillPending
+  local {alive, bodyType, stillLeafParent: parents, stillPendingMark: marks} = state
+  local removed, inserted = 0, 0
 
-  if state.stillRoot == 0 or #pending > state.stillCount then
+  -- A body moved is one of each.
+  for _, body in pending do
+    if parents[body] ~= nil then removed += 1 end
+    if alive[body] and bodyType[body] == 'static' then inserted += 1 end
+  end
+
+  local untouched = state.stillCount - removed
+
+  if state.stillRoot == 0 or removed > untouched * RebuildRemoved or inserted > untouched * RebuildInserted then
     rebuildStill(state)
 
     return
   end
-
-  local {alive, bodyType, stillLeafParent: parents, stillPendingMark: marks} = state
 
   -- Everything that is to go is taken out first, so a box a body has been moved out of is
   -- never fitted round again.
