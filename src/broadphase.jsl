@@ -551,77 +551,93 @@ local function fitStill(state: State, node: number)
   state.stillHeight[node] = 1 + math.max(stillHeightOf(state, left), stillHeightOf(state, right))
 end
 
---- Turns the taller child of a node up into its place when one child is more than one level
---- taller than the other, as an AVL tree does, and returns what is in the node's place now. The
---- child that comes up keeps the taller of its own two children and hands the node the other.
-local function balanceStill(state: State, node: number): number
-  local {stillLeft: lefts, stillRight: rights} = state
-  local left, right = lefts[node], rights[node]
-  local lean = stillHeightOf(state, right) - stillHeightOf(state, left)
-
-  -- Taller by two or more, so the child that comes up is a node and so are its parent's.
-  if lean > 1 then
-    local inner, outer = lefts[right], rights[right]
-
-    replaceStill(state, state.stillParent[node], node, right)
-    lefts[right] = node
-    state.stillParent[node] = right
-
-    if stillHeightOf(state, inner) > stillHeightOf(state, outer) then
-      rights[right], rights[node] = inner, outer
-      hangStill(state, outer, node)
-    else
-      rights[node] = inner
-      hangStill(state, inner, node)
-    end
-
-    fitStill(state, node)
-    fitStill(state, right)
-
-    return right
-  end
-
-  if lean < -1 then
-    local outer, inner = lefts[left], rights[left]
-
-    replaceStill(state, state.stillParent[node], node, left)
-    lefts[left] = node
-    state.stillParent[node] = left
-
-    if stillHeightOf(state, outer) > stillHeightOf(state, inner) then
-      rights[left], lefts[node] = outer, inner
-      hangStill(state, inner, node)
-    else
-      lefts[node] = outer
-      hangStill(state, outer, node)
-    end
-
-    fitStill(state, node)
-    fitStill(state, left)
-
-    return left
-  end
-
-  return node
-end
-
---- Fits every node from `node` up to the root round what is under it, balancing each on the way.
-local function climbStill(state: State, node: number)
-  local parents = state.stillParent
-
-  while node ~= 0 do
-    node = balanceStill(state, node)
-    fitStill(state, node)
-    node = parents[node]
-  end
-end
-
 --- What a box costs where it stands in the tree: half its surface, which is what a query is
 --- likeliest to strike.
 local function surface(low: vector, high: vector): number
   local size = high - low
 
   return size.x * size.y + size.y * size.z + size.z * size.x
+end
+
+--- Swaps one child of a node with a grandchild under its other child, where that leaves the
+--- other child's box smaller, as Box2D's dynamic tree does since its third version: of the four
+--- swaps, the one that shrinks a box most, and none when none does. A node turned by height
+--- alone, as an AVL tree is, can be handed children far apart, and a tree of static bodies that
+--- has had dense clusters put in and taken out that way answered a box four times slower.
+local function rotateStill(state: State, node: number)
+  local {stillLeft: lefts, stillRight: rights} = state
+  local left, right = lefts[node], rights[node]
+  local leftLow, leftHigh = stillBounds(state, left)
+  local rightLow, rightHigh = stillBounds(state, right)
+  local best, choice = 0, 0
+
+  if right > 0 then
+    local area = surface(rightLow, rightHigh)
+    local innerLow, innerHigh = stillBounds(state, lefts[right])
+    local outerLow, outerHigh = stillBounds(state, rights[right])
+
+    -- The left child down beside the right's right, and the right's left up: and the other way.
+    local withOuter = area - surface(vector.min(leftLow, outerLow), vector.max(leftHigh, outerHigh))
+    local withInner = area - surface(vector.min(leftLow, innerLow), vector.max(leftHigh, innerHigh))
+
+    if withOuter > best then best, choice = withOuter, 1 end
+    if withInner > best then best, choice = withInner, 2 end
+  end
+
+  if left > 0 then
+    local area = surface(leftLow, leftHigh)
+    local outerLow, outerHigh = stillBounds(state, lefts[left])
+    local innerLow, innerHigh = stillBounds(state, rights[left])
+
+    local withOuter = area - surface(vector.min(rightLow, outerLow), vector.max(rightHigh, outerHigh))
+    local withInner = area - surface(vector.min(rightLow, innerLow), vector.max(rightHigh, innerHigh))
+
+    if withOuter > best then best, choice = withOuter, 3 end
+    if withInner > best then best, choice = withInner, 4 end
+  end
+
+  if choice == 0 then return end
+
+  if choice == 1 then
+    local up = lefts[right]
+
+    lefts[node], lefts[right] = up, left
+    hangStill(state, up, node)
+    hangStill(state, left, right)
+    fitStill(state, right)
+  elseif choice == 2 then
+    local up = rights[right]
+
+    lefts[node], rights[right] = up, left
+    hangStill(state, up, node)
+    hangStill(state, left, right)
+    fitStill(state, right)
+  elseif choice == 3 then
+    local up = rights[left]
+
+    rights[node], rights[left] = up, right
+    hangStill(state, up, node)
+    hangStill(state, right, left)
+    fitStill(state, left)
+  else
+    local up = lefts[left]
+
+    rights[node], lefts[left] = up, right
+    hangStill(state, up, node)
+    hangStill(state, right, left)
+    fitStill(state, left)
+  end
+end
+
+--- Fits every node from `node` up to the root round what is under it, turning each on the way.
+local function climbStill(state: State, node: number)
+  local parents = state.stillParent
+
+  while node ~= 0 do
+    rotateStill(state, node)
+    fitStill(state, node)
+    node = parents[node]
+  end
 end
 
 --- What putting a body beside `entry`, or somewhere under it, adds to the tree: the box it would

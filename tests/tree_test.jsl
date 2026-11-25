@@ -342,7 +342,7 @@ suite.describe('the tree of static bodies', function()
     local height, count = inspect(world)
     expect(count).toBe(2048)
 
-    -- An AVL tree of 2,048 is no taller than 1.44 times eleven, and a list of them is 2,047.
+    -- 2,048 bodies are no fewer than eleven levels, and a list of them is 2,047: this is twelve.
     expect(height <= 16).toBe(true)
 
     for index = 1, 2048, 2 do
