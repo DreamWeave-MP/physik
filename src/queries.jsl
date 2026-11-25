@@ -195,8 +195,9 @@ local function rayMesh(state: State, ground: number, origin: vector, direction: 
     -- Struck at `reach` itself is struck, as a box or a sphere is: a ray handed the distance of
     -- the nearest body met so far finds a mesh just as near, whichever of them was tried first,
     -- and the ray keeps the lower slot. A ray asked for keeps only what is nearer than its reach.
-    -- Of two triangles at one distance the first listed is kept.
-    if distance and (distance < nearest or not struck) then
+    -- Of two triangles at one distance the lower is kept: they are listed from the grid or in
+    -- order, as far as the ray reaches decides, and so in another order.
+    if distance and (distance < nearest or not struck or (distance == nearest and triangle < struck)) then
       nearest, struck = distance, triangle
     end
   end

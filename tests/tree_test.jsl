@@ -622,6 +622,49 @@ suite.describe('the tree of static bodies', function()
       expect(world:raycast(origin, down, first.distance)).toBe(nil)
     end)
   end
+
+  -- Two triangles of a mesh crossing where a ray meets them, at one distance. A mesh's
+  -- triangles are listed from its grid when the ray's stretch through it touches few enough
+  -- cells and all of them in order when it touches more, and how far a ray reaches into the
+  -- second mesh it is tried on is how far away the first one was: here three cells, more than
+  -- the limit of two, for the mesh tried first, and two for the mesh tried second. The triangle
+  -- struck is the lower of the two either way, and so is the normal.
+  suite.it('strikes the lower triangle of two a ray meets at one distance, whichever way they are listed', function()
+    local normals = {}
+
+    for _, limit in { 1, 2, 4096 } do
+      local world = physik.newWorld({ meshQueryCellLimit = limit })
+      local mesh = physik.triangleMesh({
+        vector.create(0, -1, -1),
+        vector.create(0, 1, -1),
+        vector.create(0, 0, 1),
+        vector.create(-1, -1, -1),
+        vector.create(1, 1, -1),
+        vector.create(0, 0, 1),
+      }, { 1, 2, 3, 4, 5, 6 }, { cellSize = 1 })
+      local lower = world:addBody({ type = 'static', shape = mesh })
+      local upper = world:addBody({ type = 'static', shape = mesh })
+      local origin, along = vector.create(-2, 0, 0), vector.create(1, 0, 0)
+      local first = met(world:raycast(origin, along, 10))
+
+      -- Put back where it was, the lower mesh is now tried second.
+      world:setPosition(lower, vector.zero)
+      settleTree(world)
+      expect(world.stillLeft[world.stillRoot]).toBe(-(upper % 1048576))
+
+      local second = met(world:raycast(origin, along, 10))
+
+      expect(first.handle).toBe(lower)
+      expect(second.handle).toBe(lower)
+      expect(second.distance).toBe(first.distance)
+      expect(second.normal).toBe(first.normal)
+      table.insert(normals, first.normal)
+    end
+
+    expect(normals[2]).toBe(normals[1])
+    expect(normals[3]).toBe(normals[1])
+    expect(normals[1]).toBe(vector.create(-1, 0, 0))
+  end)
 end)
 
 return suite
