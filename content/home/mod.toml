@@ -24,3 +24,8 @@ summary = "First release published as a DreamWeave project."
 version = "0.5.0"
 date = 2026-11-22
 summary = "The kernel as nine typed modules that pass the strict check. Levels of static bodies cost a step nothing, bodies at rest keep their contacts, and a world that has had bodies taken out steps as a new one does. New: capsule sweeps, and a character that walks, climbs steps and slopes, rides lifts and crouches. A rotation's parts are now turn and turnW, and a contact's bodies first and second."
+
+[[releases]]
+version = "0.6.0"
+date = 2026-11-24
+summary = "Static bodies coming and going no longer stall a step: the tree of them is kept up to date instead of built again from all of them, so streaming a tile of them in or out costs a step some 2 ms, not 30. The tree is turned where that shrinks a box, so it answers as fast after streaming as one built afresh. A ray strikes the same body, triangle and normal whatever order the tree meets them in, and twin worlds built in different orders step alike."
