@@ -119,7 +119,7 @@ local function randomStatic(world: World, random: Random): number
     elseif kind == 2 then physik.capsule(random(0.2, 0.6), random(0.3, 3))
     else physik.sphere(random(0.3, 1.5))
 
-  return world:addBody({ type = 'static', shape = shape, position = at, rotation = rotation })
+  return world:addBody({ type = 'static', shape = shape, position = at, rotation = rotation, sensor = random(0, 1) < 0.15 })
 end
 
 local function randomMover(world: World, random: Random): number
@@ -129,12 +129,13 @@ local function randomMover(world: World, random: Random): number
 
   return world:addBody({
     shape = shape,
-    position = vector.create(random(-20, 20), random(2, 6), random(-20, 20)),
-    velocity = vector.create(random(-3, 3), random(-2, 0), random(-3, 3)),
+    position = vector.create(random(-20, 20), random(-0.5, 2), random(-20, 20)),
+    velocity = vector.create(random(-2, 2), random(-1, 0), random(-2, 2)),
   })
 end
 
---- Everything a world says about where its bodies are and what touches what, to the bit.
+--- Everything a world says about where its bodies are, how they turn and rest, and what touches
+--- what, to the bit: what a server would send of it.
 local function stepped(world: World): string
   local lines = {}
 
@@ -142,18 +143,35 @@ local function stepped(world: World): string
     table.insert(
       lines,
       `{contact.first} {contact.second} {pinVector(contact.normal)} {pinVector(contact.point)} `
-        .. `{pin(contact.penetration)} {pin(contact.normalImpulse)}`
+        .. `{pin(contact.penetration)} {pin(contact.normalImpulse)} {contact.sensor}`
     )
+  end
+
+  local events, eventCount = world:writeContactEvents({}, true)
+
+  for index = 1, eventCount do
+    table.insert(lines, `event {events.first[index]} {events.second[index]} {events.kind[index]} {events.sensor[index]}`)
   end
 
   local state, count = world:writeTransforms({})
 
   for index = 1, count do
-    table.insert(lines, `{state.handles[index]} {pinVector(state.positions[index])} {pinVector(state.velocities[index])}`)
+    local handle = state.handles[index]
+
+    table.insert(
+      lines,
+      `{handle} {pinVector(state.positions[index])} {pinVector(state.rotations[index])} {pin(state.rotationW[index])} `
+        .. `{pinVector(state.velocities[index])} {pinVector(state.angularVelocities[index])} {world:getBody(handle).sleeping}`
+    )
   end
 
   local stats = world:stats()
-  table.insert(lines, `{stats.contacts} {stats.candidates} {stats.manifolds}`)
+
+  table.insert(
+    lines,
+    `{stats.frame} {stats.bodies} {stats.sleeping} {stats.islands} {stats.candidates} {stats.contacts} `
+      .. `{stats.sensorContacts} {stats.activeContacts} {stats.manifolds} {stats.warmStarted} {stats.ccdHits} {stats.joints}`
+  )
 
   return table.concat(lines, '\n')
 end
@@ -201,7 +219,10 @@ local function answered(world: World, seed: number): string
     local touched = {}
 
     for index = 1, overlaps.count do
-      table.insert(touched, `{overlaps.handles[index]} {pin(overlaps.depths[index])} {pinVector(overlaps.normals[index])}`)
+      table.insert(
+        touched,
+        `{overlaps.handles[index]} {pin(overlaps.depths[index])} {pinVector(overlaps.normals[index])} {pinVector(overlaps.points[index])}`
+      )
     end
 
     table.insert(lines, `overlaps {table.concat(touched, ', ')}`)
@@ -212,13 +233,23 @@ end
 
 --- Two worlds told the same things, seeded: the first keeps its tree of static bodies up to date
 --- as they are added, removed and moved, and the second has it built again from nothing before
---- every question and every step. Each round adds static bodies, takes some out, moves and turns
---- others, throws in a body that can move now and then, steps both, walks a character through
---- both, which has to come out in the same place in each, and asks both the same questions. Calls `each` with both worlds after every round.
+--- every question and every step. Each round adds static bodies, some of them sensors, takes
+--- some out, moves and turns others, now and then puts some where a drained state says, throws
+--- two bodies that can move onto a floor, takes one out and puts a static body into its slot in
+--- the same breath, and shifts the origin; once the tree is emptied, then given one body, then
+--- many. Then both are stepped three times, a character is walked through both, which has to come
+--- out in the same place in each, and `each` is called with both worlds.
 local function twins(broadphase: 'grid' | 'sap', seed: number, rounds: number, each: (World, World, number) -> ())
-  local kept, rebuilt = physik.newWorld({ broadphase = broadphase }), physik.newWorld({ broadphase = broadphase })
+  -- Loose enough for what is thrown in to fall asleep within the run.
+  local options = { broadphase = broadphase, contactEvents = true, sleepLinear = 0.3, sleepAngular = 0.6, sleepDelay = 0.2 }
+  local kept, rebuilt = physik.newWorld(options), physik.newWorld(options)
+
+  -- A floor that is not static, so the tree can still be emptied.
+  for _, world in { kept, rebuilt } do
+    world:addBody({ type = 'kinematic', shape = physik.box(vector.create(30, 0.5, 30)), position = vector.create(0, -1.5, 0) })
+  end
   local random = generator(seed)
-  local statics: { number } = {}
+  local statics: { number }, movers: { number } = {}, {}
 
   -- The two worlds are told the same things in the same order, so their bodies are in the same
   -- slots and have the same handles.
@@ -228,10 +259,18 @@ local function twins(broadphase: 'grid' | 'sap', seed: number, rounds: number, e
     act(rebuilt)
   end
 
-  for _ = 1, 40 do
-    local handle = randomStatic(kept, generator(seed + #statics))
-    randomStatic(rebuilt, generator(seed + #statics))
+  local function addStatic()
+    local salt, handle = math.floor(random(0, 1e6)), 0
+
+    both(function(world: World)
+      handle = randomStatic(world, generator(salt))
+    end)
+
     table.insert(statics, handle)
+  end
+
+  for _ = 1, 40 do
+    addStatic()
   end
 
   local walkers = {
@@ -242,21 +281,27 @@ local function twins(broadphase: 'grid' | 'sap', seed: number, rounds: number, e
   for round = 1, rounds do
     local changes = generator(seed * 31 + round)
 
-    for _ = 1, pick(random, 12) do
-      local salt, handle = math.floor(random(0, 1e6)), 0
+    if round == 10 then
+      -- Empty, then one, then many again.
+      for _, handle in statics do
+        both(function(world: World)
+          world:removeBody(handle)
+        end)
+      end
 
-      both(function(world: World)
-        handle = randomStatic(world, generator(salt))
-      end)
-
-      table.insert(statics, handle)
+      table.clear(statics)
+    elseif round == 11 then
+      addStatic()
+    else
+      for _ = 1, pick(random, 12) do
+        addStatic()
+      end
     end
 
     for _ = 1, pick(random, 8) do
-      if #statics < 2 then break end
+      if #statics < 2 or round == 11 then break end
 
-      local index = pick(changes, #statics)
-      local handle = table.remove(statics, index) :: number
+      local handle = table.remove(statics, pick(changes, #statics)) :: number
 
       both(function(world: World)
         world:removeBody(handle)
@@ -264,6 +309,8 @@ local function twins(broadphase: 'grid' | 'sap', seed: number, rounds: number, e
     end
 
     for _ = 1, pick(random, 6) do
+      if #statics == 0 then break end
+
       local handle = statics[pick(changes, #statics)]
       local to = vector.create(random(-24, 24), random(-1, 3), random(-24, 24))
       local turn = physik.quat(random(-1, 1), random(-1, 1), random(-1, 1), random(0.2, 1))
@@ -274,12 +321,49 @@ local function twins(broadphase: 'grid' | 'sap', seed: number, rounds: number, e
       end)
     end
 
-    if round % 3 == 1 then
-      local salt = math.floor(random(0, 1e6))
+    if round % 4 == 2 and #statics > 3 then
+      local drained = { handles = {}, positions = {}, rotations = {}, rotationW = {}, count = 3 }
+
+      for index = 1, 3 do
+        local turn = physik.quat(random(-1, 1), random(-1, 1), random(-1, 1), random(0.2, 1))
+
+        drained.handles[index] = statics[pick(changes, #statics)]
+        drained.positions[index] = vector.create(random(-24, 24), random(-1, 3), random(-24, 24))
+        drained.rotations[index], drained.rotationW[index] = turn.turn, turn.turnW
+      end
 
       both(function(world: World)
-        randomMover(world, generator(salt))
+        world:applyTransforms(drained)
       end)
+    end
+
+    for _ = 1, 2 do
+      local salt, handle = math.floor(random(0, 1e6)), 0
+
+      both(function(world: World)
+        handle = randomMover(world, generator(salt))
+      end)
+
+      table.insert(movers, handle)
+    end
+
+    -- A slot let go of and taken again before the tree is next asked: a mover's by a static
+    -- body, and a static body's by a mover.
+    if round % 5 == 3 and #movers > 0 and #statics > 0 then
+      local mover = table.remove(movers, 1) :: number
+      local still = table.remove(statics, pick(changes, #statics)) :: number
+      local salt = math.floor(random(0, 1e6))
+      local staticHandle, moverHandle = 0, 0
+
+      both(function(world: World)
+        world:removeBody(mover)
+        staticHandle = randomStatic(world, generator(salt))
+        world:removeBody(still)
+        moverHandle = randomMover(world, generator(salt))
+      end)
+
+      table.insert(statics, staticHandle)
+      table.insert(movers, moverHandle)
     end
 
     if round % 7 == 0 then
@@ -290,9 +374,11 @@ local function twins(broadphase: 'grid' | 'sap', seed: number, rounds: number, e
       end)
     end
 
-    both(function(world: World)
-      world:step(1 / 60)
-    end)
+    for _ = 1, 3 do
+      both(function(world: World)
+        world:step(1 / 60)
+      end)
+    end
 
     local heading = vector.create(math.sin(round) * 0.2, -0.05, math.cos(round * 0.7) * 0.2)
 
