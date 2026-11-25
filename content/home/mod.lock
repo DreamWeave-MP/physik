@@ -85,6 +85,47 @@
       "groups": [],
       "extensions": {},
       "critical_extensions": []
+    },
+    {
+      "version": "0.6.0",
+      "locked_from": "1ab73a1f27c27309c2d600b4eeb25ebf92f53693",
+      "artifacts": [
+        {
+          "id": "jpk",
+          "format": "jpk",
+          "filename": "org.dreamweave.physik-0.6.0.jpk",
+          "media_type": "application/vnd.jess.jpk",
+          "size": 163761,
+          "digests": {
+            "sha256": "8961444b3702e7c967f31722ef7dfdb2409bc81a63e86f43c890944d8e50564e"
+          },
+          "jess": {
+            "package": "org.dreamweave.physik",
+            "jess_api": "1",
+            "content_digest": "5d8f17d76528df243bd5ba0908319226918beed8b0758598f3f4f9378055c4c2",
+            "dependencies": {}
+          }
+        }
+      ],
+      "runtimes": {},
+      "platforms": [],
+      "provides": [],
+      "relationships": [],
+      "components": [
+        {
+          "id": "main",
+          "name": "physik",
+          "path": ".",
+          "required": true,
+          "default": true,
+          "requires": [],
+          "conflicts": [],
+          "suggested_with": []
+        }
+      ],
+      "groups": [],
+      "extensions": {},
+      "critical_extensions": []
     }
   ]
 }
