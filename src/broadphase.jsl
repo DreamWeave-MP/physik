@@ -52,11 +52,11 @@ local SubtreeShare = 1 / 64
 
 -- The tree is built from nothing when what is taken out of it, a body moved included, is more
 -- than `RebuildRemoved` times what is left untouched, or what is put in is more than
--- `RebuildInserted` times that. Measured on 5,000 bodies: a body taken out costs a third of what
--- a body costs to be built in, so past the first building costs less; past the second it costs
+-- `RebuildInserted` times that. Measured on 5,000 bodies: a body taken out costs half of what a
+-- body costs to be built in, so past the first building costs less; past the second it costs
 -- at most half again what putting them in would, and gives a tree that answers a ray faster than
 -- one that is mostly put in, as a level loaded onto a world of a few bodies would be.
-local RebuildRemoved, RebuildInserted = 3, 4
+local RebuildRemoved, RebuildInserted = 2, 4
 
 
 

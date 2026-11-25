@@ -506,11 +506,11 @@ suite.describe('the tree of static bodies', function()
   end
 
   suite.it('is built again from nothing when most of it is taken out, and not when less is', function()
-    -- Seventy of a hundred out leaves thirty, and taking out a body costs a third of building one
-    -- in: walking costs less.
+    -- Sixty of a hundred out leaves forty, and taking out a body costs half of building one in:
+    -- walking costs less.
     local world, handles = row(100)
 
-    for index = 1, 70 do
+    for index = 1, 60 do
       world:removeBody(handles[index])
     end
 
@@ -518,16 +518,16 @@ suite.describe('the tree of static bodies', function()
     expect(builtFromNothing(world)).toBe(false)
     inspect(world)
 
-    -- Eighty out leaves twenty, which is less than a third of eighty.
+    -- Seventy out leaves thirty, which is less than half of seventy.
     world, handles = row(100)
 
-    for index = 1, 80 do
+    for index = 1, 70 do
       world:removeBody(handles[index])
     end
 
     settleTree(world)
     expect(builtFromNothing(world)).toBe(true)
-    expect(select(2, inspect(world))).toBe(20)
+    expect(select(2, inspect(world))).toBe(30)
 
     -- All but one, and then the last.
     world, handles = row(100)
@@ -547,7 +547,7 @@ suite.describe('the tree of static bodies', function()
   end)
 
   suite.it('is built again from nothing when most of it is moved, and not when less is', function()
-    for _, case in { { moved = 70, rebuilt = false }, { moved = 80, rebuilt = true } } do
+    for _, case in { { moved = 60, rebuilt = false }, { moved = 70, rebuilt = true } } do
       local world, handles = row(100)
 
       for index = 1, case.moved do
