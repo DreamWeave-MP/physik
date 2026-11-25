@@ -10,6 +10,13 @@ type Random = (low: number, high: number) -> number
 -- Both ways a world finds its pairs: a case that holds for one is run for the other.
 local Broadphases: { 'grid' | 'sap' } = { 'grid', 'sap' }
 
+--- What a ray met, where a case expects it to have met something.
+local function met<Hit>(hit: Hit?): Hit
+  if not hit then error('expected to meet something, and met nothing', 2) end
+
+  return hit :: Hit
+end
+
 --- A source of numbers in [low, high), the same ones for the same seed everywhere.
 local function generator(seed: number): Random
   local state = seed
@@ -399,6 +406,55 @@ suite.describe('the tree of static bodies', function()
     expect(#world.stillFree).toBe(0)
     inspect(world)
   end)
+
+  -- Two bodies alike in the same place are struck at one distance, and the lower slot is the hit
+  -- however the tree came to hold them: a body put back where it was is visited in another order.
+  local makers: { [string]: () -> physik.Shape } = {
+    box = function(): physik.Shape
+      return physik.box(vector.create(1, 0.5, 1))
+    end,
+    compound = function(): physik.Shape
+      return physik.compound({
+        { shape = physik.box(vector.create(1, 0.5, 1)), position = vector.create(0, 0, 0) },
+        { shape = physik.sphere(0.5), position = vector.create(0, 1, 0) },
+      })
+    end,
+    mesh = function(): physik.Shape
+      return physik.triangleMesh(
+        { vector.create(-2, 0, -2), vector.create(2, 0, -2), vector.create(2, 0, 2), vector.create(-2, 0, 2) },
+        { 1, 2, 3, 1, 3, 4 }
+      )
+    end,
+    heightfield = function(): physik.Shape
+      return physik.heightfield(3, 3, { 0, 0, 0, 0, 0, 0, 0, 0, 0 }, { cellSizeX = 2, cellSizeZ = 2 })
+    end,
+  }
+
+  for name, alike in makers do
+    suite.it(`strikes the lower slot of two {name} bodies in one place, however the tree holds them`, function()
+      local world = physik.newWorld()
+      local at = vector.create(0.3, 0, -0.2)
+      local lower = world:addBody({ type = 'static', shape = alike(), position = at })
+      local upper = world:addBody({ type = 'static', shape = alike(), position = at })
+      local origin, down = vector.create(0.5, 6, 0.5), vector.create(0, -1, 0)
+      local first = met(world:raycast(origin, down, 20))
+
+      expect(first.handle).toBe(lower)
+
+      -- Taken out and put back in: now the upper one is the first child of the root.
+      world:setPosition(lower, at)
+      settleTree(world)
+      expect(world.stillLeft[world.stillRoot]).toBe(-(upper % 1048576))
+
+      local second = met(world:raycast(origin, down, 20))
+      expect(second.handle).toBe(lower)
+      expect(second.distance).toBe(first.distance)
+
+      -- A ray reaches as far as it is told and no further: what is at its reach exactly is not
+      -- struck, whatever the shape.
+      expect(world:raycast(origin, down, first.distance)).toBe(nil)
+    end)
+  end
 end)
 
 return suite

@@ -192,7 +192,11 @@ local function rayMesh(state: State, ground: number, origin: vector, direction: 
     local first, second, third = shapes.meshTriangle(mesh, triangle)
     local distance = geometry.rayToTriangle(from, along, nearest, first, second, third)
 
-    if distance and distance < nearest then
+    -- Struck at `reach` itself is struck, as a box or a sphere is: a ray handed the distance of
+    -- the nearest body met so far finds a mesh just as near, whichever of them was tried first,
+    -- and the ray keeps the lower slot. A ray asked for keeps only what is nearer than its reach.
+    -- Of two triangles at one distance the first listed is kept.
+    if distance and (distance < nearest or not struck) then
       nearest, struck = distance, triangle
     end
   end
@@ -227,7 +231,8 @@ local function rayHeightfield(state: State, ground: number, origin: vector, dire
       local beside = shapes.heightVertex(field, column + 1, row)
       local distance = geometry.rayToTriangle(from, along, nearest, corner, beside, across)
 
-      if distance and distance < nearest then
+      -- Struck at `reach` itself is struck, as a mesh is.
+      if distance and (distance < nearest or not struckFirst) then
         nearest, struckFirst, struckSecond, struckThird = distance, corner, beside, across
       end
 
@@ -235,7 +240,7 @@ local function rayHeightfield(state: State, ground: number, origin: vector, dire
 
       distance = geometry.rayToTriangle(from, along, nearest, corner, across, beyond)
 
-      if distance and distance < nearest then
+      if distance and (distance < nearest or not struckFirst) then
         nearest, struckFirst, struckSecond, struckThird = distance, corner, across, beyond
       end
     end
@@ -259,7 +264,9 @@ local function rayCompound(state: State, body: number, origin: vector, direction
       geometry.placePiece(at, turn, turnW, compound.positions[piece], compound.turns[piece], compound.turnWs[piece])
     local distance, normal, point = geometry.rayToPrimitive(compound.shapes[piece], pieceAt, pieceTurn, pieceTurnW, origin, direction, nearest)
 
-    if distance and distance < nearest then
+    -- Struck at `reach` itself is struck, as a mesh is; of two pieces at one distance the first
+    -- is kept.
+    if distance and (distance < nearest or not facing) then
       nearest, facing, struck = distance, normal, point
     end
   end
